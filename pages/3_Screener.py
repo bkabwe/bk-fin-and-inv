@@ -15,13 +15,21 @@ if label == "Custom":
     custom = sanitize_ticker_list([x.strip() for x in txt.split(",") if x.strip()])
 
 min_score = st.slider("Min Score", 0, 100, 60)
-max_results = st.slider("Max Results", 5, 100, 25)
+max_results = st.slider("Max Results", 1, 200, 25)
 batch_size = st.slider(
     "Max stocks to screen",
     min_value=10,
     max_value=500,
-    value=50,
-    help="Limit the number of stocks screened at once. Lower = faster. S&P 500 full scan = ~503 stocks.",
+    value=100,
+    help=(
+        "How many stocks to analyse. Higher = more results but slower. "
+        "Screener will always scan at least 3× your Max Results to ensure enough qualifying stocks."
+    ),
+)
+st.info(
+    "💡 **Tip**: 'Max stocks to screen' controls how many tickers are analysed. "
+    "Only stocks meeting the Min Score threshold appear in results. "
+    "To get more results, increase 'Max stocks to screen' or lower 'Min Score'."
 )
 time_filter = st.multiselect("Time Horizon", ["Short-Term Opportunity", "Medium-Term Setup", "Long-Term Hold"])
 sector_filter = st.text_input("Sector filter (optional)").strip().lower()
@@ -63,6 +71,9 @@ if st.button("Run Screener"):
         if sector_filter:
             results = results[results["Company"].fillna("").str.lower().str.contains(sector_filter)]
         st.dataframe(results, use_container_width=True)
+        screened = results.attrs.get("source_ticker_count", 0)
+        matched = len(results)
+        st.caption(f"Scanned {screened} stocks → {matched} met the score threshold")
         st.download_button("Export to CSV", results.to_csv(index=False), "screener_results.csv", "text/csv")
 
 st.markdown(

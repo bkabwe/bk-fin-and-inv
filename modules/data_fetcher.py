@@ -141,23 +141,37 @@ def _extract_tickers_from_html_table_by_symbol(html: str) -> list[str]:
 
 @cache_data(ttl=86400)
 def get_sp500_tickers() -> list[str]:
+    """Fetch S&P 500 tickers from stockanalysis.com (consistent with other universes)."""
     url = "https://stockanalysis.com/list/sp-500-stocks/"
     try:
-        session = requests.Session()
-        response = session.get(url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
-        response.raise_for_status()
-        tickers = _extract_tickers_from_html_table_by_symbol(response.text)
-        if not tickers:
-            tables = _safe_read_html(response.text)
-            tickers = _extract_tickers_from_tables(tables)
-        if not tickers:
-            tickers = _scrape_stockanalysis_tickers(url, max_pages=2)
-        logger.info("Fetched %s S&P 500 tickers", len(tickers))
-        if tickers:
+        tickers = _scrape_stockanalysis_tickers(url, max_pages=6)
+        if len(tickers) > 100:
+            logger.info("Fetched %s S&P 500 tickers from stockanalysis.com", len(tickers))
             return tickers
     except Exception as exc:
-        logger.error("S&P 500 scrape failed: %s", exc)
-    raise RuntimeError("Failed to fetch S&P 500 tickers from stockanalysis.com.")
+        logger.error("S&P 500 stockanalysis scrape failed: %s", exc)
+
+    # Fallback: Wikipedia with explicit requests session + headers
+    try:
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers=_DEFAULT_HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tables = pd.read_html(StringIO(resp.text))
+        for table in tables:
+            cols = {str(c).strip().lower(): c for c in table.columns}
+            sym_col = cols.get("symbol") or cols.get("ticker")
+            if sym_col:
+                tickers = _normalize_tickers(table[sym_col].astype(str).tolist())
+                if len(tickers) > 100:
+                    logger.info("Fetched %s S&P 500 tickers from Wikipedia fallback", len(tickers))
+                    return tickers
+    except Exception as exc:
+        logger.error("S&P 500 Wikipedia fallback failed: %s", exc)
+
+    raise RuntimeError("Failed to fetch S&P 500 tickers from stockanalysis.com or Wikipedia.")
 
 
 _DEFAULT_HEADERS = {
@@ -373,15 +387,53 @@ def get_nasdaq100_tickers() -> list[str]:
 
 @cache_data(ttl=86400)
 def get_russell2000_tickers() -> list[str]:
-    url = "https://www.chartmill.com/stock/markets/usa/index/russell-2000"
+    """Fetch Russell 2000 tickers from iShares IWM ETF official holdings CSV."""
+    # Primary: iShares IWM holdings CSV (official, reliable, free)
+    csv_url = (
+        "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+        "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+    )
     try:
-        tickers = _scrape_chartmill_russell2000(url, max_pages=60)
-        if tickers:
-            logger.info("Fetched %s Russell 2000 tickers from Chartmill", len(tickers))
+        resp = requests.get(csv_url, headers=_DEFAULT_HEADERS, timeout=20)
+        resp.raise_for_status()
+        # The CSV has metadata rows at the top — skip until we find the header row containing "Ticker"
+        lines = resp.text.splitlines()
+        header_idx = next(
+            (i for i, line in enumerate(lines) if "Ticker" in line or "ticker" in line.lower()),
+            9,  # fallback: skip first 9 rows
+        )
+        df = pd.read_csv(StringIO("\n".join(lines[header_idx:])))
+        # Find the ticker column
+        ticker_col = next(
+            (col for col in df.columns if col.strip().lower() in {"ticker", "symbol"}),
+            None,
+        )
+        if ticker_col:
+            tickers = _normalize_tickers(df[ticker_col].dropna().tolist())
+            # Filter out cash, ETFs, and non-equity entries
+            tickers = [t for t in tickers if t and len(t) <= 6 and t not in {"-", "CASH", "USD", "OTHER"}]
+            if len(tickers) > 100:
+                logger.info("Fetched %s Russell 2000 tickers from iShares IWM CSV", len(tickers))
+                return sorted(tickers)
+    except Exception as exc:
+        logger.error("Russell 2000 iShares CSV fetch failed: %s", exc)
+
+    # Fallback: try stockanalysis.com multi-page scrape
+    try:
+        tickers = _scrape_stockanalysis_tickers(
+            "https://stockanalysis.com/list/russell-2000-stocks/",
+            max_pages=40,
+        )
+        if len(tickers) > 50:
+            logger.info("Fetched %s Russell 2000 tickers from stockanalysis.com fallback", len(tickers))
             return tickers
     except Exception as exc:
-        logger.error("Russell 2000 scrape failed: %s", exc)
-    raise RuntimeError("Failed to fetch Russell 2000 tickers from chartmill.com.")
+        logger.error("Russell 2000 stockanalysis fallback failed: %s", exc)
+
+    raise RuntimeError(
+        "Failed to fetch Russell 2000 tickers. "
+        "Could not reach iShares IWM holdings or stockanalysis.com."
+    )
 
 
 @cache_data(ttl=86400)
