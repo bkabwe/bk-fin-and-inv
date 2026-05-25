@@ -61,44 +61,34 @@ def get_sp500_tickers() -> list[str]:
         table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
         return sorted(set(table["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()))
     except Exception:
-        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "XOM", "V"]
+        raise RuntimeError("Failed to fetch S&P 500 tickers. Check internet connection.")
 
 
-_NASDAQ100_FALLBACK = [
-    "AAPL",
-    "MSFT",
-    "NVDA",
-    "AMZN",
-    "META",
-    "GOOGL",
-    "GOOG",
-    "TSLA",
-    "AVGO",
-    "COST",
-    "NFLX",
-    "AMD",
-    "ADBE",
-    "CSCO",
-    "INTC",
-    "INTU",
-    "QCOM",
-    "AMGN",
-    "TXN",
-    "PEP",
-]
-_RUSSELL2000_FALLBACK = ["SMCI", "CROX", "FSLY", "UPWK", "PLUG", "RUN", "RIOT", "MARA", "RKT", "SOFI", "RKLB", "LMND"]
-_OTC_FALLBACK = ["NLST", "RHHBY", "NSRGY", "BUDFF", "TCEHY", "NTDOY", "SFTBY", "BAMXF", "BYDDF", "PPRUY"]
-_REQUEST_HEADERS = {
+_DEFAULT_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 }
+# Alias kept for internal helpers
+_REQUEST_HEADERS = _DEFAULT_HEADERS
+
+
+def _normalize_tickers(values: list[Any], limit: int | None = None) -> list[str]:
+    cleaned = []
+    for value in values:
+        ticker = str(value).strip().upper().replace(".", "-")
+        if ticker and ticker not in {"NAN", "NONE", "SYMBOL"} and ticker.isascii():
+            cleaned.append(ticker)
+    unique = sorted(set(cleaned))
+    return unique[:limit] if limit is not None else unique
 
 
 def _clean_ticker(value: Any) -> str | None:
     ticker = str(value or "").strip().upper().replace(".", "-")
     if not ticker or any(ch.isspace() for ch in ticker):
+        return None
+    if ticker in {"NAN", "NONE", "SYMBOL"}:
         return None
     return ticker
 
@@ -132,9 +122,23 @@ def _extract_tickers_from_rows(html: str) -> list[str]:
     return tickers
 
 
+def _extract_tickers_from_tables(tables: list[pd.DataFrame], limit: int | None = None) -> list[str]:
+    for table in tables:
+        cols = {str(col).strip().lower(): col for col in table.columns}
+        candidate = next(
+            (cols[key] for key in cols if key in {"symbol", "ticker", "ticker symbol"}),
+            None,
+        )
+        if candidate is not None:
+            tickers = _normalize_tickers(table[candidate].tolist(), limit=limit)
+            if tickers:
+                return tickers
+    return []
+
+
 def _scrape_stockanalysis_tickers(url: str, max_pages: int = 1, limit: int | None = None) -> list[str]:
     tickers: list[str] = []
-    seen = set()
+    seen: set[str] = set()
     session = requests.Session()
     for page in range(1, max_pages + 1):
         page_url = url if page == 1 else f"{url}?p={page}"
@@ -158,26 +162,35 @@ def _scrape_stockanalysis_tickers(url: str, max_pages: int = 1, limit: int | Non
 
 @cache_data(ttl=86400)
 def get_nasdaq100_tickers() -> list[str]:
+    url = "https://stockanalysis.com/list/nasdaq-100-stocks/"
     try:
-        tickers = _scrape_stockanalysis_tickers("https://stockanalysis.com/list/nasdaq-100-stocks/", max_pages=2)
-        return tickers or _NASDAQ100_FALLBACK
+        tickers = _scrape_stockanalysis_tickers(url, max_pages=2)
+        if tickers:
+            return tickers
     except Exception:
-        return _NASDAQ100_FALLBACK
+        pass
+    raise RuntimeError("Failed to fetch NASDAQ 100 tickers.")
 
 
 @cache_data(ttl=86400)
 def get_russell2000_tickers() -> list[str]:
+    url = "https://stockanalysis.com/list/russell-2000-stocks/"
     try:
-        tickers = _scrape_stockanalysis_tickers("https://stockanalysis.com/list/russell-2000-stocks/", max_pages=30)
-        return tickers or _RUSSELL2000_FALLBACK
+        tickers = _scrape_stockanalysis_tickers(url, max_pages=30)
+        if tickers:
+            return tickers
     except Exception:
-        return _RUSSELL2000_FALLBACK
+        pass
+    raise RuntimeError("Failed to fetch Russell 2000 tickers.")
 
 
 @cache_data(ttl=86400)
 def get_otc_tickers() -> list[str]:
+    url = "https://stockanalysis.com/list/otc-stocks/"
     try:
-        tickers = _scrape_stockanalysis_tickers("https://stockanalysis.com/list/otc-stocks/", max_pages=50, limit=500)
-        return tickers or _OTC_FALLBACK
+        tickers = _scrape_stockanalysis_tickers(url, max_pages=50, limit=500)
+        if tickers:
+            return tickers
     except Exception:
-        return _OTC_FALLBACK
+        pass
+    raise RuntimeError("Failed to fetch OTC tickers.")

@@ -8,6 +8,8 @@ Comprehensive US stock analysis toolkit inspired by Richard W. Schabacker's tech
 pip install -r requirements.txt
 ```
 
+> Note: Installing `prophet` may take a few minutes on macOS because native dependencies are compiled during `pip install prophet`.
+
 ## Run the dashboard
 
 ```bash

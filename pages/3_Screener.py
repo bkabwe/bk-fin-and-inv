@@ -31,15 +31,29 @@ if st.button("Run Screener"):
     def _cb(v: float):
         progress.progress(min(1.0, max(0.0, v)))
 
-    with st.spinner("Screening..."):
-        results = run_screener(
-            map_universe[label],
-            min_score=min_score,
-            max_results=max_results,
-            batch_size=batch_size,
-            custom_tickers=custom,
-            progress_callback=_cb,
+    try:
+        with st.spinner("Screening..."):
+            results = run_screener(
+                map_universe[label],
+                min_score=min_score,
+                max_results=max_results,
+                batch_size=batch_size,
+                custom_tickers=custom,
+                progress_callback=_cb,
+            )
+    except RuntimeError as e:
+        st.error(str(e))
+        st.stop()
+    if results.attrs.get("fallback_used"):
+        count = results.attrs.get("source_ticker_count", 0)
+        st.warning(
+            f"⚠️ Could not fetch live ticker list. Results based on fallback list of {count} stocks. "
+            "Check your internet connection."
         )
+    if map_universe[label] == "russell2000":
+        count = int(results.attrs.get("source_ticker_count", 0))
+        if count and count < 50:
+            st.warning(f"⚠️ Russell 2000 scrape returned only {count} tickers. Results may be incomplete.")
     if results.empty:
         st.warning("No results.")
     else:

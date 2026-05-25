@@ -30,7 +30,11 @@ def run_screener(
     custom_tickers: list[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
 ) -> pd.DataFrame:
-    rows, tickers = [], _get_tickers(universe, custom_tickers)
+    rows = []
+    try:
+        tickers = _get_tickers(universe, custom_tickers)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Unable to fetch ticker universe '{universe}': {exc}") from exc
     if not tickers:
         return pd.DataFrame()
     if batch_size:
@@ -60,4 +64,8 @@ def run_screener(
             pass
         if progress_callback:
             progress_callback(i / len(tickers))
-    return pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results) if rows else pd.DataFrame()
+    results = pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results) if rows else pd.DataFrame()
+    results.attrs["source_ticker_count"] = len(tickers)
+    results.attrs["universe"] = universe
+    results.attrs["fallback_used"] = False
+    return results
