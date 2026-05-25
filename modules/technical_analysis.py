@@ -85,8 +85,16 @@ def analyze_technical(data: pd.DataFrame) -> dict:
     stoch = StochasticOscillator(df["High"], df["Low"], df["Close"], window=14, smooth_window=3).stoch()
     bb = BollingerBands(df["Close"], window=20, window_dev=2)
     bb_high, bb_low = bb.bollinger_hband(), bb.bollinger_lband()
+    bb_mid = bb.bollinger_mavg()
     atr = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
     obv = OnBalanceVolumeIndicator(df["Close"], df["Volume"]).on_balance_volume()
+
+    df["rsi"] = rsi
+    df["macd"] = macd_line
+    df["macd_signal"] = macd_signal
+    df["bb_high"] = bb_high
+    df["bb_low"] = bb_low
+    df["bb_mid"] = bb_mid
 
     last = df.iloc[-1]
     trend = "sideways"

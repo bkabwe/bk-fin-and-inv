@@ -5,10 +5,16 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from modules.sentiment_analysis import analyze_sentiment
+from modules.validators import sanitize_ticker
 
 st.title("📰 News & Sentiment")
-ticker = st.text_input("Ticker", value="AAPL").upper()
-if ticker:
+ticker_input = st.text_input("Ticker", value="AAPL")
+if ticker_input:
+    try:
+        ticker = sanitize_ticker(ticker_input)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
     result = analyze_sentiment(ticker)
     st.write(f"Overall Sentiment: **{result['sentiment_label']}** ({result['sentiment_score']})")
     headlines = pd.DataFrame(result.get("headlines", []))
