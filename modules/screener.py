@@ -29,23 +29,19 @@ def run_screener(
     universe: str = "sp500",
     min_score: int = 50,
     max_results: int = 25,
-    batch_size: int = 100,
     label: str = "",
     custom_tickers: list[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
 ) -> pd.DataFrame:
-    logger.info("Starting screener | universe=%s | batch_size=%s | min_score=%s | max_results=%s", universe, batch_size, min_score, max_results)
-    rows = []
+    rows: list[dict] = []
     try:
         tickers = _get_tickers(universe, custom_tickers)
     except RuntimeError as exc:
         raise RuntimeError(f"Unable to fetch ticker universe '{universe}': {exc}") from exc
     if not tickers:
         return pd.DataFrame()
-    # effective_batch ensures we scan enough tickers to have a reasonable chance
-    # of finding max_results qualifying stocks (assuming ~20–30% pass rate)
-    effective_batch = max(batch_size, max_results * 3)
-    tickers = tickers[:effective_batch]
+    total = len(tickers)
+    logger.info("Scanning %s tickers in universe '%s'", total, universe)
     for i, ticker in enumerate(tickers, start=1):
         try:
             result = analyze_stock(ticker)
@@ -67,18 +63,24 @@ def run_screener(
                         **({"Index": label} if label else {}),
                     }
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Skipped %s: %s", ticker, exc)
         if progress_callback:
-            progress_callback(i / len(tickers))
-        # Stop early only if we have enough results AND have scanned at least batch_size tickers
-        if len(rows) >= max_results and i >= batch_size:
-            if progress_callback:
-                progress_callback(1.0)
-            break
-    results = pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results) if rows else pd.DataFrame()
-    results.attrs["source_ticker_count"] = len(tickers)
+            progress_callback(i / total)
+
+    if not rows:
+        results = pd.DataFrame()
+    else:
+        results = pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results).reset_index(drop=True)
+    results.attrs["source_ticker_count"] = total
+    results.attrs["qualified_count"] = len(rows)
     results.attrs["universe"] = universe
     results.attrs["fallback_used"] = False
-    logger.info("Completed screener | universe=%s | screened=%s | matched=%s", universe, len(tickers), len(results))
+    logger.info(
+        "Screener complete | universe=%s | scanned=%s | qualified=%s | displayed=%s",
+        universe,
+        total,
+        len(rows),
+        len(results),
+    )
     return results
