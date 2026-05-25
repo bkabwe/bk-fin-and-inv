@@ -6,4 +6,6 @@ plotly
 ta
 textblob
 requests
+beautifulsoup4==4.13.4
+lxml==6.1.0
 Pillow

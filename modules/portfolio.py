@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from modules.scoring_engine import analyze_stock
+from modules.scoring_engine import analyze_stock, get_price_projections
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
@@ -92,11 +92,15 @@ def analyze_portfolio_holdings() -> list[dict]:
     for holding in get_portfolio():
         try:
             analysis = analyze_stock(holding["ticker"])
+            projections = get_price_projections(holding["ticker"])
             shares = float(holding["shares"])
             avg = float(holding["avg_cost"])
             current = analysis.get("current_price") or 0
             value, basis = shares * current, shares * avg
             pnl = value - basis
+            recommendation_to_sell_at = projections.get("recommendation_to_sell_at")
+            if current and avg and current < avg:
+                recommendation_to_sell_at = f"Hold for recovery to break-even at ${avg:.2f} before considering sell."
             rows.append(
                 {
                     "Ticker": holding["ticker"],
@@ -112,6 +116,16 @@ def analyze_portfolio_holdings() -> list[dict]:
                     "Sell Signal": analysis.get("sell_recommendation"),
                     "Entry Price": analysis.get("entry_price"),
                     "Target Price": analysis.get("target_price"),
+                    "short_term_target": projections.get("short_term_target"),
+                    "short_term_upside": projections.get("short_term_upside"),
+                    "short_term_basis": projections.get("short_term_basis"),
+                    "medium_term_target": projections.get("medium_term_target"),
+                    "medium_term_upside": projections.get("medium_term_upside"),
+                    "medium_term_basis": projections.get("medium_term_basis"),
+                    "long_term_target": projections.get("long_term_target"),
+                    "long_term_upside": projections.get("long_term_upside"),
+                    "long_term_basis": projections.get("long_term_basis"),
+                    "recommendation_to_sell_at": recommendation_to_sell_at,
                 }
             )
         except Exception:
