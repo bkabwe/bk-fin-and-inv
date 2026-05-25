@@ -55,14 +55,38 @@ if get_portfolio():
 else:
     st.caption("No holdings yet.")
 
-st.subheader("Top 3 Screener Picks of the Day")
+st.subheader("🏆 Top 15 Picks of the Day")
 if st.button("Load Top Picks"):
-    with st.spinner("Running screener..."):
-        picks = run_screener("sp500", min_score=65, max_results=3)
+    picks = pd.DataFrame()
+    try:
+        with st.spinner("Running screener..."):
+            universes = [
+                ("sp500", "S&P 500"),
+                ("nasdaq100", "NASDAQ 100"),
+                ("russell2000", "Russell 2000"),
+                ("otc", "OTC"),
+            ]
+            frames = [run_screener(u, min_score=65, max_results=20, batch_size=20, label=label) for u, label in universes]
+            picks = pd.concat([df for df in frames if not df.empty], ignore_index=True) if any(not df.empty for df in frames) else pd.DataFrame()
+            if not picks.empty:
+                picks = picks.sort_values("Score", ascending=False).head(15)
+    except RuntimeError as e:
+        st.error(str(e))
+        st.stop()
     if picks.empty:
         st.warning("No picks found.")
     else:
-        st.dataframe(picks, use_container_width=True)
+        display_cols = [
+            "Ticker",
+            "Company",
+            "Index",
+            "Score",
+            "Recommendation",
+            "Time Horizon",
+            "Entry Price",
+            "Target Price",
+        ]
+        st.dataframe(picks[[c for c in display_cols if c in picks.columns]], use_container_width=True)
 
 st.subheader("Recent Notifications")
 notes = get_notifications()[:5]
