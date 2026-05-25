@@ -105,25 +105,72 @@ def get_news(ticker: str) -> list[dict[str, Any]]:
         return []
 
 
+def _safe_read_html(html: str) -> list[pd.DataFrame]:
+    try:
+        return pd.read_html(StringIO(html))
+    except Exception:
+        return []
+
+
+def _extract_tickers_from_html_table_by_symbol(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "lxml")
+    for table in soup.select("table"):
+        header_cells = table.select("thead th")
+        if not header_cells:
+            first_row = table.select_one("tr")
+            if first_row:
+                header_cells = first_row.find_all(["th", "td"])
+        headers = [cell.get_text(" ", strip=True).lower() for cell in header_cells]
+        if "symbol" not in headers:
+            continue
+        symbol_idx = headers.index("symbol")
+        tickers: list[str] = []
+        for row in table.select("tbody tr"):
+            cells = row.find_all("td")
+            if symbol_idx >= len(cells):
+                continue
+            cell = cells[symbol_idx]
+            value = cell.find("a").get_text(strip=True) if cell.find("a") else cell.get_text(strip=True)
+            ticker = _clean_ticker(value)
+            if ticker:
+                tickers.append(ticker)
+        if tickers:
+            return sorted(set(tickers))
+    return []
+
+
 @cache_data(ttl=86400)
 def get_sp500_tickers() -> list[str]:
+    url = "https://stockanalysis.com/list/sp-500-stocks/"
     try:
-        table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        tickers = sorted(set(table["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()))
+        session = requests.Session()
+        response = session.get(url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
+        response.raise_for_status()
+        tickers = _extract_tickers_from_html_table_by_symbol(response.text)
+        if not tickers:
+            tables = _safe_read_html(response.text)
+            tickers = _extract_tickers_from_tables(tables)
+        if not tickers:
+            tickers = _scrape_stockanalysis_tickers(url, max_pages=2)
         logger.info("Fetched %s S&P 500 tickers", len(tickers))
-        return tickers
-    except Exception:
-        raise RuntimeError("Failed to fetch S&P 500 tickers. Check internet connection.")
+        if tickers:
+            return tickers
+    except Exception as exc:
+        logger.error("S&P 500 scrape failed: %s", exc)
+    raise RuntimeError("Failed to fetch S&P 500 tickers from stockanalysis.com.")
 
 
 _DEFAULT_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
 }
 # Alias kept for internal helpers
 _REQUEST_HEADERS = _DEFAULT_HEADERS
+_REQUEST_TIMEOUT = 15
 
 
 def _normalize_tickers(values: list[Any], limit: int | None = None) -> list[str]:
@@ -197,7 +244,7 @@ def _scrape_stockanalysis_tickers(url: str, max_pages: int = 1, limit: int | Non
     session = requests.Session()
     for page in range(1, max_pages + 1):
         page_url = url if page == 1 else f"{url}?p={page}"
-        response = session.get(page_url, headers=_REQUEST_HEADERS, timeout=20)
+        response = session.get(page_url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
         response.raise_for_status()
         page_tickers = _extract_tickers_from_table(response.text) or _extract_tickers_from_rows(response.text)
         if not page_tickers:
@@ -266,9 +313,11 @@ def _scrape_chartmill_russell2000(base_url: str, max_pages: int = 60) -> list[st
     seen: set[str] = set()
     tickers: list[str] = []
 
-    first = session.get(base_url, headers=_REQUEST_HEADERS, timeout=20)
+    first = session.get(base_url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
     first.raise_for_status()
-    first_page_tickers = _extract_chartmill_tickers(first.text)
+    first_page_tickers = _extract_tickers_from_html_table_by_symbol(first.text) or _extract_chartmill_tickers(first.text)
+    if not first_page_tickers:
+        first_page_tickers = _extract_tickers_from_tables(_safe_read_html(first.text))
     for ticker in first_page_tickers:
         if ticker not in seen:
             seen.add(ticker)
@@ -280,10 +329,12 @@ def _scrape_chartmill_russell2000(base_url: str, max_pages: int = 60) -> list[st
 
     empty_streak = 0
     for page_url in page_urls[: max_pages - 1]:
-        response = session.get(page_url, headers=_REQUEST_HEADERS, timeout=20)
+        response = session.get(page_url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
         if response.status_code >= 400:
             continue
-        page_tickers = _extract_chartmill_tickers(response.text)
+        page_tickers = _extract_tickers_from_html_table_by_symbol(response.text) or _extract_chartmill_tickers(response.text)
+        if not page_tickers:
+            page_tickers = _extract_tickers_from_tables(_safe_read_html(response.text))
         if not page_tickers:
             empty_streak += 1
             if empty_streak >= 3:
