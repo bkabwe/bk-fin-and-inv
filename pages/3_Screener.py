@@ -15,22 +15,17 @@ if label == "Custom":
     custom = sanitize_ticker_list([x.strip() for x in txt.split(",") if x.strip()])
 
 min_score = st.slider("Min Score", 0, 100, 60)
-max_results = st.slider("Max Results", 1, 200, 25)
-batch_size = st.slider(
-    "Max stocks to screen",
-    min_value=10,
-    max_value=500,
-    value=100,
-    help=(
-        "How many stocks to analyse. Higher = more results but slower. "
-        "Screener will always scan at least 3× your Max Results to ensure enough qualifying stocks."
-    ),
-)
+max_results = st.slider("Max Results to Display", 5, 500, 25)
 st.info(
-    "💡 **Tip**: 'Max stocks to screen' controls how many tickers are analysed. "
-    "Only stocks meeting the Min Score threshold appear in results. "
-    "To get more results, increase 'Max stocks to screen' or lower 'Min Score'."
+    "ℹ️ The screener analyses **every stock** in the selected universe, then displays "
+    "the top results ranked by score. Larger universes (e.g. Russell 2000 with ~2,000 stocks) "
+    "will take longer to complete."
 )
+if map_universe[label] in ("russell2000",):
+    st.warning(
+        "⚠️ Russell 2000 contains ~2,000 stocks. A full scan may take 10–20 minutes. "
+        "Consider using a higher Min Score (e.g. 70+) to focus on the best candidates."
+    )
 time_filter = st.multiselect("Time Horizon", ["Short-Term Opportunity", "Medium-Term Setup", "Long-Term Hold"])
 sector_filter = st.text_input("Sector filter (optional)").strip().lower()
 
@@ -46,7 +41,6 @@ if st.button("Run Screener"):
                 map_universe[label],
                 min_score=min_score,
                 max_results=max_results,
-                batch_size=batch_size,
                 custom_tickers=custom,
                 progress_callback=_cb,
             )
@@ -71,9 +65,14 @@ if st.button("Run Screener"):
         if sector_filter:
             results = results[results["Company"].fillna("").str.lower().str.contains(sector_filter)]
         st.dataframe(results, use_container_width=True)
-        screened = results.attrs.get("source_ticker_count", 0)
-        matched = len(results)
-        st.caption(f"Scanned {screened} stocks → {matched} met the score threshold")
+        total_scanned = results.attrs.get("source_ticker_count", 0)
+        total_qualified = results.attrs.get("qualified_count", 0)
+        displayed = len(results)
+        st.caption(
+            f"✅ Scanned **{total_scanned}** stocks → "
+            f"**{total_qualified}** scored ≥{min_score} → "
+            f"Showing top **{displayed}** by score"
+        )
         st.download_button("Export to CSV", results.to_csv(index=False), "screener_results.csv", "text/csv")
 
 st.markdown(

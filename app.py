@@ -85,7 +85,7 @@ if st.button("Load Top Picks"):
         frames = []
         for universe, label in universes:
             try:
-                frame = run_screener(universe, min_score=65, max_results=20, batch_size=20, label=label)
+                frame = run_screener(universe, min_score=65, max_results=20, label=label)
                 if not frame.empty:
                     frames.append(frame)
             except RuntimeError as exc:
