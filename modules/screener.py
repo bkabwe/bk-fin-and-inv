@@ -29,7 +29,7 @@ def run_screener(
     universe: str = "sp500",
     min_score: int = 50,
     max_results: int = 25,
-    batch_size: int = 50,
+    batch_size: int = 100,
     label: str = "",
     custom_tickers: list[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
@@ -42,8 +42,10 @@ def run_screener(
         raise RuntimeError(f"Unable to fetch ticker universe '{universe}': {exc}") from exc
     if not tickers:
         return pd.DataFrame()
-    if batch_size:
-        tickers = tickers[: max(1, int(batch_size))]
+    # effective_batch ensures we scan enough tickers to have a reasonable chance
+    # of finding max_results qualifying stocks (assuming ~20–30% pass rate)
+    effective_batch = max(batch_size, max_results * 3)
+    tickers = tickers[:effective_batch]
     for i, ticker in enumerate(tickers, start=1):
         try:
             result = analyze_stock(ticker)
@@ -69,6 +71,11 @@ def run_screener(
             pass
         if progress_callback:
             progress_callback(i / len(tickers))
+        # Stop early only if we have enough results AND have scanned at least batch_size tickers
+        if len(rows) >= max_results and i >= batch_size:
+            if progress_callback:
+                progress_callback(1.0)
+            break
     results = pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results) if rows else pd.DataFrame()
     results.attrs["source_ticker_count"] = len(tickers)
     results.attrs["universe"] = universe
