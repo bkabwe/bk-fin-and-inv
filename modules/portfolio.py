@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from modules.scoring_engine import analyze_stock
+from modules.scoring_engine import analyze_stock, get_price_projections
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
@@ -92,12 +92,19 @@ def analyze_portfolio_holdings() -> list[dict]:
     for holding in get_portfolio():
         try:
             analysis = analyze_stock(holding["ticker"], avg_cost=float(holding["avg_cost"]))
+            projections = analysis.get("projections") or get_price_projections(holding["ticker"])
             shares = float(holding["shares"])
             avg = float(holding["avg_cost"])
             current = analysis.get("current_price") or 0
             value, basis = shares * current, shares * avg
             pnl = value - basis
-            projections = analysis.get("projections", {})
+
+            recommendation_to_sell_at = projections.get("recommendation_to_sell_at")
+            if current and avg and current < avg:
+                recommendation_to_sell_at = (
+                    f"Hold for recovery to break-even at ${avg:.2f} before considering sell."
+                )
+
             rows.append(
                 {
                     "Ticker": holding["ticker"],
@@ -113,18 +120,27 @@ def analyze_portfolio_holdings() -> list[dict]:
                     "Sell Signal": analysis.get("sell_recommendation"),
                     "Entry Price": analysis.get("entry_price"),
                     "Target Price": analysis.get("target_price"),
+                    # Full projection dict for in-card rendering
                     "Projection": projections,
                     "Projection Models": ", ".join(projections.get("models_used", [])),
                     "Projection Data Quality": projections.get("data_quality", "Limited"),
-                    "Short Target": projections.get("short_term_target"),
-                    "Short Low": projections.get("short_term_low"),
-                    "Short High": projections.get("short_term_high"),
-                    "Medium Target": projections.get("medium_term_target"),
-                    "Medium Low": projections.get("medium_term_low"),
-                    "Medium High": projections.get("medium_term_high"),
-                    "Long Target": projections.get("long_term_target"),
-                    "Long Low": projections.get("long_term_low"),
-                    "Long High": projections.get("long_term_high"),
+                    # Flat projection keys used by the expander section
+                    "short_term_target": projections.get("short_term_target"),
+                    "short_term_low": projections.get("short_term_low"),
+                    "short_term_high": projections.get("short_term_high"),
+                    "short_term_upside": projections.get("short_term_upside"),
+                    "short_term_basis": projections.get("short_term_basis"),
+                    "medium_term_target": projections.get("medium_term_target"),
+                    "medium_term_low": projections.get("medium_term_low"),
+                    "medium_term_high": projections.get("medium_term_high"),
+                    "medium_term_upside": projections.get("medium_term_upside"),
+                    "medium_term_basis": projections.get("medium_term_basis"),
+                    "long_term_target": projections.get("long_term_target"),
+                    "long_term_low": projections.get("long_term_low"),
+                    "long_term_high": projections.get("long_term_high"),
+                    "long_term_upside": projections.get("long_term_upside"),
+                    "long_term_basis": projections.get("long_term_basis"),
+                    "recommendation_to_sell_at": recommendation_to_sell_at,
                 }
             )
         except Exception:

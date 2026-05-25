@@ -25,6 +25,8 @@ def run_screener(
     universe: str = "sp500",
     min_score: int = 50,
     max_results: int = 25,
+    batch_size: int = 50,
+    label: str = "",
     custom_tickers: list[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
 ) -> pd.DataFrame:
@@ -35,6 +37,8 @@ def run_screener(
         raise RuntimeError(f"Unable to fetch ticker universe '{universe}': {exc}") from exc
     if not tickers:
         return pd.DataFrame()
+    if batch_size:
+        tickers = tickers[: max(1, int(batch_size))]
     for i, ticker in enumerate(tickers, start=1):
         try:
             result = analyze_stock(ticker)
@@ -53,6 +57,7 @@ def run_screener(
                         "Stop Loss": result["stop_loss"],
                         "Current Price": current,
                         "% from Entry": round(pct, 2) if pct is not None else None,
+                        **({"Index": label} if label else {}),
                     }
                 )
         except Exception:
