@@ -25,7 +25,7 @@ python analyze_stock.py AAPL
 - Streamlit dashboard + multipage app
 - Manual portfolio tracker with sell-signal checks
 - Watchlist management
-- Screener for S&P 500, NASDAQ 100, Russell 2000 sample, OTC sample, and custom tickers
+- Screener for S&P 500, NASDAQ 100, Russell 2000, OTC, and custom tickers
 - Notification bell with unread count + mark-all-read
 - Technical analysis (SMA/EMA, RSI, MACD, Stochastic, Bollinger, ATR, OBV, support/resistance, classic patterns)
 - Fundamental analysis scoring
