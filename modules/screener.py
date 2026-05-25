@@ -4,7 +4,7 @@ from typing import Callable
 
 import pandas as pd
 
-from modules.data_fetcher import get_nasdaq100_tickers, get_otc_sample, get_russell2000_sample, get_sp500_tickers
+from modules.data_fetcher import get_nasdaq100_tickers, get_otc_tickers, get_russell2000_tickers, get_sp500_tickers
 from modules.scoring_engine import analyze_stock
 
 
@@ -13,9 +13,9 @@ def _get_tickers(universe: str, custom_tickers: list[str] | None = None) -> list
     if universe == "nasdaq100":
         return get_nasdaq100_tickers()
     if universe == "russell2000":
-        return get_russell2000_sample()
+        return get_russell2000_tickers()
     if universe == "otc":
-        return get_otc_sample()
+        return get_otc_tickers()
     if universe == "custom":
         return [x.strip().upper() for x in (custom_tickers or []) if x.strip()]
     return get_sp500_tickers()
@@ -28,7 +28,11 @@ def run_screener(
     custom_tickers: list[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
 ) -> pd.DataFrame:
-    rows, tickers = [], _get_tickers(universe, custom_tickers)
+    rows = []
+    try:
+        tickers = _get_tickers(universe, custom_tickers)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Unable to fetch ticker universe '{universe}': {exc}") from exc
     if not tickers:
         return pd.DataFrame()
     for i, ticker in enumerate(tickers, start=1):
@@ -55,4 +59,8 @@ def run_screener(
             pass
         if progress_callback:
             progress_callback(i / len(tickers))
-    return pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results) if rows else pd.DataFrame()
+    results = pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results) if rows else pd.DataFrame()
+    results.attrs["source_ticker_count"] = len(tickers)
+    results.attrs["universe"] = universe
+    results.attrs["fallback_used"] = False
+    return results

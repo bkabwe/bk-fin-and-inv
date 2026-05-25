@@ -91,12 +91,13 @@ def analyze_portfolio_holdings() -> list[dict]:
     rows = []
     for holding in get_portfolio():
         try:
-            analysis = analyze_stock(holding["ticker"])
+            analysis = analyze_stock(holding["ticker"], avg_cost=float(holding["avg_cost"]))
             shares = float(holding["shares"])
             avg = float(holding["avg_cost"])
             current = analysis.get("current_price") or 0
             value, basis = shares * current, shares * avg
             pnl = value - basis
+            projections = analysis.get("projections", {})
             rows.append(
                 {
                     "Ticker": holding["ticker"],
@@ -112,6 +113,18 @@ def analyze_portfolio_holdings() -> list[dict]:
                     "Sell Signal": analysis.get("sell_recommendation"),
                     "Entry Price": analysis.get("entry_price"),
                     "Target Price": analysis.get("target_price"),
+                    "Projection": projections,
+                    "Projection Models": ", ".join(projections.get("models_used", [])),
+                    "Projection Data Quality": projections.get("data_quality", "Limited"),
+                    "Short Target": projections.get("short_term_target"),
+                    "Short Low": projections.get("short_term_low"),
+                    "Short High": projections.get("short_term_high"),
+                    "Medium Target": projections.get("medium_term_target"),
+                    "Medium Low": projections.get("medium_term_low"),
+                    "Medium High": projections.get("medium_term_high"),
+                    "Long Target": projections.get("long_term_target"),
+                    "Long Low": projections.get("long_term_low"),
+                    "Long High": projections.get("long_term_high"),
                 }
             )
         except Exception:

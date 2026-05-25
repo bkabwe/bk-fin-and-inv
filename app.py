@@ -57,8 +57,12 @@ else:
 
 st.subheader("Top 3 Screener Picks of the Day")
 if st.button("Load Top Picks"):
-    with st.spinner("Running screener..."):
-        picks = run_screener("sp500", min_score=65, max_results=3)
+    try:
+        with st.spinner("Running screener..."):
+            picks = run_screener("sp500", min_score=65, max_results=3)
+    except RuntimeError as e:
+        st.error(str(e))
+        st.stop()
     if picks.empty:
         st.warning("No picks found.")
     else:

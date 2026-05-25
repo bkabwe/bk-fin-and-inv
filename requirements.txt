@@ -6,4 +6,9 @@ plotly
 ta
 textblob
 requests
+beautifulsoup4
+lxml
+prophet
+statsmodels
+scikit-learn
 Pillow
