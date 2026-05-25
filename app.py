@@ -8,9 +8,22 @@ from modules.notifications import get_notifications, get_unread_count, mark_all_
 from modules.portfolio import analyze_portfolio_holdings, get_portfolio
 from modules.scoring_engine import analyze_stock
 from modules.screener import run_screener
+from modules.validators import sanitize_ticker
 
 st.set_page_config(page_title="BK Stock Market Analyzer", page_icon="📈", layout="wide")
 st.title("📈 BK Stock Market Analyzer")
+
+if not st.session_state.get("disclaimer_shown"):
+    st.warning(
+        "⚠️ **Disclaimer**: This application is for informational and educational purposes only. "
+        "It does not constitute financial advice. Always consult a qualified financial advisor "
+        "before making investment decisions. Past performance is not indicative of future results.",
+        icon="⚠️",
+    )
+    if st.button("I understand — Continue"):
+        st.session_state["disclaimer_shown"] = True
+        st.rerun()
+    st.stop()
 
 _, bell_col = st.columns([8, 2])
 with bell_col:
@@ -30,8 +43,12 @@ st.sidebar.header("Navigation")
 st.sidebar.info("Use the built-in Pages menu to open Portfolio, Watchlist, Screener, Stock Analysis, and News Sentiment.")
 quick_ticker = st.sidebar.text_input("Quick Analyze", value="AAPL")
 if st.sidebar.button("Run Quick Analyze"):
-    quick = analyze_stock(quick_ticker)
-    st.sidebar.success(f"{quick['score']} - {quick['recommendation']}")
+    try:
+        safe_ticker = sanitize_ticker(quick_ticker)
+        quick = analyze_stock(safe_ticker)
+        st.sidebar.success(f"{quick['score']} - {quick['recommendation']}")
+    except ValueError as exc:
+        st.sidebar.error(str(exc))
 
 st.subheader("Market Overview")
 rows = []
@@ -58,21 +75,24 @@ else:
 st.subheader("🏆 Top 15 Picks of the Day")
 if st.button("Load Top Picks"):
     picks = pd.DataFrame()
-    try:
-        with st.spinner("Running screener..."):
-            universes = [
-                ("sp500", "S&P 500"),
-                ("nasdaq100", "NASDAQ 100"),
-                ("russell2000", "Russell 2000"),
-                ("otc", "OTC"),
-            ]
-            frames = [run_screener(u, min_score=65, max_results=20, batch_size=20, label=label) for u, label in universes]
-            picks = pd.concat([df for df in frames if not df.empty], ignore_index=True) if any(not df.empty for df in frames) else pd.DataFrame()
-            if not picks.empty:
-                picks = picks.sort_values("Score", ascending=False).head(15)
-    except RuntimeError as e:
-        st.error(str(e))
-        st.stop()
+    with st.spinner("Running screener..."):
+        universes = [
+            ("sp500", "S&P 500"),
+            ("nasdaq100", "NASDAQ 100"),
+            ("russell2000", "Russell 2000"),
+            ("otc", "OTC"),
+        ]
+        frames = []
+        for universe, label in universes:
+            try:
+                frame = run_screener(universe, min_score=65, max_results=20, batch_size=20, label=label)
+                if not frame.empty:
+                    frames.append(frame)
+            except RuntimeError as exc:
+                st.warning(f"Could not load {label} universe: {exc}")
+        picks = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not picks.empty:
+            picks = picks.sort_values("Score", ascending=False).head(15)
     if picks.empty:
         st.warning("No picks found.")
     else:

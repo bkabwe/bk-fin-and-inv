@@ -7,6 +7,7 @@ import streamlit as st
 
 from modules.notifications import add_notification
 from modules.portfolio import add_holding, analyze_portfolio_holdings, get_portfolio, remove_holding, update_holding
+from modules.validators import sanitize_ticker
 
 
 def _fmt_money(value) -> str:
@@ -27,8 +28,12 @@ with st.form("add_holding_form"):
     date_purchased = c4.date_input("Date Purchased")
     notes = c5.text_input("Notes")
     if st.form_submit_button("Add Holding") and ticker:
-        add_holding(ticker, shares, avg_cost, str(date_purchased), notes)
-        st.success(f"Added {ticker}")
+        try:
+            safe_ticker = sanitize_ticker(ticker)
+            add_holding(safe_ticker, shares, avg_cost, str(date_purchased), notes)
+            st.success(f"Added {safe_ticker}")
+        except ValueError as exc:
+            st.error(str(exc))
 
 portfolio = get_portfolio()
 if not portfolio:

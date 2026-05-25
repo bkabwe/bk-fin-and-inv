@@ -1,17 +1,38 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from modules.validators import sanitize_ticker
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 NOTIFICATIONS_FILE = DATA_DIR / "notifications.json"
+MAX_NOTIFICATIONS = 100
 
 
 def _ensure():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not NOTIFICATIONS_FILE.exists():
-        NOTIFICATIONS_FILE.write_text("[]", encoding="utf-8")
+        _atomic_write(NOTIFICATIONS_FILE, [])
+
+
+def _atomic_write(path: Path, data) -> None:
+    """Write JSON atomically using temp file + rename to prevent corruption."""
+    dir_path = path.parent
+    dir_path.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=dir_path,
+        delete=False,
+        suffix=".tmp",
+    ) as tmp:
+        json.dump(data, tmp, indent=2)
+        tmp_path = tmp.name
+    os.replace(tmp_path, path)
 
 
 def _load() -> list[dict]:
@@ -24,20 +45,25 @@ def _load() -> list[dict]:
 
 def _save(items: list[dict]):
     _ensure()
-    NOTIFICATIONS_FILE.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    _atomic_write(NOTIFICATIONS_FILE, items)
 
 
 def add_notification(title: str, message: str, ticker: str, type: str = "info") -> dict:
     items = _load()
+    try:
+        safe_ticker = sanitize_ticker(ticker)
+    except ValueError:
+        safe_ticker = "UNKNOWN"
     note = {
         "title": title,
         "message": message,
-        "ticker": ticker.upper(),
+        "ticker": safe_ticker,
         "type": type,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "read": False,
     }
     items.insert(0, note)
+    items = items[:MAX_NOTIFICATIONS]
     _save(items)
     return note
 

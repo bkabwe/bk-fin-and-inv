@@ -6,14 +6,18 @@ import streamlit as st
 from modules.data_fetcher import get_stock_data
 from modules.portfolio import add_holding, add_to_watchlist, get_watchlist, remove_from_watchlist
 from modules.scoring_engine import analyze_stock
+from modules.validators import sanitize_ticker
 
 st.title("👀 Watchlist")
 
 c1, c2 = st.columns([3, 1])
 new_ticker = c1.text_input("Add to Watchlist", value="").upper()
 if c2.button("Add") and new_ticker:
-    add_to_watchlist(new_ticker)
-    st.rerun()
+    try:
+        add_to_watchlist(sanitize_ticker(new_ticker))
+        st.rerun()
+    except ValueError as exc:
+        st.error(str(exc))
 
 watchlist = get_watchlist()
 if not watchlist:

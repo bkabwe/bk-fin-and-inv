@@ -1,21 +1,42 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
+from modules.logger import get_logger
 from modules.scoring_engine import analyze_stock, get_price_projections
+from modules.validators import sanitize_ticker
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
 WATCHLIST_FILE = DATA_DIR / "watchlist.json"
+logger = get_logger(__name__)
 
 
 def _ensure():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not PORTFOLIO_FILE.exists():
-        PORTFOLIO_FILE.write_text("[]", encoding="utf-8")
+        _atomic_write(PORTFOLIO_FILE, [])
     if not WATCHLIST_FILE.exists():
-        WATCHLIST_FILE.write_text("[]", encoding="utf-8")
+        _atomic_write(WATCHLIST_FILE, [])
+
+
+def _atomic_write(path: Path, data) -> None:
+    """Write JSON atomically using temp file + rename to prevent corruption."""
+    dir_path = path.parent
+    dir_path.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=dir_path,
+        delete=False,
+        suffix=".tmp",
+    ) as tmp:
+        json.dump(data, tmp, indent=2)
+        tmp_path = tmp.name
+    os.replace(tmp_path, path)
 
 
 def _load(path: Path):
@@ -28,7 +49,7 @@ def _load(path: Path):
 
 def _save(path: Path, payload):
     _ensure()
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _atomic_write(path, payload)
 
 
 def get_portfolio() -> list[dict]:
@@ -40,30 +61,34 @@ def save_portfolio(portfolio: list[dict]):
 
 
 def add_holding(ticker: str, shares: float, avg_cost: float, date_purchased: str, notes: str = ""):
-    ticker = ticker.upper().strip()
+    ticker = sanitize_ticker(ticker)
     portfolio = get_portfolio()
     match = next((x for x in portfolio if x.get("ticker") == ticker), None)
     data = {"ticker": ticker, "shares": float(shares), "avg_cost": float(avg_cost), "date_purchased": date_purchased, "notes": notes}
     if match:
         match.update(data)
+        logger.info("Updated holding %s in portfolio", ticker)
     else:
         portfolio.append(data)
+        logger.info("Added holding %s to portfolio", ticker)
     save_portfolio(portfolio)
 
 
 def remove_holding(ticker: str):
-    ticker = ticker.upper().strip()
+    ticker = sanitize_ticker(ticker)
     save_portfolio([x for x in get_portfolio() if x.get("ticker") != ticker])
+    logger.info("Removed holding %s from portfolio", ticker)
 
 
 def update_holding(ticker: str, shares: float, avg_cost: float):
-    ticker = ticker.upper().strip()
+    ticker = sanitize_ticker(ticker)
     portfolio = get_portfolio()
     for h in portfolio:
         if h.get("ticker") == ticker:
             h["shares"] = float(shares)
             h["avg_cost"] = float(avg_cost)
     save_portfolio(portfolio)
+    logger.info("Updated holding %s shares/cost in portfolio", ticker)
 
 
 def get_watchlist() -> list[str]:
@@ -75,7 +100,7 @@ def save_watchlist(watchlist: list[str]):
 
 
 def add_to_watchlist(ticker: str):
-    ticker = ticker.upper().strip()
+    ticker = sanitize_ticker(ticker)
     watchlist = get_watchlist()
     if ticker and ticker not in watchlist:
         watchlist.append(ticker)
@@ -83,7 +108,7 @@ def add_to_watchlist(ticker: str):
 
 
 def remove_from_watchlist(ticker: str):
-    ticker = ticker.upper().strip()
+    ticker = sanitize_ticker(ticker)
     save_watchlist([x for x in get_watchlist() if x != ticker])
 
 
@@ -143,6 +168,44 @@ def analyze_portfolio_holdings() -> list[dict]:
                     "recommendation_to_sell_at": recommendation_to_sell_at,
                 }
             )
-        except Exception:
-            continue
+        except Exception as exc:
+            ticker = str(holding.get("ticker", "UNKNOWN"))
+            logger.error("Failed to analyze holding %s", ticker, exc_info=True)
+            rows.append(
+                {
+                    "Ticker": ticker,
+                    "Shares": float(holding.get("shares", 0) or 0),
+                    "Avg Cost": float(holding.get("avg_cost", 0) or 0),
+                    "Current Price": None,
+                    "Current Value": 0.0,
+                    "Cost Basis": 0.0,
+                    "P&L $": 0.0,
+                    "P&L %": 0.0,
+                    "Score": 0,
+                    "Recommendation": "⚠️ Analysis Failed",
+                    "Error": str(exc),
+                    "Sell Signal": "⚠️ Analysis Failed",
+                    "Entry Price": None,
+                    "Target Price": None,
+                    "Projection": {},
+                    "Projection Models": "",
+                    "Projection Data Quality": "Limited",
+                    "short_term_target": None,
+                    "short_term_low": None,
+                    "short_term_high": None,
+                    "short_term_upside": None,
+                    "short_term_basis": None,
+                    "medium_term_target": None,
+                    "medium_term_low": None,
+                    "medium_term_high": None,
+                    "medium_term_upside": None,
+                    "medium_term_basis": None,
+                    "long_term_target": None,
+                    "long_term_low": None,
+                    "long_term_high": None,
+                    "long_term_upside": None,
+                    "long_term_basis": None,
+                    "recommendation_to_sell_at": "Unable to compute recommendation due to analysis error.",
+                }
+            )
     return rows

@@ -3,6 +3,7 @@ from __future__ import annotations
 import streamlit as st
 
 from modules.screener import run_screener
+from modules.validators import sanitize_ticker_list
 
 st.title("🔍 Stock Screener")
 
@@ -11,7 +12,7 @@ map_universe = {"S&P 500": "sp500", "NASDAQ 100": "nasdaq100", "Russell 2000": "
 custom = []
 if label == "Custom":
     txt = st.text_area("Custom tickers (comma separated)", "AAPL,MSFT,NLST")
-    custom = [x.strip().upper() for x in txt.split(",") if x.strip()]
+    custom = sanitize_ticker_list([x.strip() for x in txt.split(",") if x.strip()])
 
 min_score = st.slider("Min Score", 0, 100, 60)
 max_results = st.slider("Max Results", 5, 100, 25)

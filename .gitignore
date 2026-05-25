@@ -1,3 +1,27 @@
+# Personal financial data - never commit
+data/portfolio.json
+data/watchlist.json
+data/notifications.json
+data/*.json
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
 .venv/
+venv/
+
+# Logs
+logs/

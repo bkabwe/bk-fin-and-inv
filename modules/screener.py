@@ -5,7 +5,11 @@ from typing import Callable
 import pandas as pd
 
 from modules.data_fetcher import get_nasdaq100_tickers, get_otc_tickers, get_russell2000_tickers, get_sp500_tickers
+from modules.logger import get_logger
 from modules.scoring_engine import analyze_stock
+from modules.validators import sanitize_ticker_list
+
+logger = get_logger(__name__)
 
 
 def _get_tickers(universe: str, custom_tickers: list[str] | None = None) -> list[str]:
@@ -17,7 +21,7 @@ def _get_tickers(universe: str, custom_tickers: list[str] | None = None) -> list
     if universe == "otc":
         return get_otc_tickers()
     if universe == "custom":
-        return [x.strip().upper() for x in (custom_tickers or []) if x.strip()]
+        return sanitize_ticker_list(custom_tickers or [])
     return get_sp500_tickers()
 
 
@@ -30,6 +34,7 @@ def run_screener(
     custom_tickers: list[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
 ) -> pd.DataFrame:
+    logger.info("Starting screener | universe=%s | batch_size=%s | min_score=%s | max_results=%s", universe, batch_size, min_score, max_results)
     rows = []
     try:
         tickers = _get_tickers(universe, custom_tickers)
@@ -68,4 +73,5 @@ def run_screener(
     results.attrs["source_ticker_count"] = len(tickers)
     results.attrs["universe"] = universe
     results.attrs["fallback_used"] = False
+    logger.info("Completed screener | universe=%s | screened=%s | matched=%s", universe, len(tickers), len(results))
     return results

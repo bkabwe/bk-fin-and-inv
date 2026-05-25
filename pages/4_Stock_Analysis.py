@@ -4,16 +4,25 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
 
 from modules.data_fetcher import get_stock_data
 from modules.scoring_engine import analyze_stock
+from modules.validators import sanitize_ticker
 
 st.title("📊 Deep Dive Stock Analysis")
-ticker = st.text_input("Ticker", value="AAPL").upper()
+ticker_input = st.text_input("Ticker", value="AAPL")
 period_map = {"1M": "1mo", "3M": "3mo", "6M": "6mo", "1Y": "1y", "2Y": "2y", "5Y": "5y"}
 period = st.selectbox("Time Period", list(period_map.keys()), index=3)
 
-if ticker:
+if ticker_input:
+    try:
+        ticker = sanitize_ticker(ticker_input)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+
     analysis = analyze_stock(ticker, period=period_map[period], interval="1d")
     df = get_stock_data(ticker, period=period_map[period], interval="1d")
     if df.empty:
@@ -31,6 +40,32 @@ if ticker:
         fig.add_hline(y=lvl, line_dash="dash", line_color="green", row=1, col=1)
     for lvl in analysis["technical"].get("resistance_levels", []):
         fig.add_hline(y=lvl, line_dash="dash", line_color="orange", row=1, col=1)
+    if "bb_high" in tech.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=tech.index,
+                y=tech["bb_high"],
+                mode="lines",
+                name="BB Upper",
+                line=dict(color="gray", dash="dot"),
+            ),
+            row=1,
+            col=1,
+        )
+    if "bb_low" in tech.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=tech.index,
+                y=tech["bb_low"],
+                mode="lines",
+                name="BB Lower",
+                line=dict(color="gray", dash="dot"),
+                fill="tonexty",
+                fillcolor="rgba(128,128,128,0.1)",
+            ),
+            row=1,
+            col=1,
+        )
     for value, color in [
         (analysis.get("entry_price"), "green"),
         (analysis.get("target_price"), "blue"),
@@ -38,12 +73,19 @@ if ticker:
     ]:
         if value:
             fig.add_hline(y=value, line_dash="dot", line_color=color, row=1, col=1)
-    rsi = pd.Series([analysis["technical"]["indicators"].get("rsi")] * len(df), index=df.index)
-    macd = pd.Series([analysis["technical"]["indicators"].get("macd")] * len(df), index=df.index)
-    signal = pd.Series([analysis["technical"]["indicators"].get("macd_signal")] * len(df), index=df.index)
-    fig.add_trace(go.Scatter(x=df.index, y=rsi, mode="lines", name="RSI"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=macd, mode="lines", name="MACD"), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=signal, mode="lines", name="Signal"), row=3, col=1)
+
+    rsi = tech["rsi"] if "rsi" in tech.columns else RSIIndicator(df["Close"], window=14).rsi()
+    if "macd" in tech.columns and "macd_signal" in tech.columns:
+        macd = tech["macd"]
+        signal = tech["macd_signal"]
+    else:
+        macd_calc = MACD(df["Close"], 26, 12, 9)
+        macd = macd_calc.macd()
+        signal = macd_calc.macd_signal()
+
+    fig.add_trace(go.Scatter(x=rsi.index, y=rsi, mode="lines", name="RSI"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=macd.index, y=macd, mode="lines", name="MACD"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=signal.index, y=signal, mode="lines", name="Signal"), row=3, col=1)
     for i, p in enumerate(analysis["technical"].get("patterns", [])[:3], start=1):
         fig.add_annotation(x=df.index[-1], y=float(df["Close"].iloc[-1]) * (1 + i * 0.02), text=p["name"], showarrow=True)
     fig.update_layout(height=900, xaxis_rangeslider_visible=False)
