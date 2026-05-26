@@ -4,7 +4,7 @@ from typing import Callable
 
 import pandas as pd
 
-from modules.data_fetcher import get_nasdaq100_tickers, get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_russell2000_tickers, get_sp500_tickers
+from modules.data_fetcher import get_nasdaq_tickers, get_nasdaq100_tickers, get_nyseamerican_tickers, get_otc_tickers, get_russell2000_tickers, get_sp500_tickers
 from modules.logger import get_logger
 from modules.scoring_engine import analyze_stock
 from modules.validators import sanitize_ticker_list
