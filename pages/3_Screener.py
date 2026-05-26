@@ -7,8 +7,8 @@ from modules.validators import sanitize_ticker_list
 
 st.title("🔍 Stock Screener")
 
-label = st.selectbox("Universe", ["S&P 500", "NASDAQ 100", "Russell 2000", "OTC", "Custom"])
-map_universe = {"S&P 500": "sp500", "NASDAQ 100": "nasdaq100", "Russell 2000": "russell2000", "OTC": "otc", "Custom": "custom"}
+label = st.selectbox("Universe", ["S&P 500", "NASDAQ", "NYSE American", "OTC", "Custom"])
+map_universe = {"S&P 500": "sp500", "NASDAQ": "nasdaq", "NYSE American": "nyseamerican", "OTC": "otc", "Custom": "custom"}
 custom = []
 if label == "Custom":
     txt = st.text_area("Custom tickers (comma separated)", "AAPL,MSFT,NLST")
@@ -21,9 +21,9 @@ st.info(
     "the top results ranked by score. Larger universes (e.g. Russell 2000 with ~2,000 stocks) "
     "will take longer to complete."
 )
-if map_universe[label] in ("russell2000",):
+if map_universe[label] in ("nasdaq", "otc"):
     st.warning(
-        "⚠️ Russell 2000 contains ~2,000 stocks. A full scan may take 10–20 minutes. "
+        f"⚠️ {label} contains thousands of stocks. A full scan may take a long time. "
         "Consider using a higher Min Score (e.g. 70+) to focus on the best candidates."
     )
 time_filter = st.multiselect("Time Horizon", ["Short-Term Opportunity", "Medium-Term Setup", "Long-Term Hold"])
@@ -53,10 +53,10 @@ if st.button("Run Screener"):
             f"⚠️ Could not fetch live ticker list. Results based on fallback list of {count} stocks. "
             "Check your internet connection."
         )
-    if map_universe[label] == "russell2000":
+    if map_universe[label] in ("nasdaq", "otc", "nyseamerican"):
         count = int(results.attrs.get("source_ticker_count", 0))
         if count and count < 50:
-            st.warning(f"⚠️ Russell 2000 scrape returned only {count} tickers. Results may be incomplete.")
+            st.warning(f"⚠️ {label} scrape returned only {count} tickers. Results may be incomplete.")
     if results.empty:
         st.warning("No results.")
     else:

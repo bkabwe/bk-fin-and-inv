@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from modules.data_fetcher import get_nasdaq100_tickers, get_otc_tickers, get_russell2000_tickers, get_sp500_tickers, get_stock_data
+from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers, get_stock_data
 from modules.portfolio import get_portfolio
 from modules.scoring_engine import analyze_stock
 
@@ -43,11 +43,20 @@ horizon = st.radio(
 
 selected_universes = st.multiselect(
     "Universe",
-    ["S&P 500", "NASDAQ 100", "Russell 2000", "OTC", "My Portfolio"],
-    default=["S&P 500", "NASDAQ 100"],
+    ["S&P 500", "NASDAQ", "NYSE American", "OTC", "My Portfolio"],
+    default=["S&P 500", "NASDAQ"],
 )
 min_upside_pct = st.slider("Min Upside %", min_value=5, max_value=100, value=15)
-batch_size = st.slider("Max stocks to scan", min_value=20, max_value=200, value=50)
+st.info(
+    "ℹ️ This page analyses **every stock** in your selected universes and surfaces "
+    "the highest projected profit opportunities. Larger universes will take longer."
+)
+large = [u for u in selected_universes if u in ("NASDAQ", "OTC")]
+if large:
+    st.warning(
+        f"⚠️ {' and '.join(large)} contain thousands of stocks. "
+        "A full scan can take 30–60 minutes. Consider starting with S&P 500 or NYSE American."
+    )
 
 
 @st.cache_data(ttl=1800)
@@ -158,11 +167,11 @@ def estimate_target_date(ticker: str, target_price: float, horizon_value: str, r
     return _format_date_range(est, confidence), confidence
 
 
-def _collect_tickers(universes: list[str], max_scan: int) -> tuple[list[str], dict[str, str]]:
+def _collect_tickers(universes: list[str]) -> tuple[list[str], dict[str, str]]:
     universe_fetchers = {
         "S&P 500": get_sp500_tickers,
-        "NASDAQ 100": get_nasdaq100_tickers,
-        "Russell 2000": get_russell2000_tickers,
+        "NASDAQ": get_nasdaq_tickers,
+        "NYSE American": get_nyseamerican_tickers,
         "OTC": get_otc_tickers,
     }
 
@@ -193,12 +202,11 @@ def _collect_tickers(universes: list[str], max_scan: int) -> tuple[list[str], di
                 ordered.append(clean)
             source_map[clean].add(universe_name)
 
-    ordered = ordered[:max_scan]
     return ordered, {k: ", ".join(sorted(v)) for k, v in source_map.items() if k in ordered}
 
 
 if st.button("Run Analysis"):
-    tickers, source_labels = _collect_tickers(selected_universes, batch_size)
+    tickers, source_labels = _collect_tickers(selected_universes)
     if not tickers:
         st.warning("No tickers available for analysis.")
     else:
@@ -226,10 +234,13 @@ if st.button("Run Analysis"):
                 continue
             progress.progress(i / len(tickers))
         st.session_state["profit_opportunities_scan"] = rows
+        st.session_state["profit_opportunities_scanned_total"] = len(tickers)
 
 scan_rows = st.session_state.get("profit_opportunities_scan", [])
+total_scanned = st.session_state.get("profit_opportunities_scanned_total", 0)
 
-if scan_rows:
+if total_scanned:
+    max_results = st.slider("Max Results to Display", 5, 200, 25)
     horizon_map = {
         "Short-Term (1–4 weeks)": ("short_term_target", "short_term_upside", "short_term_basis"),
         "Medium-Term (1–6 months)": ("medium_term_target", "medium_term_upside", "medium_term_basis"),
@@ -261,10 +272,21 @@ if scan_rows:
             }
         )
 
-    if not display_rows:
-        st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside % or scanning more stocks.")
+    display_rows_all = display_rows
+    if not display_rows_all:
+        st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside %.")
+        st.caption(
+            f"✅ Scanned **{total_scanned}** stocks → "
+            f"**{len([r for r in display_rows_all if r])}** met the upside threshold → "
+            "Showing top **0**"
+        )
     else:
-        results_df = pd.DataFrame(display_rows).sort_values("Projected Upside %", ascending=False)
+        results_df = pd.DataFrame(display_rows_all).sort_values("Projected Upside %", ascending=False).head(max_results)
+        st.caption(
+            f"✅ Scanned **{total_scanned}** stocks → "
+            f"**{len([r for r in display_rows_all if r])}** met the upside threshold → "
+            f"Showing top **{len(results_df)}**"
+        )
 
         styled = results_df.style.format(
             {
