@@ -4,7 +4,7 @@ from typing import Callable
 
 import pandas as pd
 
-from modules.data_fetcher import get_nasdaq100_tickers, get_otc_tickers, get_russell2000_tickers, get_sp500_tickers
+from modules.data_fetcher import get_nasdaq100_tickers, get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_russell2000_tickers, get_sp500_tickers
 from modules.logger import get_logger
 from modules.scoring_engine import analyze_stock
 from modules.validators import sanitize_ticker_list
@@ -14,8 +14,12 @@ logger = get_logger(__name__)
 
 def _get_tickers(universe: str, custom_tickers: list[str] | None = None) -> list[str]:
     universe = (universe or "sp500").lower()
+    if universe == "nasdaq":
+        return get_nasdaq_tickers()
     if universe == "nasdaq100":
         return get_nasdaq100_tickers()
+    if universe == "nyseamerican":
+        return get_nyseamerican_tickers()
     if universe == "russell2000":
         return get_russell2000_tickers()
     if universe == "otc":

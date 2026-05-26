@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from modules.data_fetcher import get_nasdaq100_tickers, get_otc_tickers, get_russell2000_tickers, get_sp500_tickers, get_stock_data
+from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers, get_stock_data
 from modules.portfolio import get_portfolio
 from modules.scoring_engine import analyze_stock
 
@@ -43,19 +43,19 @@ horizon = st.radio(
 
 selected_universes = st.multiselect(
     "Universe",
-    ["S&P 500", "NASDAQ 100", "Russell 2000", "OTC", "My Portfolio"],
-    default=["S&P 500", "NASDAQ 100"],
+    ["S&P 500", "NASDAQ", "NYSE American", "OTC", "My Portfolio"],
+    default=["S&P 500", "NASDAQ"],
 )
 min_upside_pct = st.slider("Min Upside %", min_value=5, max_value=100, value=15)
 st.info(
     "ℹ️ This page analyses **every stock** in your selected universes and surfaces "
     "the highest projected profit opportunities. Larger universes will take longer."
 )
-large = [u for u in selected_universes if u in ("Russell 2000", "OTC")]
+large = [u for u in selected_universes if u in ("NASDAQ", "OTC")]
 if large:
     st.warning(
         f"⚠️ {' and '.join(large)} contain thousands of stocks. "
-        "A full scan can take 30–60 minutes. Consider starting with S&P 500 or NASDAQ 100."
+        "A full scan can take 30–60 minutes. Consider starting with S&P 500 or NYSE American."
     )
 
 
@@ -170,8 +170,8 @@ def estimate_target_date(ticker: str, target_price: float, horizon_value: str, r
 def _collect_tickers(universes: list[str]) -> tuple[list[str], dict[str, str]]:
     universe_fetchers = {
         "S&P 500": get_sp500_tickers,
-        "NASDAQ 100": get_nasdaq100_tickers,
-        "Russell 2000": get_russell2000_tickers,
+        "NASDAQ": get_nasdaq_tickers,
+        "NYSE American": get_nyseamerican_tickers,
         "OTC": get_otc_tickers,
     }
 
