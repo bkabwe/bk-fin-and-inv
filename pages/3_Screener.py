@@ -18,7 +18,7 @@ min_score = st.slider("Min Score", 0, 100, 60)
 max_results = st.slider("Max Results to Display", 5, 500, 25)
 st.info(
     "ℹ️ The screener analyses **every stock** in the selected universe, then displays "
-    "the top results ranked by score. Larger universes (e.g. Russell 2000 with ~2,000 stocks) "
+    "the top results ranked by score. Larger universes (e.g. NASDAQ with 3,000+ stocks or OTC) "
     "will take longer to complete."
 )
 if map_universe[label] in ("nasdaq", "otc"):
@@ -66,12 +66,11 @@ if st.button("Run Screener"):
             results = results[results["Company"].fillna("").str.lower().str.contains(sector_filter)]
         st.dataframe(results, use_container_width=True)
         total_scanned = results.attrs.get("source_ticker_count", 0)
-        total_qualified = results.attrs.get("qualified_count", 0)
-        displayed = len(results)
+        total_qualified = results.attrs.get("qualified_count", len(results))
         st.caption(
             f"✅ Scanned **{total_scanned}** stocks → "
             f"**{total_qualified}** scored ≥{min_score} → "
-            f"Showing top **{displayed}** by score"
+            f"Showing top **{len(results)}** by score"
         )
         st.download_button("Export to CSV", results.to_csv(index=False), "screener_results.csv", "text/csv")
 

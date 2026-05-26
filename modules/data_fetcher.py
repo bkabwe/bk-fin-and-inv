@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import re
 import time
 from functools import lru_cache
 from io import StringIO
 from typing import Any
-from urllib.parse import urljoin
 
 import pandas as pd
 import requests
@@ -310,102 +308,6 @@ def _scrape_stockanalysis_tickers(url: str, max_pages: int = 1, limit: int | Non
         if len(tickers) == before:
             break
     return tickers[:limit] if limit else tickers
-
-
-def _extract_chartmill_tickers(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "lxml")
-    found: set[str] = set()
-
-    for table in soup.select("table"):
-        for row in table.select("tbody tr"):
-            for cell in row.find_all("td")[:3]:
-                ticker = _clean_ticker(cell.get_text(strip=True))
-                if ticker:
-                    found.add(ticker)
-            for anchor in row.find_all("a", href=True):
-                ticker = _clean_ticker(anchor.get_text(strip=True))
-                if ticker:
-                    found.add(ticker)
-                match = re.search(r"/stock/(?:quote|fundamental)/([A-Za-z0-9.\-]+)", anchor["href"])
-                if match:
-                    ticker = _clean_ticker(match.group(1))
-                    if ticker:
-                        found.add(ticker)
-
-    for value in re.findall(r'"symbol"\s*:\s*"([A-Za-z0-9.\-]+)"', html):
-        ticker = _clean_ticker(value)
-        if ticker:
-            found.add(ticker)
-
-    return sorted(found)
-
-
-def _collect_chartmill_pagination_urls(base_url: str, html: str) -> list[str]:
-    soup = BeautifulSoup(html, "lxml")
-    urls: list[str] = []
-    seen: set[str] = set()
-    for anchor in soup.select("a[href]"):
-        href = anchor.get("href") or ""
-        if "russell-2000" not in href:
-            continue
-        if not re.search(r"[?&](?:page|p)=\d+", href):
-            continue
-        full_url = urljoin(base_url, href)
-        if full_url in seen:
-            continue
-        seen.add(full_url)
-        urls.append(full_url)
-    return urls
-
-
-def _scrape_chartmill_russell2000(base_url: str, max_pages: int = 60) -> list[str]:
-    session = requests.Session()
-    seen: set[str] = set()
-    tickers: list[str] = []
-
-    first = session.get(base_url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
-    first.raise_for_status()
-    first_page_tickers = _extract_tickers_from_html_table_by_symbol(first.text) or _extract_chartmill_tickers(first.text)
-    if not first_page_tickers:
-        first_page_tickers = _extract_tickers_from_tables(_safe_read_html(first.text))
-    for ticker in first_page_tickers:
-        if ticker not in seen:
-            seen.add(ticker)
-            tickers.append(ticker)
-
-    page_urls = _collect_chartmill_pagination_urls(base_url, first.text)
-    if not page_urls:
-        page_urls = [f"{base_url}?page={page}" for page in range(2, max_pages + 1)]
-
-    empty_streak = 0
-    for page_url in page_urls[: max_pages - 1]:
-        response = session.get(page_url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
-        if response.status_code >= 400:
-            continue
-        page_tickers = _extract_tickers_from_html_table_by_symbol(response.text) or _extract_chartmill_tickers(response.text)
-        if not page_tickers:
-            page_tickers = _extract_tickers_from_tables(_safe_read_html(response.text))
-        if not page_tickers:
-            empty_streak += 1
-            if empty_streak >= 3:
-                break
-            continue
-
-        before = len(tickers)
-        for ticker in page_tickers:
-            if ticker in seen:
-                continue
-            seen.add(ticker)
-            tickers.append(ticker)
-
-        if len(tickers) == before:
-            empty_streak += 1
-            if empty_streak >= 3:
-                break
-        else:
-            empty_streak = 0
-
-    return tickers
 
 
 @cache_data(ttl=86400)

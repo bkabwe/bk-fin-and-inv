@@ -272,19 +272,14 @@ if total_scanned:
             }
         )
 
-    display_rows_all = display_rows
-    if not display_rows_all:
+    if not display_rows:
         st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside %.")
-        st.caption(
-            f"✅ Scanned **{total_scanned}** stocks → "
-            f"**{len([r for r in display_rows_all if r])}** met the upside threshold → "
-            "Showing top **0**"
-        )
+        st.caption(f"✅ Scanned **{total_scanned}** stocks → **0** met the upside threshold")
     else:
-        results_df = pd.DataFrame(display_rows_all).sort_values("Projected Upside %", ascending=False).head(max_results)
+        results_df = pd.DataFrame(display_rows).sort_values("Projected Upside %", ascending=False).head(max_results)
         st.caption(
             f"✅ Scanned **{total_scanned}** stocks → "
-            f"**{len([r for r in display_rows_all if r])}** met the upside threshold → "
+            f"**{len(display_rows)}** met the upside threshold → "
             f"Showing top **{len(results_df)}**"
         )
 
