@@ -8,7 +8,13 @@ from modules.validators import sanitize_ticker_list
 st.title("🔍 Stock Screener")
 
 label = st.selectbox("Universe", ["S&P 500", "NASDAQ", "NYSE American", "OTC", "Custom"])
-map_universe = {"S&P 500": "sp500", "NASDAQ": "nasdaq", "NYSE American": "nyseamerican", "OTC": "otc", "Custom": "custom"}
+map_universe = {
+    "S&P 500": "sp500",
+    "NASDAQ": "nasdaq",
+    "NYSE American": "nyseamerican",
+    "OTC": "otc",
+    "Custom": "custom",
+}
 custom = []
 if label == "Custom":
     txt = st.text_area("Custom tickers (comma separated)", "AAPL,MSFT,NLST")
