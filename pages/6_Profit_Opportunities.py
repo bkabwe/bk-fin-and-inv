@@ -13,21 +13,18 @@ from modules.scoring_engine import analyze_stock
 
 try:  # pragma: no cover
     from prophet import Prophet
-
     PROPHET_AVAILABLE = True
 except ImportError:  # pragma: no cover
     PROPHET_AVAILABLE = False
 
 try:  # pragma: no cover
     from statsmodels.tsa.arima.model import ARIMA
-
     ARIMA_AVAILABLE = True
 except ImportError:  # pragma: no cover
     ARIMA_AVAILABLE = False
 
 try:  # pragma: no cover
     from sklearn.linear_model import LinearRegression
-
     SKLEARN_AVAILABLE = True
 except ImportError:  # pragma: no cover
     SKLEARN_AVAILABLE = False
@@ -48,8 +45,8 @@ selected_universes = st.multiselect(
 )
 min_upside_pct = st.slider("Min Upside %", min_value=5, max_value=100, value=15)
 st.info(
-    "ℹ️ This page analyses **every stock** in your selected universes and surfaces "
-    "the highest projected profit opportunities. Larger universes will take longer."
+    "ℹ️ This page analyses **every stock** in your selected universes. "
+    "Larger universes will take longer to scan."
 )
 large = [u for u in selected_universes if u in ("NASDAQ", "OTC")]
 if large:
@@ -61,9 +58,7 @@ if large:
 
 @st.cache_data(ttl=1800)
 def estimate_target_date(ticker: str, target_price: float, horizon_value: str, rsi: float | None = None) -> tuple[str, str]:
-    """
-    Returns (estimated_date_range, confidence) for when ticker may reach target_price.
-    """
+    """Returns (estimated_date_range, confidence) for when ticker may reach target_price."""
 
     def _format_date_range(center_date: date, confidence: str) -> str:
         windows = {
@@ -115,7 +110,6 @@ def estimate_target_date(ticker: str, target_price: float, horizon_value: str, r
                 prophet_df = prophet_df.rename(columns={prophet_df.columns[0]: "ds"})
             prophet_df["ds"] = pd.to_datetime(prophet_df["ds"]).dt.tz_localize(None)
             prophet_df = prophet_df[["ds", "y"]]
-
             model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
             model.fit(prophet_df)
             forecast = model.predict(model.make_future_dataframe(periods=max_days, freq="D"))
@@ -239,7 +233,7 @@ if st.button("Run Analysis"):
 scan_rows = st.session_state.get("profit_opportunities_scan", [])
 total_scanned = st.session_state.get("profit_opportunities_scanned_total", 0)
 
-if total_scanned:
+if scan_rows:
     max_results = st.slider("Max Results to Display", 5, 200, 25)
     horizon_map = {
         "Short-Term (1–4 weeks)": ("short_term_target", "short_term_upside", "short_term_basis"),
@@ -274,14 +268,16 @@ if total_scanned:
 
     if not display_rows:
         st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside %.")
-        st.caption(f"✅ Scanned **{total_scanned}** stocks → **0** met the upside threshold")
+        if total_scanned:
+            st.caption(f"✅ Scanned **{total_scanned}** stocks → **0** met the upside threshold")
     else:
         results_df = pd.DataFrame(display_rows).sort_values("Projected Upside %", ascending=False).head(max_results)
-        st.caption(
-            f"✅ Scanned **{total_scanned}** stocks → "
-            f"**{len(display_rows)}** met the upside threshold → "
-            f"Showing top **{len(results_df)}**"
-        )
+        if total_scanned:
+            st.caption(
+                f"✅ Scanned **{total_scanned}** stocks → "
+                f"**{len(display_rows)}** met the upside threshold → "
+                f"Showing top **{len(results_df)}**"
+            )
 
         styled = results_df.style.format(
             {
