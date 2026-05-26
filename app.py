@@ -78,8 +78,8 @@ if st.button("Load Top Picks"):
     with st.spinner("Running screener..."):
         universes = [
             ("sp500", "S&P 500"),
-            ("nasdaq100", "NASDAQ 100"),
-            ("russell2000", "Russell 2000"),
+            ("nasdaq", "NASDAQ"),
+            ("nyseamerican", "NYSE American"),
             ("otc", "OTC"),
         ]
         frames = []

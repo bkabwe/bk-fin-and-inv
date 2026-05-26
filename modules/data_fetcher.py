@@ -252,6 +252,42 @@ def _extract_tickers_from_tables(tables: list[pd.DataFrame], limit: int | None =
     return []
 
 
+def _scrape_stockanalysis_paged(url: str, max_pages: int = 100, limit: int | None = None) -> list[str]:
+    """Scrape stockanalysis.com lists that use ?page=N pagination (page 1 is base URL, page 2+ uses ?page=N)."""
+    tickers: list[str] = []
+    seen: set[str] = set()
+    session = requests.Session()
+    empty_streak = 0
+    for page in range(1, max_pages + 1):
+        page_url = url if page == 1 else f"{url}?page={page}"
+        try:
+            response = session.get(page_url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
+            response.raise_for_status()
+        except Exception:
+            empty_streak += 1
+            if empty_streak >= 3:
+                break
+            continue
+        page_tickers = _extract_tickers_from_table(response.text) or _extract_tickers_from_rows(response.text)
+        if not page_tickers:
+            empty_streak += 1
+            if empty_streak >= 3:
+                break
+            continue
+        empty_streak = 0
+        before = len(tickers)
+        for symbol in page_tickers:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            tickers.append(symbol)
+            if limit and len(tickers) >= limit:
+                return tickers[:limit]
+        if len(tickers) == before:
+            break
+    return tickers[:limit] if limit else tickers
+
+
 def _scrape_stockanalysis_tickers(url: str, max_pages: int = 1, limit: int | None = None) -> list[str]:
     tickers: list[str] = []
     seen: set[str] = set()
@@ -471,13 +507,42 @@ def get_russell2000_tickers() -> list[str]:
 
 
 @cache_data(ttl=86400)
+def get_nasdaq_tickers() -> list[str]:
+    """Fetch full NASDAQ stock list from stockanalysis.com (3000+ stocks, paginated with ?page=N)."""
+    url = "https://stockanalysis.com/list/nasdaq-stocks/"
+    try:
+        tickers = _scrape_stockanalysis_paged(url, max_pages=100)
+        if len(tickers) > 100:
+            logger.info("Fetched %s full NASDAQ tickers from stockanalysis.com", len(tickers))
+            return tickers
+    except Exception as exc:
+        logger.error("Full NASDAQ scrape failed: %s", exc)
+    raise RuntimeError("Failed to fetch full NASDAQ tickers from stockanalysis.com.")
+
+
+@cache_data(ttl=86400)
+def get_nyseamerican_tickers() -> list[str]:
+    """Fetch NYSE American stock list from stockanalysis.com (paginated with ?page=N)."""
+    url = "https://stockanalysis.com/list/nyseamerican-stocks/"
+    try:
+        tickers = _scrape_stockanalysis_paged(url, max_pages=20)
+        if tickers:
+            logger.info("Fetched %s NYSE American tickers from stockanalysis.com", len(tickers))
+            return tickers
+    except Exception as exc:
+        logger.error("NYSE American scrape failed: %s", exc)
+    raise RuntimeError("Failed to fetch NYSE American tickers from stockanalysis.com.")
+
+
+@cache_data(ttl=86400)
 def get_otc_tickers() -> list[str]:
+    """Fetch full OTC stock list from stockanalysis.com (21+ pages, using ?page=N pagination)."""
     url = "https://stockanalysis.com/list/otc-stocks/"
     try:
-        tickers = _scrape_stockanalysis_tickers(url, max_pages=50, limit=500)
+        tickers = _scrape_stockanalysis_paged(url, max_pages=50)
         if tickers:
-            logger.info("Fetched %s OTC tickers", len(tickers))
+            logger.info("Fetched %s OTC tickers from stockanalysis.com", len(tickers))
             return tickers
     except Exception as exc:
         logger.error("OTC scrape failed: %s", exc)
-    raise RuntimeError("Failed to fetch OTC tickers.")
+    raise RuntimeError("Failed to fetch OTC tickers from stockanalysis.com.")
