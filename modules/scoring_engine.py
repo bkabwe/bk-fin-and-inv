@@ -94,7 +94,7 @@ def _recommendation(score: int) -> str:
 
 
 def _weighted_ensemble(components: list[tuple[str, float | None, float]]) -> tuple[float | None, str, list[float]]:
-    available = [(name, float(value), weight) for name, value, weight in components if value is not None and weight > 0]
+    available = [(name, float(value), weight) for name, value, weight in components if value is not None and float(weight) > 0.0]
     if not available:
         return None, "No projection models available", []
     total_weight = sum(weight for _, _, weight in available)

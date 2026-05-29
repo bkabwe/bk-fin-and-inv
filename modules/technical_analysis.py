@@ -269,9 +269,9 @@ def detect_trendlines(df: pd.DataFrame) -> dict:
         default["downtrend_line"]["broken"] = True
         default["trendline_break_signal"] = "bullish_break"
 
-    if up_val and highs:
+    if up_val and len(highs) >= 5:
         default["channel_upper"] = round(float(max(h[1] for h in highs[-5:])), 2)
-    if down_val and lows:
+    if down_val and len(lows) >= 5:
         default["channel_lower"] = round(float(min(l[1] for l in lows[-5:])), 2)
 
     logger.info("Trendline break signal: %s", default["trendline_break_signal"])

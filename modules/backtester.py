@@ -42,7 +42,6 @@ except Exception:  # pragma: no cover
         return decorator
 
 
-
 def _rmse(actual: np.ndarray, pred: np.ndarray) -> float:
     if len(actual) == 0 or len(pred) == 0:
         return float("inf")

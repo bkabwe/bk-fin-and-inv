@@ -16,7 +16,7 @@ try:
 except Exception:  # pragma: no cover
     def cache_data(ttl: int | None = None):
         def decorator(func):
-            return func
+            return lru_cache(maxsize=128)(func)
 
         return decorator
 
