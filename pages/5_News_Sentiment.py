@@ -17,6 +17,13 @@ if ticker_input:
         st.stop()
     result = analyze_sentiment(ticker)
     st.write(f"Overall Sentiment: **{result['sentiment_label']}** ({result['sentiment_score']})")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Short Interest Ratio", result.get("short_ratio"))
+    m2.metric("Short % of Float", result.get("short_pct_float"))
+    m3.metric("Put/Call Ratio", result.get("put_call_ratio"))
+    st.caption(f"Options Sentiment: {result.get('options_sentiment', 'Neutral')}")
+
     headlines = pd.DataFrame(result.get("headlines", []))
     if not headlines.empty:
         st.dataframe(headlines, use_container_width=True)
@@ -33,5 +40,12 @@ st.subheader("Market-wide sentiment")
 market = []
 for symbol in ["SPY", "QQQ", "DIA", "IWM"]:
     sentiment = analyze_sentiment(symbol)
-    market.append({"Ticker": symbol, "Sentiment": sentiment["sentiment_label"], "Score": sentiment["sentiment_score"]})
+    market.append(
+        {
+            "Ticker": symbol,
+            "Sentiment": sentiment["sentiment_label"],
+            "Score": sentiment["sentiment_score"],
+            "Put/Call": sentiment.get("put_call_ratio"),
+        }
+    )
 st.table(pd.DataFrame(market))

@@ -101,22 +101,61 @@ if ticker_input:
     c4.metric("Entry / Target", f"{analysis.get('entry_price')} / {analysis.get('target_price')}")
     c5.metric("Stop / Expected %", f"{analysis.get('stop_loss')} / {expected:.2f}%" if expected is not None else str(analysis.get("stop_loss")))
 
-    t1, t2, t3, t4 = st.tabs(["Technical Analysis", "Fundamental Analysis", "Detected Patterns", "News & Sentiment"])
+    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(
+        [
+            "Technical Analysis",
+            "Fundamental Analysis",
+            "Schabacker Patterns",
+            "Gaps",
+            "Trendlines",
+            "Relative Strength",
+            "Macro Regime",
+            "Breakout",
+            "News & Sentiment",
+            "Score Breakdown",
+        ]
+    )
+
     with t1:
         st.json(analysis["technical"])
+
     with t2:
         st.table(pd.DataFrame([analysis["fundamentals"]["metrics"]]).T)
+
     with t3:
         st.table(pd.DataFrame(analysis["technical"].get("patterns", [])))
+
     with t4:
+        gaps_df = pd.DataFrame(analysis["technical"].get("gaps", []))
+        if gaps_df.empty:
+            st.info("No recent gaps detected.")
+        else:
+            st.dataframe(gaps_df[["type", "date", "direction", "gap_pct", "significance"]], use_container_width=True)
+
+    with t5:
+        st.json(analysis["technical"].get("trendlines", {}))
+
+    with t6:
+        st.table(pd.DataFrame([analysis.get("relative_strength", {})]))
+
+    with t7:
+        macro = analysis.get("macro_regime", {})
+        st.metric("VIX", macro.get("vix"))
+        st.metric("10Y Yield", macro.get("yield_10y"))
+        st.metric("Market Regime", macro.get("market_regime"))
+        c_bull, c_bear = st.columns(2)
+        c_bull.write("**Bullish Sectors**")
+        c_bull.write(", ".join(macro.get("bullish_sectors", [])) or "None")
+        c_bear.write("**Bearish Sectors**")
+        c_bear.write(", ".join(macro.get("bearish_sectors", [])) or "None")
+
+    with t8:
+        st.json(analysis["technical"].get("breakout", {}))
+
+    with t9:
         st.write(f"Sentiment: {analysis['sentiment']['sentiment_label']} ({analysis['sentiment']['sentiment_score']})")
         st.table(pd.DataFrame(analysis["sentiment"].get("headlines", [])))
-    st.bar_chart(
-        pd.DataFrame(
-            [
-                {"Component": "Technical", "Points": analysis["score_breakdown"]["technical"]},
-                {"Component": "Fundamental", "Points": analysis["score_breakdown"]["fundamental"]},
-                {"Component": "Sentiment", "Points": analysis["score_breakdown"]["sentiment"]},
-            ]
-        ).set_index("Component")
-    )
+
+    with t10:
+        breakdown_df = pd.DataFrame([{"Component": k, "Points": v} for k, v in analysis["score_breakdown"].items()]).set_index("Component")
+        st.bar_chart(breakdown_df)
