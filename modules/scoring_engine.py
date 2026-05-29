@@ -4,11 +4,13 @@ from functools import lru_cache
 
 import numpy as np
 
+from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
 from modules.fundamental_analysis import analyze_fundamentals
 from modules.logger import get_logger
+from modules.macro_regime import get_macro_regime
 from modules.sentiment_analysis import analyze_sentiment
-from modules.technical_analysis import analyze_technical
+from modules.technical_analysis import analyze_technical, relative_strength_vs_spy
 
 logger = get_logger(__name__)
 
@@ -45,6 +47,37 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     SKLEARN_AVAILABLE = False
 
+try:  # pragma: no cover
+    from arch import arch_model
+
+    ARCH_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    ARCH_AVAILABLE = False
+
+
+@cache_data(ttl=86400)
+def _select_arima_order(ticker: str, series_values: tuple[float, ...]) -> tuple[int, int, int]:
+    if not STATSMODELS_AVAILABLE:
+        return (5, 1, 0)
+    series = np.array(series_values, dtype=float)
+    if len(series) < 60:
+        return (5, 1, 0)
+
+    best_order = (5, 1, 0)
+    best_aic = float("inf")
+    for p in range(6):
+        for d in range(2):
+            for q in range(3):
+                try:
+                    fit = ARIMA(series, order=(p, d, q)).fit()
+                    if fit.aic < best_aic:
+                        best_aic = float(fit.aic)
+                        best_order = (p, d, q)
+                except Exception:
+                    continue
+    logger.info("Selected ARIMA order for %s: %s (aic=%.2f)", ticker.upper(), best_order, best_aic)
+    return best_order
+
 
 def _recommendation(score: int) -> str:
     if score >= 80:
@@ -61,7 +94,7 @@ def _recommendation(score: int) -> str:
 
 
 def _weighted_ensemble(components: list[tuple[str, float | None, float]]) -> tuple[float | None, str, list[float]]:
-    available = [(name, float(value), weight) for name, value, weight in components if value is not None]
+    available = [(name, float(value), weight) for name, value, weight in components if value is not None and weight > 0]
     if not available:
         return None, "No projection models available", []
     total_weight = sum(weight for _, _, weight in available)
@@ -77,13 +110,20 @@ def _confidence_bounds(
     prophet_high: float | None,
     current_price: float,
     cap_value: float | None,
+    garch_low: float | None = None,
+    garch_high: float | None = None,
 ) -> tuple[float, float]:
     lows = [target, current_price, *values]
     highs = [target, current_price, *values]
-    if prophet_low is not None:
+    if garch_low is not None:
+        lows.append(garch_low)
+    elif prophet_low is not None:
         lows.append(prophet_low)
-    if prophet_high is not None:
+    if garch_high is not None:
+        highs.append(garch_high)
+    elif prophet_high is not None:
         highs.append(prophet_high)
+
     low = max(0.0, min(lows))
     high = max(highs)
     if cap_value is not None:
@@ -99,22 +139,50 @@ def _cap_target(value: float, current_price: float, cap_value: float | None) -> 
     return round(target, 2)
 
 
+def _inverse_rmse_weights(backtest: dict) -> dict[str, float] | None:
+    try:
+        rmses = {
+            "prophet": float(backtest.get("prophet_rmse") or 0),
+            "arima": float(backtest.get("arima_rmse") or 0),
+            "trend": float(backtest.get("trend_rmse") or 0),
+        }
+        if int(backtest.get("n_windows") or 0) <= 0:
+            return None
+        inv = {k: (1.0 / max(v, 1e-9)) for k, v in rmses.items() if v > 0}
+        total = sum(inv.values())
+        if total <= 0:
+            return None
+        return {k: inv[k] / total for k in inv}
+    except Exception:
+        return None
+
+
+def _garch_confidence_from_returns(current_price: float, log_returns: np.ndarray, horizon_days: int) -> tuple[float | None, float | None]:
+    if not ARCH_AVAILABLE or len(log_returns) < 60 or current_price <= 0:
+        return None, None
+    try:
+        model = arch_model(log_returns * 100, vol="Garch", p=1, q=1, rescale=False)
+        fit = model.fit(disp="off")
+        fcast = fit.forecast(horizon=max(horizon_days, 1), reindex=False)
+        var = float(fcast.variance.values[-1, min(horizon_days - 1, fcast.variance.shape[1] - 1)])
+        sigma = np.sqrt(max(var, 1e-9)) / 100.0
+        z = 1.96
+        low = current_price * np.exp(-z * sigma)
+        high = current_price * np.exp(z * sigma)
+        return float(low), float(high)
+    except Exception as exc:
+        logger.warning("GARCH confidence fallback used: %s", exc)
+        return None, None
+
+
 @cache_data(ttl=3600)
 def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
-    """
-    Multi-model price projection using:
-    1. Prophet (Facebook) time series forecasting
-    2. ARIMA via statsmodels
-    3. Linear regression trend via scikit-learn
-    4. Fundamental fair value (P/E based)
-    5. Technical resistance levels
-
-    Returns ensemble projections for short (1-4 weeks), medium (1-6 months),
-    and long term (6-24 months).
-    """
     info = get_stock_info(ticker)
     data = get_stock_data(ticker, period="2y", interval="1d")
     technical = analyze_technical(data)
+    macro = get_macro_regime()
+    risk_free_rate = float(macro.get("risk_free_rate") or 0.045)
+
     close = data["Close"].dropna() if data is not None and not data.empty and "Close" in data else None
     current_price = float(close.iloc[-1]) if close is not None and not close.empty else float(info.get("currentPrice") or 0)
     if current_price <= 0:
@@ -152,6 +220,36 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
     is_speculative_otc = "OTC" in exchange
     cap_value = None if is_speculative_otc else (3 * current_price)
 
+    # adaptive model weights from walk-forward
+    model_weights = None
+    try:
+        backtest = run_walk_forward(ticker, data)
+        model_weights = _inverse_rmse_weights(backtest)
+        if model_weights:
+            models_used.append("Adaptive Weights")
+        else:
+            models_skipped.append("Adaptive Weights: backtest unavailable")
+    except Exception as exc:
+        models_skipped.append(f"Adaptive Weights: {exc}")
+
+    short_model_total, medium_model_total, long_model_total = 0.80, 0.55, 0.50
+    if model_weights:
+        short_prophet_w = short_model_total * model_weights.get("prophet", 0)
+        short_arima_w = short_model_total * model_weights.get("arima", 0)
+        short_trend_w = short_model_total * model_weights.get("trend", 0)
+
+        medium_prophet_w = medium_model_total * model_weights.get("prophet", 0)
+        medium_arima_w = medium_model_total * model_weights.get("arima", 0)
+        medium_trend_w = medium_model_total * model_weights.get("trend", 0)
+
+        long_prophet_w = long_model_total * model_weights.get("prophet", 0)
+        long_arima_w = long_model_total * model_weights.get("arima", 0)
+        long_trend_w = long_model_total * model_weights.get("trend", 0)
+    else:
+        short_prophet_w, short_arima_w, short_trend_w = 0.35, 0.25, 0.20
+        medium_prophet_w, medium_arima_w, medium_trend_w = 0.30, 0.0, 0.25
+        long_prophet_w, long_arima_w, long_trend_w = 0.25, 0.0, 0.25
+
     prophet_30 = prophet_180 = prophet_720 = None
     prophet_low_30 = prophet_low_180 = prophet_low_720 = None
     prophet_high_30 = prophet_high_180 = prophet_high_720 = None
@@ -163,7 +261,7 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
             date_col = prophet_df.columns[0]
             prophet_df = prophet_df.rename(columns={date_col: "ds", "Close": "y"})[["ds", "y"]]
             prophet_df["ds"] = prophet_df["ds"].dt.tz_localize(None)
-            model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
+            model = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True)
             model.fit(prophet_df)
             forecast = model.predict(model.make_future_dataframe(periods=720, freq="D"))
             base_idx = len(prophet_df) - 1
@@ -183,15 +281,17 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
     else:
         models_skipped.append("Prophet: package not installed")
 
-    arima_30 = arima_180 = None
+    arima_30 = arima_180 = arima_720 = None
     if STATSMODELS_AVAILABLE:
         try:
             if close is None or len(close) < 60:
                 raise ValueError("not enough history")
             series = close.tail(252).astype(float)
-            arima_forecast = ARIMA(series, order=(5, 1, 0)).fit().forecast(steps=180)
+            order = _select_arima_order(ticker.upper(), tuple(np.round(series.values, 6).tolist()))
+            arima_forecast = ARIMA(series, order=order).fit().forecast(steps=720)
             arima_30 = float(arima_forecast.iloc[29]) if len(arima_forecast) >= 30 else float(arima_forecast.iloc[-1])
             arima_180 = float(arima_forecast.iloc[179]) if len(arima_forecast) >= 180 else float(arima_forecast.iloc[-1])
+            arima_720 = float(arima_forecast.iloc[719]) if len(arima_forecast) >= 720 else float(arima_forecast.iloc[-1])
             models_used.append("ARIMA")
         except Exception as exc:
             models_skipped.append(f"ARIMA: {exc}")
@@ -199,35 +299,37 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
         models_skipped.append("ARIMA: package not installed")
 
     trend_30 = trend_180 = trend_720 = None
-    poly_30 = poly_180 = poly_720 = None
     if SKLEARN_AVAILABLE:
         try:
             if close is None or len(close) < 30:
                 raise ValueError("not enough history")
             trend_series = close.tail(200).astype(float).reset_index(drop=True)
+            y_log = np.log(np.maximum(trend_series.values, 1e-9))
             x = np.arange(len(trend_series)).reshape(-1, 1)
             model = LinearRegression()
-            model.fit(x, trend_series.values)
-            trend_30 = float(model.predict(np.array([[len(trend_series) + 29]]))[0])
-            trend_180 = float(model.predict(np.array([[len(trend_series) + 179]]))[0])
-            trend_720 = float(model.predict(np.array([[len(trend_series) + 719]]))[0])
-            models_used.append("Linear Regression Trend")
+            model.fit(x, y_log)
+            trend_30 = float(np.exp(model.predict(np.array([[len(trend_series) + 29]]))[0]))
+            trend_180 = float(np.exp(model.predict(np.array([[len(trend_series) + 179]]))[0]))
+            trend_720 = float(np.exp(model.predict(np.array([[len(trend_series) + 719]]))[0]))
+            models_used.append("Log Linear Trend")
         except Exception as exc:
             models_skipped.append(f"Linear Regression: {exc}")
     else:
         models_skipped.append("Linear Regression: package not installed")
 
+    poly_30 = poly_180 = poly_720 = None
     try:
         if close is None or len(close) < 30:
             raise ValueError("not enough history")
         poly_series = close.tail(200).astype(float).reset_index(drop=True)
         x = np.arange(len(poly_series))
-        coeffs = np.polyfit(x, poly_series.values, deg=2 if len(poly_series) >= 60 else 1)
+        y_log = np.log(np.maximum(poly_series.values, 1e-9))
+        coeffs = np.polyfit(x, y_log, deg=2 if len(poly_series) >= 60 else 1)
         poly = np.poly1d(coeffs)
-        poly_30 = float(poly(len(poly_series) + 29))
-        poly_180 = float(poly(len(poly_series) + 179))
-        poly_720 = float(poly(len(poly_series) + 719))
-        models_used.append("NumPy Polynomial Trend")
+        poly_30 = float(np.exp(poly(len(poly_series) + 29)))
+        poly_180 = float(np.exp(poly(len(poly_series) + 179)))
+        poly_720 = float(np.exp(poly(len(poly_series) + 719)))
+        models_used.append("Log Polynomial Trend")
     except Exception as exc:
         models_skipped.append(f"NumPy Polynomial Trend: {exc}")
 
@@ -237,6 +339,9 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
         trend_30 = (trend_30 + poly_30) / 2
         trend_180 = (trend_180 + poly_180) / 2 if trend_180 is not None and poly_180 is not None else trend_180
         trend_720 = (trend_720 + poly_720) / 2 if trend_720 is not None and poly_720 is not None else trend_720
+
+    fundamentals = analyze_fundamentals(info, current_price=current_price, risk_free_rate=risk_free_rate)
+    metrics = fundamentals.get("metrics", {})
 
     fair_value = None
     forward_eps = info.get("forwardEps")
@@ -255,41 +360,53 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
     else:
         models_skipped.append("Fundamental Fair Value: no EPS data")
 
+    dcf_estimate = metrics.get("dcf_estimate")
+    if dcf_estimate:
+        models_used.append("DCF Estimate")
+    else:
+        models_skipped.append("DCF Estimate: unavailable")
+
     resistance_levels = sorted([float(x) for x in technical.get("resistance_levels", []) if x is not None])
     nearest_resistance = next((value for value in resistance_levels if value >= current_price), None)
     bb_upper = technical.get("indicators", {}).get("bb_high")
     technical_resistance = max([x for x in [nearest_resistance, bb_upper, current_price] if x is not None])
     models_used.append("Technical Resistance")
 
-    analyst_target_half = None
     analyst_target = info.get("targetMeanPrice")
+    analyst_medium = analyst_long = None
     if analyst_target and analyst_target > 0:
-        analyst_target_half = float(analyst_target) * 0.5
-        models_used.append("Analyst Target (50%)")
+        analyst_medium = float(analyst_target) * 0.65
+        analyst_long = float(analyst_target)
+        models_used.append("Analyst Target")
     else:
         models_skipped.append("Analyst Target: unavailable")
 
     short_projection, short_basis, short_values = _weighted_ensemble(
         [
-            ("Prophet", prophet_30, 0.35),
-            ("ARIMA", arima_30, 0.25),
-            ("Trend", trend_30, 0.20),
+            ("Prophet", prophet_30, short_prophet_w),
+            ("ARIMA", arima_30, short_arima_w),
+            ("Trend", trend_30, short_trend_w),
             ("Resistance", technical_resistance, 0.20),
         ]
     )
     medium_projection, medium_basis, medium_values = _weighted_ensemble(
         [
-            ("Prophet", prophet_180, 0.30),
-            ("Trend", trend_180, 0.25),
-            ("Fundamental", fair_value, 0.30),
-            ("Analyst x0.5", analyst_target_half, 0.15),
+            ("Prophet", prophet_180, medium_prophet_w),
+            ("ARIMA", arima_180, medium_arima_w),
+            ("Trend", trend_180, medium_trend_w),
+            ("Fundamental", fair_value, 0.20),
+            ("DCF", dcf_estimate, 0.10),
+            ("Analyst x0.65", analyst_medium, 0.15),
         ]
     )
     long_projection, long_basis, long_values = _weighted_ensemble(
         [
-            ("Prophet", prophet_720, 0.25),
-            ("Trend", trend_720, 0.25),
-            ("Fundamental", fair_value, 0.50),
+            ("Prophet", prophet_720, long_prophet_w),
+            ("ARIMA", arima_720, long_arima_w),
+            ("Trend", trend_720, long_trend_w),
+            ("Fundamental", fair_value, 0.20),
+            ("DCF", dcf_estimate, 0.10),
+            ("Analyst", analyst_long, 0.20),
         ]
     )
 
@@ -299,11 +416,32 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
 
     directional_models = [
         x
-        for x in [prophet_30, arima_30, trend_30, prophet_180, arima_180, trend_180, prophet_720, trend_720, fair_value]
+        for x in [
+            prophet_30,
+            arima_30,
+            trend_30,
+            prophet_180,
+            arima_180,
+            trend_180,
+            prophet_720,
+            arima_720,
+            trend_720,
+            fair_value,
+            dcf_estimate,
+        ]
         if x is not None
     ]
     bearish = bool(directional_models) and all(x < current_price for x in directional_models)
     outlook = "Bearish" if bearish else "Bullish" if long_projection > current_price * 1.10 else "Neutral"
+
+    garch_low_30 = garch_high_30 = garch_low_180 = garch_high_180 = garch_low_720 = garch_high_720 = None
+    if close is not None and len(close) > 80:
+        log_returns = np.log(close / close.shift(1)).dropna().values.astype(float)
+        garch_low_30, garch_high_30 = _garch_confidence_from_returns(current_price, log_returns, 30)
+        garch_low_180, garch_high_180 = _garch_confidence_from_returns(current_price, log_returns, 180)
+        garch_low_720, garch_high_720 = _garch_confidence_from_returns(current_price, log_returns, 720)
+        if garch_low_30 is not None:
+            models_used.append("GARCH(1,1) Confidence")
 
     short_low, short_high = _confidence_bounds(
         short_projection,
@@ -312,6 +450,8 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
         prophet_high_30,
         current_price,
         cap_value,
+        garch_low=garch_low_30,
+        garch_high=garch_high_30,
     )
     medium_low, medium_high = _confidence_bounds(
         medium_projection,
@@ -320,6 +460,8 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
         prophet_high_180,
         current_price,
         cap_value,
+        garch_low=garch_low_180,
+        garch_high=garch_high_180,
     )
     long_low, long_high = _confidence_bounds(
         long_projection,
@@ -328,6 +470,8 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
         prophet_high_720,
         current_price,
         cap_value,
+        garch_low=garch_low_720,
+        garch_high=garch_high_720,
     )
 
     near_resistance = current_price >= (technical_resistance * 0.97) if technical_resistance else False
@@ -357,7 +501,7 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
 
     if is_speculative_otc and "Fundamental Fair Value" not in models_used:
         data_quality = "Technical Only"
-    elif {"Prophet", "ARIMA", "Linear Regression Trend", "Fundamental Fair Value"}.issubset(set(models_used)):
+    elif {"Prophet", "ARIMA", "Fundamental Fair Value"}.issubset(set(models_used)):
         data_quality = "Full"
     else:
         data_quality = "Limited"
@@ -402,8 +546,15 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
     info = get_stock_info(ticker)
     technical = analyze_technical(data)
     current_price = float(data["Close"].iloc[-1]) if not data.empty else info.get("currentPrice")
-    fundamentals = analyze_fundamentals(info, current_price=current_price)
+
+    macro_regime = get_macro_regime()
+    risk_free_rate = float(macro_regime.get("risk_free_rate") or 0.045)
+
+    fundamentals = analyze_fundamentals(info, current_price=current_price, risk_free_rate=risk_free_rate)
     sentiment = analyze_sentiment(ticker)
+
+    spy_data = get_stock_data("SPY", period=period, interval=interval)
+    relative_strength = relative_strength_vs_spy(data, spy_data)
 
     trend_score = 15 if technical["trend"] == "uptrend" else 8 if technical["trend"] == "sideways" else 2
     rsi, macd, signal = (
@@ -419,10 +570,48 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
     bearish = sum(1 for p in technical["patterns"] if p["implication"] == "bearish")
     pattern_score = max(0, min(10, 5 + (bullish - bearish) * 2))
 
-    technical_total = max(0, min(50, trend_score + momentum_score + volume_score + pattern_score))
+    trendline_score = 0
+    trendline_break = technical.get("signals", {}).get("trendline_break_signal")
+    if trendline_break == "bullish_break":
+        trendline_score = 5
+    elif trendline_break == "bearish_break":
+        trendline_score = -5
+
+    rs_score = 0
+    rs20 = relative_strength.get("rs_20d")
+    if rs20 is not None and rs20 > 1.1:
+        rs_score = 5
+    elif rs20 is not None and rs20 < 0.9:
+        rs_score = -3
+
+    breakout_score = 0
+    breakout = technical.get("breakout", {})
+    if breakout.get("signal_strength") == "strong":
+        breakout_score = 7
+
+    volume_quality_score = 0
+    vq = technical.get("volume_quality", {})
+    if vq.get("breakout_volume_confirmed"):
+        volume_quality_score += 3
+    if vq.get("climactic_volume") and vq.get("volume_divergence"):
+        volume_quality_score -= 3
+
+    macro_score = 0
+    if macro_regime.get("market_regime") == "risk_off":
+        macro_score = -5
+    elif macro_regime.get("market_regime") == "risk_on":
+        macro_score = 3
+
+    technical_total = max(
+        0,
+        min(
+            50,
+            trend_score + momentum_score + volume_score + pattern_score + trendline_score + rs_score + breakout_score + volume_quality_score,
+        ),
+    )
     fundamental_total = round((fundamentals["fundamental_score"] / 100) * 30)
     sentiment_total = round(((sentiment["sentiment_score"] + 1) / 2) * 20)
-    total = max(0, min(100, int(technical_total + fundamental_total + sentiment_total)))
+    total = max(0, min(100, int(technical_total + fundamental_total + sentiment_total + macro_score)))
 
     horizon = "Medium-Term Setup"
     if macd is not None and signal is not None and macd > signal and technical["trend"] != "uptrend":
@@ -467,14 +656,21 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
         "technical": technical,
         "fundamentals": fundamentals,
         "sentiment": sentiment,
+        "macro_regime": macro_regime,
+        "relative_strength": relative_strength,
         "score_breakdown": {
             "technical": technical_total,
             "fundamental": fundamental_total,
             "sentiment": sentiment_total,
+            "macro": macro_score,
             "trend": trend_score,
             "momentum": momentum_score,
             "volume": volume_score,
             "patterns": pattern_score,
+            "trendline": trendline_score,
+            "relative_strength": rs_score,
+            "breakout": breakout_score,
+            "volume_quality": volume_quality_score,
         },
         "sell_recommendation": sell,
     }

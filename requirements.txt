@@ -12,3 +12,4 @@ prophet
 statsmodels
 scikit-learn
 Pillow
+arch
