@@ -34,7 +34,7 @@ export default function Watchlist() {
         Sort:
         <button className="rounded border px-2 py-1" onClick={() => setSort('Score')}>Score</button>
         <button className="rounded border px-2 py-1" onClick={() => setSort('Ticker')}>Alpha</button>
-        <button className="rounded border px-2 py-1" onClick={() => setSort('Price')}>Daily %</button>
+        <button className="rounded border px-2 py-1" onClick={() => setSort('Price')}>Price</button>
       </div>
       <div className="rounded border bg-white p-4">
         <table className="min-w-full text-sm">

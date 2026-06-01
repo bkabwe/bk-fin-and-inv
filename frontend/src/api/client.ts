@@ -1,8 +1,10 @@
 import axios from 'axios'
 
+const API_TIMEOUT_MS = 20000
+
 const http = axios.create({
   baseURL: '/api',
-  timeout: 20000
+  timeout: API_TIMEOUT_MS
 })
 
 export interface ScreenerRequest {

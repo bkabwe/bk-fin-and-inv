@@ -87,7 +87,7 @@ def run_profit_task(job_id: str, params: dict):
         "OTC": get_otc_tickers,
     }
 
-    horizons = params.get("horizon", "Short-Term (1–4 weeks)")
+    horizon = str(params.get("horizon", "Short-Term (1–4 weeks)"))
     min_upside_pct = float(params.get("min_upside_pct", 15.0))
     max_results = int(params.get("max_results", 25))
 
@@ -115,12 +115,12 @@ def run_profit_task(job_id: str, params: dict):
     state["total"] = total
     _save_state(state)
 
-    if "short" in horizons.lower():
-        key = "short_term"
-    elif "medium" in horizons.lower():
-        key = "medium_term"
-    else:
-        key = "long_term"
+    horizon_map = {
+        "Short-Term (1–4 weeks)": "short_term",
+        "Medium-Term (1–6 months)": "medium_term",
+        "Long-Term (6+ months)": "long_term",
+    }
+    key = horizon_map.get(horizon, "short_term")
 
     rows: list[dict] = []
     for i, ticker in enumerate(tickers, start=1):

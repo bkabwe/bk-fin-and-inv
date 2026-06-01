@@ -77,8 +77,6 @@ def stop_screener(job_id: str) -> dict:
 
 @celery_app.task
 def run_screener_task(job_id: str, params: dict):
-    import json
-
     from api.deps import redis_client
     from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers
     from modules.scoring_engine import analyze_stock
