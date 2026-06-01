@@ -67,7 +67,7 @@ export default function Portfolio() {
         </table>
       </div>
 
-      <button className="rounded bg-green-600 px-4 py-2 text-sm text-white" onClick={run}>Analyse All Holdings</button>
+      <button className="rounded bg-green-600 px-4 py-2 text-sm text-white" onClick={run}>Analyze All Holdings</button>
 
       {analysis.data && <ProgressBar screened={analysis.data.screened} total={analysis.data.total} currentTicker={analysis.data.current_ticker} status={analysis.data.status} />}
 

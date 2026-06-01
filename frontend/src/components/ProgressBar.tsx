@@ -18,7 +18,7 @@ export default function ProgressBar({ screened, total, currentTicker, status }: 
       </div>
       {status === 'stopped' && <p className="text-sm text-red-600">⏹ Stopped at {screened.toLocaleString()} stocks</p>}
       {status === 'complete' && <p className="text-sm text-green-600">✅ Scan complete — {screened.toLocaleString()} stocks screened</p>}
-      {currentTicker && <p className="text-xs text-gray-500">Currently analysing: {currentTicker}</p>}
+      {currentTicker && <p className="text-xs text-gray-500">Currently analyzing: {currentTicker}</p>}
     </div>
   )
 }

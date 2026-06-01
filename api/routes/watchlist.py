@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from modules.portfolio import add_holding, add_to_watchlist, get_watchlist, remove_from_watchlist
 from modules.scoring_engine import analyze_stock
@@ -30,18 +30,27 @@ def list_watchlist() -> list[dict]:
 
 @router.post("/{ticker}")
 def create_watchlist(ticker: str) -> dict:
-    add_to_watchlist(ticker)
+    try:
+        add_to_watchlist(ticker)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Unable to add ticker to watchlist") from exc
     return {"status": "ok"}
 
 
 @router.delete("/{ticker}")
 def delete_watchlist(ticker: str) -> dict:
-    remove_from_watchlist(ticker)
+    try:
+        remove_from_watchlist(ticker)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Unable to remove ticker from watchlist") from exc
     return {"status": "ok"}
 
 
 @router.post("/{ticker}/portfolio")
 def move_to_portfolio(ticker: str) -> dict:
-    add_holding(ticker=ticker, shares=0, avg_cost=0, date_purchased="", notes="Moved from watchlist")
-    remove_from_watchlist(ticker)
+    try:
+        add_holding(ticker=ticker, shares=0, avg_cost=0, date_purchased="", notes="Moved from watchlist")
+        remove_from_watchlist(ticker)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Unable to move ticker to portfolio") from exc
     return {"status": "ok"}
