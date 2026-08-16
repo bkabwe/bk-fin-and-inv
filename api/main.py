@@ -7,6 +7,7 @@ from api.routes.portfolio import router as portfolio_router
 from api.routes.profit import router as profit_router
 from api.routes.screener import router as screener_router
 from api.routes.sentiment import router as sentiment_router
+from api.routes.track_record import router as track_record_router
 from api.routes.watchlist import router as watchlist_router
 
 app = FastAPI(title="BK Fin API")
@@ -26,6 +27,7 @@ app.include_router(portfolio_router, prefix="/api")
 app.include_router(watchlist_router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")
 app.include_router(sentiment_router, prefix="/api")
+app.include_router(track_record_router, prefix="/api")
 
 
 @app.get("/health")

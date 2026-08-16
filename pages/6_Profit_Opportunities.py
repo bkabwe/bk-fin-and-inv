@@ -9,6 +9,7 @@ import streamlit as st
 
 from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers, get_stock_data
 from modules.portfolio import get_portfolio
+from modules.prediction_tracker import record_predictions_from_scan
 from modules.scoring_engine import analyze_stock
 
 try:  # pragma: no cover
@@ -265,6 +266,21 @@ if scan_rows:
                 "Basis": projections.get(basis_key, ""),
             }
         )
+
+    # Record predictions for the track-record feature.
+    if display_rows:
+        horizon_key_map = {
+            "Short-Term (1–4 weeks)": "short_term",
+            "Medium-Term (1–6 months)": "medium_term",
+            "Long-Term (6–24 months)": "long_term",
+        }
+        _h = horizon_key_map.get(horizon, "short_term")
+        try:
+            _recorded = record_predictions_from_scan(display_rows, horizon=_h, source="profit_opportunities")
+            if _recorded:
+                st.toast(f"📌 Recorded {_recorded} new prediction(s) for tracking.", icon="📌")
+        except Exception:
+            pass  # Never block UI for tracking failures
 
     if not display_rows:
         st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside %.")

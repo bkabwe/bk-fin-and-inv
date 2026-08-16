@@ -180,6 +180,14 @@ def run_profit_task(job_id: str, params: dict):
             _save_state(current)
 
     final = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+
+    # Record predictions for the track-record feature.
+    try:
+        from modules.prediction_tracker import record_predictions_from_scan
+        record_predictions_from_scan(final, horizon=key, source="profit_opportunities")
+    except Exception:
+        pass  # Never let tracking failures break the task
+
     _save_state(
         {
             "status": "complete",

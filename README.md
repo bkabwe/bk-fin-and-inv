@@ -133,3 +133,85 @@ detected, a visible warning is shown in the portfolio card:
 Share count and cost basis are **not** auto-adjusted (to avoid silent
 corruption of user data), but the warning makes it clear that manual
 review is needed.
+
+---
+
+## Prediction Track Record
+
+### Overview
+Every price projection shown to the user is automatically persisted so that,
+once the estimated target date has passed, the app can verify whether the
+prediction actually hit — giving you an empirical track record of the
+Prophet/ARIMA/GARCH/trend ensemble's accuracy.
+
+### What gets tracked
+Predictions are recorded from three sources:
+
+| Source | Trigger |
+|--------|---------|
+| **Profit Opportunities** (Streamlit) | Whenever a scan produces qualifying rows |
+| **Profit Opportunities** (API/Celery) | At the end of each background scan task |
+| **Stock Analysis** | Each time a ticker is opened on the Deep Dive page |
+
+Each prediction stores: ticker, company, horizon (`short_term` / `medium_term` /
+`long_term`), scan date, estimated target date, current price at scan, target
+price, target low/high band, projected upside %, score, confidence tier,
+model basis string, and source.
+
+Predictions are deduplicated by `(ticker, horizon, scan_date)` so re-running
+the same scan on the same day does not create duplicate entries.
+
+### How predictions resolve
+When the **Track Record** page loads, the app automatically checks all
+`pending` predictions whose `target_date` has already passed.  For each one it:
+
+1. Fetches the split-adjusted historical closing price on/near the target date
+   via `get_stock_data` (the same adjusted-price path used app-wide).
+2. Computes `actual_return_pct` and marks the prediction as either:
+   - **`resolved`** — actual price data was available.
+   - **`unresolved_no_data`** — ticker was delisted or no price data found.
+3. Records two hit definitions:
+   - **Hit (strict)** — actual price ≥ projected target price.
+   - **Hit (band)** — actual price fell within the projected low–high band.
+
+No new infrastructure is required.  Resolution runs on-demand when you visit
+the Track Record page; a Celery task is not needed.
+
+### Track Record page (`7_Track_Record`)
+The new **📈 Track Record** page (sidebar item 7) shows:
+
+- **Summary metrics** — total predictions, resolved count, pending count,
+  overall hit rate (strict and band definitions).
+- **Mean / Median Absolute % Error** — average gap between projected upside
+  and actual return.
+- **Breakdown tables** — hit rate and MAE split by horizon, by source, and by
+  confidence tier (calibration view).
+- **Calibration chart** — bar chart of hit rate by confidence tier, making
+  miscalibration visible at a glance.
+- **Resolved predictions table** — filterable/sortable by horizon, source, and
+  hit/miss result; exportable to CSV.
+- **Projected vs Actual scatter** — visual comparison of projected upside vs
+  actual return per resolved prediction.
+- **Pending predictions** — collapsible list of predictions still awaiting
+  their target date.
+
+### API endpoints
+Two read-only endpoints are available for programmatic access:
+
+```
+GET /api/track-record/summary
+```
+Returns the same summary stats (overall hit rates, MAE, breakdown by horizon/
+source/confidence) as a JSON object.
+
+```
+GET /api/track-record/predictions?status=resolved
+```
+Returns the full predictions list, optionally filtered by `status`
+(`pending`, `resolved`, `unresolved_no_data`).
+
+### Storage
+Predictions are persisted to `data/predictions.json` using the same
+atomic-write pattern (tempfile + `os.replace`) used by the portfolio and
+watchlist modules.  The file is excluded from git via `.gitignore`
+(`data/*.json`).
