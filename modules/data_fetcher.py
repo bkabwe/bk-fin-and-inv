@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from functools import lru_cache
 from io import StringIO
 from typing import Any
 
@@ -20,9 +19,58 @@ try:
 
     cache_data = st.cache_data
 except Exception:  # pragma: no cover
-    def cache_data(ttl: int | None = None):
+    import threading as _threading
+    import time as _time
+
+    def cache_data(ttl: int | None = None):  # type: ignore[misc]
+        """TTL-aware, stampede-safe cache fallback for non-Streamlit (FastAPI) deployments.
+
+        Unlike plain ``lru_cache``, this respects the ``ttl`` argument so cached
+        values expire and fresh data is fetched after the TTL window.  It is also
+        stampede-safe: when multiple threads encounter a cache miss simultaneously,
+        only the first computes the value while the rest wait for that result.
+        """
+
         def decorator(func):
-            return lru_cache(maxsize=128)(func)
+            _cache: dict = {}       # key -> (value, timestamp)
+            _inflight: dict = {}    # key -> threading.Event (in-progress guard)
+            _lock = _threading.Lock()
+
+            def wrapper(*args, **kwargs):
+                key = (args, tuple(sorted(kwargs.items())))
+                while True:
+                    now = _time.monotonic()
+                    with _lock:
+                        entry = _cache.get(key)
+                        if entry is not None:
+                            value, ts = entry
+                            if ttl is None or (now - ts) < ttl:
+                                return value
+                        # Cache miss — check if another thread is computing
+                        event = _inflight.get(key)
+                        if event is None:
+                            # This thread is the designated computer; set sentinel.
+                            ev = _threading.Event()
+                            _inflight[key] = ev
+                            break
+                    # Another thread is computing; wait outside the lock.
+                    event.wait(timeout=300)
+                    # Loop back to try reading from cache.
+
+                # We are the designated computing thread.
+                try:
+                    result = func(*args, **kwargs)
+                    with _lock:
+                        _cache[key] = (result, _time.monotonic())
+                    return result
+                finally:
+                    with _lock:
+                        ev = _inflight.pop(key, None)
+                    if ev is not None:
+                        ev.set()
+
+            wrapper.cache_clear = lambda: (_cache.clear(), _inflight.clear())  # type: ignore[attr-defined]
+            return wrapper
 
         return decorator
 
@@ -53,7 +101,11 @@ def get_stock_data(ticker: str, period: str = "1y", interval: str = "1d") -> pd.
         return pd.DataFrame()
 
     def _fetch():
-        data = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+        data = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+        # auto_adjust=True back-adjusts OHLC for splits/dividends so the series
+        # is continuous across corporate actions (required for correct indicators,
+        # backtests, and forecasts).  Raw latest-quote display uses get_stock_info
+        # (currentPrice field) and is intentionally not sourced from here.
         if data is None or data.empty:
             raise ValueError("Empty price response (possible temporary rate limit)")
         return data

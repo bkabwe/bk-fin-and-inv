@@ -67,3 +67,69 @@ python analyze_stock.py AAPL
 ## Disclaimer
 
 This project is for educational/research use only and is **not financial advice**.
+
+## Recent improvements
+
+### Split/dividend-adjusted price data
+All historical price data fetched via `yfinance` now uses `auto_adjust=True`,
+so OHLC series are continuously back-adjusted for stock splits, reverse splits,
+and dividends.  This ensures that technical indicators, walk-forward backtests,
+Prophet/ARIMA/GARCH forecasts, relative-strength calculations, and charts do
+**not** show artificial price discontinuities caused by corporate actions.
+
+The latest real-time quote used for "Current Price" display is sourced from
+`yfinance`'s `info["currentPrice"]` field (unadjusted) and is clearly
+documented as such in the code.
+
+### TTL-aware caching in API (non-Streamlit) mode
+When the app runs as a FastAPI/Celery backend, `st.cache_data` is unavailable.
+Previously the fallback was a plain `functools.lru_cache` that ignored the
+`ttl` argument, so cached data could go stale indefinitely.  The fallback is
+now a lightweight TTL-aware decorator that actually expires entries after the
+configured TTL (e.g. 1 hour for stock data, 24 hours for backtests).
+
+### Failed-ticker visibility in screener results
+Exceptions during per-ticker analysis are no longer silently swallowed.
+Screener results (Streamlit and API) now track and surface:
+- **Failed ticker count** — how many tickers could not be analyzed (and why).
+- **Failed ticker list** — the ticker symbols and error reasons, visible in
+  the API `ProgressResponse` and logged as warnings in Streamlit.
+
+### Two-tier fast-screen pre-filter (screener performance)
+The screener now uses a two-tier approach to dramatically cut runtime across
+large universes (S&P 500, NASDAQ, Russell 2000) while keeping results accurate:
+
+1. **Fast tier** — every ticker in the universe is evaluated with a cheap
+   technical-subscore pass (data fetch + `analyze_technical` only, no
+   Prophet/ARIMA/GARCH/backtest).  The subscore is normalized to 0–100.
+2. **Full tier** — only tickers whose fast-tier score ≥ `min_score − margin`
+   proceed to the expensive full analysis (forecasting + walk-forward backtest).
+
+Key safeguards:
+- Every ticker in the universe is still analyzed at least at the fast-tier
+  level — none are silently excluded from consideration.
+- The default safety margin is **15 points**, making the pre-filter
+  deliberately conservative to minimize false negatives (candidates that
+  would have qualified after full analysis but get cut early).
+- The margin is configurable via the `fast_screen_margin` parameter.
+- The pre-filter can be disabled entirely with `use_fast_screen=False`
+  (useful for small custom universes where speed matters less).
+- Screener results include transparency counts:
+  - `fast_filtered_count` — tickers eliminated by the fast tier.
+  - `fully_analyzed_count` — tickers that went through full analysis.
+
+Additionally, per-ticker fetches are now parallelized with a thread pool
+(`max_workers=8` by default, tunable) since yfinance calls are I/O-bound,
+subject to conservative concurrency limits to avoid HTTP 429 rate-limiting.
+
+### Portfolio split/reverse-split detection
+The portfolio view now detects whether any held ticker has undergone a
+split or reverse split since the recorded purchase date.  When a split is
+detected, a visible warning is shown in the portfolio card:
+
+> ⚠️ TICKER has undergone a Nx forward split since YYYY-MM-DD.
+> Your share count and cost basis may be outdated — please update this holding.
+
+Share count and cost basis are **not** auto-adjusted (to avoid silent
+corruption of user data), but the warning makes it clear that manual
+review is needed.

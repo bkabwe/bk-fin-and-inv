@@ -5,6 +5,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import yfinance as yf
+
 from modules.logger import get_logger
 from modules.scoring_engine import analyze_stock, get_price_projections
 from modules.validators import sanitize_ticker
@@ -112,6 +114,52 @@ def remove_from_watchlist(ticker: str):
     save_watchlist([x for x in get_watchlist() if x != ticker])
 
 
+def detect_split_since_purchase(ticker: str, date_purchased: str) -> dict:
+    """Detect whether a stock split or reverse split has occurred since the purchase date.
+
+    Returns a dict with:
+    - ``split_detected`` (bool): True if any split event occurred after purchase.
+    - ``split_factor`` (float | None): Cumulative split factor since purchase (>1 = forward, <1 = reverse).
+    - ``events`` (list[dict]): Individual split events with date and ratio.
+    - ``warning`` (str | None): Human-readable warning if a split was detected.
+    """
+    result: dict = {"split_detected": False, "split_factor": None, "events": [], "warning": None}
+    try:
+        hist = yf.Ticker(ticker).history(period="max", auto_adjust=False)
+        if hist is None or hist.empty or "Stock Splits" not in hist.columns:
+            return result
+        splits = hist["Stock Splits"].dropna()
+        splits = splits[splits != 0]
+        if date_purchased:
+            try:
+                splits = splits[splits.index.tz_localize(None) > date_purchased]
+            except Exception:
+                splits = splits[splits.index > date_purchased]
+        if splits.empty:
+            return result
+        cumulative = 1.0
+        events = []
+        for dt, ratio in splits.items():
+            cumulative *= float(ratio)
+            events.append({"date": str(dt.date()), "ratio": float(ratio)})
+        result["split_detected"] = True
+        result["split_factor"] = round(cumulative, 6)
+        result["events"] = events
+        if cumulative > 1:
+            result["warning"] = (
+                f"⚠️ {ticker} has undergone a {cumulative:.4g}x forward split since {date_purchased}. "
+                "Your share count and cost basis may be outdated — please update this holding."
+            )
+        else:
+            result["warning"] = (
+                f"⚠️ {ticker} has undergone a {cumulative:.4g}x reverse split since {date_purchased}. "
+                "Your share count and cost basis may be outdated — please update this holding."
+            )
+    except Exception as exc:
+        logger.warning("Split detection failed for %s: %s", ticker, exc)
+    return result
+
+
 def analyze_portfolio_holdings() -> list[dict]:
     rows = []
     for holding in get_portfolio():
@@ -123,6 +171,10 @@ def analyze_portfolio_holdings() -> list[dict]:
             current = analysis.get("current_price") or 0
             value, basis = shares * current, shares * avg
             pnl = value - basis
+
+            # Detect splits/reverse splits since purchase date and warn user.
+            split_info = detect_split_since_purchase(holding["ticker"], holding.get("date_purchased", ""))
+            split_warning = split_info.get("warning")
 
             recommendation_to_sell_at = projections.get("recommendation_to_sell_at")
             if current and avg and current < avg:
@@ -166,6 +218,8 @@ def analyze_portfolio_holdings() -> list[dict]:
                     "long_term_upside": projections.get("long_term_upside"),
                     "long_term_basis": projections.get("long_term_basis"),
                     "recommendation_to_sell_at": recommendation_to_sell_at,
+                    "split_warning": split_warning,
+                    "split_info": split_info,
                 }
             )
         except Exception as exc:
@@ -206,6 +260,8 @@ def analyze_portfolio_holdings() -> list[dict]:
                     "long_term_upside": None,
                     "long_term_basis": None,
                     "recommendation_to_sell_at": "Unable to compute recommendation due to analysis error.",
+                    "split_warning": None,
+                    "split_info": {},
                 }
             )
     return rows

@@ -74,6 +74,9 @@ if rows:
         )
 
         st.markdown(f"### {row['Ticker']}: {row['Recommendation']} ({row['Score']})")
+        # Surface split/reverse-split warning so users know to update share count/cost basis
+        if row.get("split_warning"):
+            st.warning(row["split_warning"])
         st.write(f"Data quality: {quality_badge}")
         st.write(
             f"Short target: **{_fmt_money(projection.get('short_term_target', row['Target Price']))}** "

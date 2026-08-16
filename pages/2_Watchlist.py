@@ -4,9 +4,12 @@ import pandas as pd
 import streamlit as st
 
 from modules.data_fetcher import get_stock_data
+from modules.logger import get_logger
 from modules.portfolio import add_holding, add_to_watchlist, get_watchlist, remove_from_watchlist
 from modules.scoring_engine import analyze_stock
 from modules.validators import sanitize_ticker
+
+logger = get_logger(__name__)
 
 st.title("👀 Watchlist")
 
@@ -26,6 +29,7 @@ if not watchlist:
 
 sort_by = st.selectbox("Sort by", ["score", "alphabetical", "% change"])
 rows = []
+failed_watchlist: list[str] = []
 for ticker in watchlist:
     try:
         analysis = analyze_stock(ticker)
@@ -42,8 +46,12 @@ for ticker in watchlist:
                 "Recommendation": analysis.get("recommendation"),
             }
         )
-    except Exception:
-        continue
+    except Exception as exc:
+        failed_watchlist.append(ticker)
+        logger.warning("Failed to analyze watchlist ticker %s: %s", ticker, exc)
+
+if failed_watchlist:
+    st.warning(f"⚠️ Could not analyze {len(failed_watchlist)} ticker(s): {', '.join(failed_watchlist)}. Results may be incomplete.")
 
 frame = pd.DataFrame(rows)
 if sort_by == "score":

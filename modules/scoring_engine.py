@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from functools import lru_cache
-
 import numpy as np
 
 from modules.backtester import run_walk_forward
@@ -19,9 +17,46 @@ try:
 
     cache_data = st.cache_data
 except Exception:  # pragma: no cover
-    def cache_data(ttl: int | None = None):
+    import threading as _threading
+    import time as _time
+
+    def cache_data(ttl: int | None = None):  # type: ignore[misc]
+        """TTL-aware, stampede-safe cache fallback for non-Streamlit (FastAPI) deployments."""
+
         def decorator(func):
-            return lru_cache(maxsize=128)(func)
+            _cache: dict = {}
+            _inflight: dict = {}
+            _lock = _threading.Lock()
+
+            def wrapper(*args, **kwargs):
+                key = (args, tuple(sorted(kwargs.items())))
+                while True:
+                    now = _time.monotonic()
+                    with _lock:
+                        entry = _cache.get(key)
+                        if entry is not None:
+                            value, ts = entry
+                            if ttl is None or (now - ts) < ttl:
+                                return value
+                        event = _inflight.get(key)
+                        if event is None:
+                            ev = _threading.Event()
+                            _inflight[key] = ev
+                            break
+                    event.wait(timeout=300)
+
+                try:
+                    result = func(*args, **kwargs)
+                    with _lock:
+                        _cache[key] = (result, _time.monotonic())
+                    return result
+                finally:
+                    with _lock:
+                        ev = _inflight.pop(key, None)
+                    if ev is not None:
+                        ev.set()
+
+            return wrapper
 
         return decorator
 
@@ -674,3 +709,63 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
         },
         "sell_recommendation": sell,
     }
+
+
+# ---------------------------------------------------------------------------
+# Fast-screen helper
+# ---------------------------------------------------------------------------
+# Maximum possible contribution from non-technical components:
+#   fundamental (0-30) + sentiment (0-20) + macro (-5 to +3) => up to 53
+_MAX_NON_TECHNICAL_SCORE = 53
+
+
+def fast_screen_score(ticker: str, period: str = "1y", interval: str = "1d") -> tuple[int, str | None]:
+    """Compute only the technical subscore for a ticker (fast, cheap).
+
+    Returns ``(technical_score_out_of_100, error_reason)`` where ``error_reason``
+    is ``None`` on success.  The returned score is the technical subscore
+    normalised to a 0-100 scale (``technical_total / 50 * 100``) so it can be
+    compared directly against ``min_score``.
+
+    This is a genuine partial computation of the scoring logic in
+    ``analyze_stock`` — it uses the same ``analyze_technical`` call and the
+    same formula for ``technical_total``.  It intentionally omits the
+    expensive steps (Prophet/ARIMA/GARCH forecasting and walk-forward
+    backtesting) to serve as a cheap first-pass filter.
+    """
+    try:
+        data = get_stock_data(ticker, period=period, interval=interval)
+        if data is None or data.empty:
+            return 0, "no data"
+        technical = analyze_technical(data)
+
+        trend_score = 15 if technical["trend"] == "uptrend" else 8 if technical["trend"] == "sideways" else 2
+        rsi = technical["indicators"].get("rsi")
+        macd = technical["indicators"].get("macd")
+        signal = technical["indicators"].get("macd_signal")
+        momentum_score = (8 if rsi is not None and 40 <= rsi <= 65 else 4 if rsi is not None and 30 <= rsi <= 75 else 1) + (
+            7 if macd is not None and signal is not None and macd > signal else 2
+        )
+        volume_score = 10 if technical["volume_confirmation"] else 5 if technical["volume_trend"] == "increasing" else 2
+        bullish = sum(1 for p in technical["patterns"] if p["implication"] == "bullish")
+        bearish = sum(1 for p in technical["patterns"] if p["implication"] == "bearish")
+        pattern_score = max(0, min(10, 5 + (bullish - bearish) * 2))
+
+        trendline_break = technical.get("signals", {}).get("trendline_break_signal")
+        trendline_score = 5 if trendline_break == "bullish_break" else -5 if trendline_break == "bearish_break" else 0
+
+        breakout_score = 7 if technical.get("breakout", {}).get("signal_strength") == "strong" else 0
+
+        vq = technical.get("volume_quality", {})
+        volume_quality_score = 0
+        if vq.get("breakout_volume_confirmed"):
+            volume_quality_score += 3
+        if vq.get("climactic_volume") and vq.get("volume_divergence"):
+            volume_quality_score -= 3
+
+        technical_total = max(0, min(50, trend_score + momentum_score + volume_score + pattern_score + trendline_score + breakout_score + volume_quality_score))
+        # Normalize to 0-100 so callers can compare directly against min_score.
+        normalized = int(round(technical_total / 50 * 100))
+        return normalized, None
+    except Exception as exc:
+        return 0, str(exc)
