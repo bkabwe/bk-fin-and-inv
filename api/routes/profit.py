@@ -40,6 +40,8 @@ def start_profit(payload: ProfitRequest) -> JobResponse:
             "current_ticker": None,
             "results": [],
             "qualified": 0,
+            "fast_filtered": 0,
+            "fully_analyzed": 0,
             "stop_requested": False,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
@@ -61,6 +63,8 @@ def profit_progress(job_id: str) -> ProgressResponse:
         current_ticker=state.get("current_ticker"),
         results=state.get("results", []),
         qualified=int(state.get("qualified", 0)),
+        fast_filtered=int(state.get("fast_filtered", 0)),
+        fully_analyzed=int(state.get("fully_analyzed", 0)),
         failed_count=int(state.get("failed_count", 0)),
         failed_tickers=state.get("failed_tickers", []),
     )
@@ -78,9 +82,12 @@ def stop_profit(job_id: str) -> dict:
 
 @celery_app.task
 def run_profit_task(job_id: str, params: dict):
+    import concurrent.futures
+    import threading
+
     from api.deps import redis_client
     from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers
-    from modules.scoring_engine import analyze_stock
+    from modules.scoring_engine import analyze_stock, fast_screen_score
 
     universe_map = {
         "S&P 500": get_sp500_tickers,
@@ -92,6 +99,12 @@ def run_profit_task(job_id: str, params: dict):
     horizon = str(params.get("horizon", "Short-Term (1–4 weeks)"))
     min_upside_pct = float(params.get("min_upside_pct", 15.0))
     max_results = int(params.get("max_results", 25))
+    scan_mode = str(params.get("scan_mode", "fast"))
+    use_fast_screen = bool(params.get("use_fast_screen", True))
+    fast_screen_margin = int(params.get("fast_screen_margin", 15))
+    # Conservative proxy threshold matching the Streamlit page logic.
+    _FAST_SCREEN_BASE = 30  # base proxy cutoff (out of 100, matching Streamlit page)
+    _FAST_SCREEN_PROXY_THRESHOLD = _FAST_SCREEN_BASE - fast_screen_margin  # e.g. 15 with default margin
 
     selected = params.get("universes", ["S&P 500", "NASDAQ"])
     all_tickers: list[str] = []
@@ -126,79 +139,211 @@ def run_profit_task(job_id: str, params: dict):
 
     rows: list[dict] = []
     failed_tickers: list[dict] = []
-    for i, ticker in enumerate(tickers, start=1):
-        current = _load_state()
-        if current.get("stop_requested"):
-            current["status"] = "stopped"
-            current["screened"] = i - 1
-            current["current_ticker"] = None
-            current["qualified"] = len(rows)
-            current["failed_count"] = len(failed_tickers)
-            current["failed_tickers"] = failed_tickers
-            current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
-            _save_state(current)
-            return
 
-        current["screened"] = i
-        current["current_ticker"] = ticker
-        current["qualified"] = len(rows)
-        _save_state(current)
+    if scan_mode == "fast":
+        # ------------------------------------------------------------------
+        # FAST MODE: parallel thread pool + optional fast-screen pre-filter
+        # ------------------------------------------------------------------
+        fast_filtered = 0
+        fully_analyzed = 0
+        processed = 0
+        _stop_requested = [False]
+        _lock = threading.Lock()
 
-        try:
-            result = analyze_stock(ticker)
-            projections = result.get("projections") or {}
-            upside = projections.get(f"{key}_upside")
-            target = projections.get(f"{key}_target")
-            if upside is None:
-                continue
-            upside = float(upside)
-            if upside < min_upside_pct:
-                continue
+        def _process(ticker: str) -> None:
+            nonlocal fast_filtered, fully_analyzed, processed
+            try:
+                with _lock:
+                    if _stop_requested[0]:
+                        return
+                if use_fast_screen:
+                    fast_score, err = fast_screen_score(ticker)
+                    if err is not None:
+                        with _lock:
+                            failed_tickers.append({"ticker": ticker, "reason": f"fast-screen error: {err}"})
+                        return
+                    if fast_score < _FAST_SCREEN_PROXY_THRESHOLD:
+                        with _lock:
+                            fast_filtered += 1
+                        return
 
-            confidence = projections.get("data_quality", "Limited")
-            rows.append(
-                {
-                    "Ticker": ticker,
-                    "Company": result.get("company", ticker),
-                    "Index": ", ".join(selected),
-                    "Score": result.get("score", 0),
-                    "Current Price": result.get("current_price"),
-                    "Target Price": target,
-                    "Projected Upside %": round(upside, 2),
-                    "Est. Target Date": None,
-                    "Confidence": confidence,
-                }
-            )
-        except Exception as exc:
-            failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
+                result = analyze_stock(ticker)
+                with _lock:
+                    fully_analyzed += 1
+                projections = result.get("projections") or {}
+                upside = projections.get(f"{key}_upside")
+                target = projections.get(f"{key}_target")
+                if upside is None:
+                    return
+                upside = float(upside)
+                if upside < min_upside_pct:
+                    return
+                confidence = projections.get("data_quality", "Limited")
+                with _lock:
+                    rows.append(
+                        {
+                            "Ticker": ticker,
+                            "Company": result.get("company", ticker),
+                            "Index": ", ".join(selected),
+                            "Score": result.get("score", 0),
+                            "Current Price": result.get("current_price"),
+                            "Target Price": target,
+                            "Projected Upside %": round(upside, 2),
+                            "Est. Target Date": None,
+                            "Confidence": confidence,
+                        }
+                    )
+            except Exception as exc:
+                with _lock:
+                    failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
+            finally:
+                with _lock:
+                    processed += 1
+                    snap = {
+                        "status": "running",
+                        "screened": processed,
+                        "total": total,
+                        "current_ticker": ticker,
+                        "qualified": len(rows),
+                        "fast_filtered": fast_filtered,
+                        "fully_analyzed": fully_analyzed,
+                        "failed_count": len(failed_tickers),
+                        "results": [],
+                        "stop_requested": _stop_requested[0],
+                        "created_at": state.get("created_at"),
+                    }
+                _save_state(snap)
 
-        if i % 50 == 0:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(_process, t): t for t in tickers}
+            for future in concurrent.futures.as_completed(futures):
+                snap = json.loads(redis_client.get(f"job:{job_id}") or "{}")
+                if snap.get("stop_requested"):
+                    with _lock:
+                        _stop_requested[0] = True
+                    # Cancel pending futures and wait for in-flight workers to
+                    # finish before reading shared counters/rows to avoid a race.
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    with _lock:
+                        final_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+                        _save_state({
+                            "status": "stopped",
+                            "screened": processed,
+                            "total": total,
+                            "current_ticker": None,
+                            "results": final_rows,
+                            "qualified": len(rows),
+                            "fast_filtered": fast_filtered,
+                            "fully_analyzed": fully_analyzed,
+                            "failed_count": len(failed_tickers),
+                            "failed_tickers": failed_tickers,
+                            "stop_requested": True,
+                            "created_at": state.get("created_at"),
+                        })
+                    record_predictions_from_scan(final_rows, horizon=key, source="profit_opportunities")
+                    return
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+        with _lock:
+            final_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+            _save_state({
+                "status": "complete",
+                "screened": total,
+                "total": total,
+                "current_ticker": None,
+                "results": final_rows,
+                "qualified": len(rows),
+                "fast_filtered": fast_filtered,
+                "fully_analyzed": fully_analyzed,
+                "failed_count": len(failed_tickers),
+                "failed_tickers": failed_tickers,
+                "stop_requested": False,
+                "created_at": state.get("created_at"),
+            })
+
+    else:
+        # ------------------------------------------------------------------
+        # THOROUGH MODE: original sequential loop (unchanged behaviour)
+        # ------------------------------------------------------------------
+        for i, ticker in enumerate(tickers, start=1):
             current = _load_state()
-            current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+            if current.get("stop_requested"):
+                current["status"] = "stopped"
+                current["screened"] = i - 1
+                current["current_ticker"] = None
+                current["qualified"] = len(rows)
+                current["failed_count"] = len(failed_tickers)
+                current["failed_tickers"] = failed_tickers
+                current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+                _save_state(current)
+                return
+
+            current["screened"] = i
+            current["current_ticker"] = ticker
             current["qualified"] = len(rows)
-            current["failed_count"] = len(failed_tickers)
             _save_state(current)
 
-    final = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+            try:
+                result = analyze_stock(ticker)
+                projections = result.get("projections") or {}
+                upside = projections.get(f"{key}_upside")
+                target = projections.get(f"{key}_target")
+                if upside is None:
+                    continue
+                upside = float(upside)
+                if upside < min_upside_pct:
+                    continue
+
+                confidence = projections.get("data_quality", "Limited")
+                rows.append(
+                    {
+                        "Ticker": ticker,
+                        "Company": result.get("company", ticker),
+                        "Index": ", ".join(selected),
+                        "Score": result.get("score", 0),
+                        "Current Price": result.get("current_price"),
+                        "Target Price": target,
+                        "Projected Upside %": round(upside, 2),
+                        "Est. Target Date": None,
+                        "Confidence": confidence,
+                    }
+                )
+            except Exception as exc:
+                failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
+
+            if i % 50 == 0:
+                current = _load_state()
+                current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+                current["qualified"] = len(rows)
+                current["failed_count"] = len(failed_tickers)
+                _save_state(current)
+
+        final_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+
+        _save_state(
+            {
+                "status": "complete",
+                "screened": total,
+                "total": total,
+                "current_ticker": None,
+                "results": final_rows,
+                "qualified": len(rows),
+                "fast_filtered": 0,
+                "fully_analyzed": total - len(failed_tickers),
+                "failed_count": len(failed_tickers),
+                "failed_tickers": failed_tickers,
+                "stop_requested": False,
+                "created_at": state.get("created_at"),
+            }
+        )
 
     # Record predictions for the track-record feature.
+    # Use final_rows already computed in each branch (avoids a Redis re-fetch).
     try:
         from modules.prediction_tracker import record_predictions_from_scan
-        record_predictions_from_scan(final, horizon=key, source="profit_opportunities")
+        record_predictions_from_scan(final_rows, horizon=key, source="profit_opportunities")
     except Exception:
         pass  # Never let tracking failures break the task
-
-    _save_state(
-        {
-            "status": "complete",
-            "screened": total,
-            "total": total,
-            "current_ticker": None,
-            "results": final,
-            "qualified": len(rows),
-            "failed_count": len(failed_tickers),
-            "failed_tickers": failed_tickers,
-            "stop_requested": False,
-            "created_at": state.get("created_at"),
-        }
-    )

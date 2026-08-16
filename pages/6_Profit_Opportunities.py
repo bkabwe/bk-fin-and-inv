@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures
+import threading
 from datetime import date, timedelta
 
 import numpy as np
@@ -10,7 +12,7 @@ import streamlit as st
 from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers, get_stock_data
 from modules.portfolio import get_portfolio
 from modules.prediction_tracker import record_predictions_from_scan
-from modules.scoring_engine import analyze_stock
+from modules.scoring_engine import analyze_stock, fast_screen_score
 
 try:  # pragma: no cover
     from prophet import Prophet
@@ -45,16 +47,67 @@ selected_universes = st.multiselect(
     default=["S&P 500", "NASDAQ"],
 )
 min_upside_pct = st.slider("Min Upside %", min_value=5, max_value=100, value=15)
+
+# ---------------------------------------------------------------------------
+# Scan-mode selector
+# ---------------------------------------------------------------------------
+scan_mode = st.radio(
+    "Scan Mode",
+    ["Fast (Recommended)", "Thorough (Original, Slower)"],
+    help=(
+        "**Fast**: Parallel thread-pool execution + optional fast-screen pre-filter "
+        "(technical subscore proxy). Significantly quicker on large universes. "
+        "May very rarely miss a borderline candidate near the upside threshold.\n\n"
+        "**Thorough**: Original sequential behaviour — every ticker gets full "
+        "Prophet/ARIMA/GARCH analysis. Slower but no pre-filtering shortcuts."
+    ),
+)
+_fast_mode = scan_mode.startswith("Fast")
+
+use_fast_screen = False
+if _fast_mode:
+    use_fast_screen = st.checkbox(
+        "Enable fast-screen pre-filter",
+        value=True,
+        help=(
+            "Before running the expensive full analysis, compute a cheap "
+            "technical subscore. Tickers whose subscore falls well below the "
+            "proxy threshold are skipped (saves significant time on large "
+            "universes). Disable for exhaustive coverage."
+        ),
+    )
+
+# Shared constants matching modules/screener.py defaults
+_MAX_WORKERS = 8
+_FAST_SCREEN_MARGIN = 15
+# Conservative proxy threshold: tickers whose fast technical subscore is below
+# this value are very unlikely to produce a high projected upside, so we skip
+# them.  We use a fixed low-bar proxy base (30 out of 100) with a safety
+# margin rather than the upside % directly, because fast_screen_score() returns
+# a normalized technical subscore (not an upside %) — a score this low makes
+# any meaningful upside projection unlikely.
+_FAST_SCREEN_BASE = 30  # base proxy cutoff (out of 100)
+_FAST_SCREEN_PROXY_THRESHOLD = _FAST_SCREEN_BASE - _FAST_SCREEN_MARGIN  # = 15
+
 st.info(
     "ℹ️ This page analyses **every stock** in your selected universes. "
     "Larger universes will take longer to scan."
+    + (" Fast mode uses parallel processing to reduce runtime." if _fast_mode else "")
 )
 large = [u for u in selected_universes if u in ("NASDAQ", "OTC")]
 if large:
-    st.warning(
-        f"⚠️ {' and '.join(large)} contain thousands of stocks. "
-        "A full scan can take 30–60 minutes. Consider starting with S&P 500 or NYSE American."
-    )
+    if _fast_mode:
+        st.warning(
+            f"⚠️ {' and '.join(large)} contain thousands of stocks. "
+            "Fast mode (parallel + pre-filter) should reduce runtime significantly, "
+            "but a full scan may still take several minutes."
+        )
+    else:
+        st.warning(
+            f"⚠️ {' and '.join(large)} contain thousands of stocks. "
+            "A full scan in Thorough mode can take 30–60 minutes. "
+            "Consider starting with S&P 500 or NYSE American."
+        )
 
 
 @st.cache_data(ttl=1800)
@@ -207,27 +260,106 @@ if st.button("Run Analysis"):
     else:
         progress = st.progress(0.0)
         rows: list[dict] = []
-        for i, ticker in enumerate(tickers, start=1):
-            try:
-                analysis = analyze_stock(ticker)
-                projections = analysis.get("projections") or {}
-                current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
-                if current_price <= 0:
+
+        if _fast_mode:
+            # ------------------------------------------------------------------
+            # FAST MODE: parallel thread pool + optional fast-screen pre-filter
+            # ------------------------------------------------------------------
+            failed_tickers: list[dict] = []
+            fast_filtered_count = 0
+            fully_analyzed_count = 0
+            processed_count = 0
+            _lock = threading.Lock()
+            total = len(tickers)
+
+            def _process_ticker(ticker: str) -> None:
+                nonlocal fast_filtered_count, fully_analyzed_count, processed_count
+                try:
+                    if use_fast_screen:
+                        fast_score, err = fast_screen_score(ticker)
+                        if err is not None:
+                            with _lock:
+                                failed_tickers.append({"ticker": ticker, "reason": f"fast-screen error: {err}"})
+                            return
+                        # Conservative proxy: skip tickers whose cheap technical
+                        # subscore is well below a low threshold, since a low
+                        # technical subscore makes any meaningful projected upside
+                        # very unlikely.  The margin keeps borderline tickers safe.
+                        if fast_score < _FAST_SCREEN_PROXY_THRESHOLD:
+                            with _lock:
+                                fast_filtered_count += 1
+                            return
+
+                    analysis = analyze_stock(ticker)
+                    with _lock:
+                        fully_analyzed_count += 1
+                    projections = analysis.get("projections") or {}
+                    current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
+                    if current_price <= 0:
+                        return
+                    with _lock:
+                        rows.append(
+                            {
+                                "ticker": ticker,
+                                "company": analysis.get("company") or ticker,
+                                "index": source_labels.get(ticker, ""),
+                                "score": int(analysis.get("score") or 0),
+                                "current_price": current_price,
+                                "technical": analysis.get("technical") or {},
+                                "projections": projections,
+                            }
+                        )
+                except Exception as exc:
+                    with _lock:
+                        failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
+                finally:
+                    with _lock:
+                        processed_count += 1
+                        done = processed_count / total
+                    progress.progress(done)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+                futures = {executor.submit(_process_ticker, t): t for t in tickers}
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
+
+            st.session_state["profit_opportunities_fast_filtered"] = fast_filtered_count
+            st.session_state["profit_opportunities_fully_analyzed"] = fully_analyzed_count
+            st.session_state["profit_opportunities_failed"] = failed_tickers
+
+        else:
+            # ------------------------------------------------------------------
+            # THOROUGH MODE: original sequential loop, no pre-filter (unchanged)
+            # ------------------------------------------------------------------
+            for i, ticker in enumerate(tickers, start=1):
+                try:
+                    analysis = analyze_stock(ticker)
+                    projections = analysis.get("projections") or {}
+                    current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
+                    if current_price <= 0:
+                        continue
+                    rows.append(
+                        {
+                            "ticker": ticker,
+                            "company": analysis.get("company") or ticker,
+                            "index": source_labels.get(ticker, ""),
+                            "score": int(analysis.get("score") or 0),
+                            "current_price": current_price,
+                            "technical": analysis.get("technical") or {},
+                            "projections": projections,
+                        }
+                    )
+                except Exception:
                     continue
-                rows.append(
-                    {
-                        "ticker": ticker,
-                        "company": analysis.get("company") or ticker,
-                        "index": source_labels.get(ticker, ""),
-                        "score": int(analysis.get("score") or 0),
-                        "current_price": current_price,
-                        "technical": analysis.get("technical") or {},
-                        "projections": projections,
-                    }
-                )
-            except Exception:
-                continue
-            progress.progress(i / len(tickers))
+                progress.progress(i / len(tickers))
+            # Clear fast-mode stats when running thorough
+            st.session_state.pop("profit_opportunities_fast_filtered", None)
+            st.session_state.pop("profit_opportunities_fully_analyzed", None)
+            st.session_state.pop("profit_opportunities_failed", None)
+
         st.session_state["profit_opportunities_scan"] = rows
         st.session_state["profit_opportunities_scanned_total"] = len(tickers)
 
@@ -288,12 +420,18 @@ if scan_rows:
             st.caption(f"✅ Scanned **{total_scanned}** stocks → **0** met the upside threshold")
     else:
         results_df = pd.DataFrame(display_rows).sort_values("Projected Upside %", ascending=False).head(max_results)
+        _fast_filtered = st.session_state.get("profit_opportunities_fast_filtered")
+        _fully_analyzed = st.session_state.get("profit_opportunities_fully_analyzed")
         if total_scanned:
-            st.caption(
-                f"✅ Scanned **{total_scanned}** stocks → "
-                f"**{len(display_rows)}** met the upside threshold → "
-                f"Showing top **{len(results_df)}**"
+            caption_parts = [f"✅ Scanned **{total_scanned}** stocks"]
+            if _fast_filtered is not None and _fully_analyzed is not None:
+                caption_parts.append(
+                    f"fast-filtered **{_fast_filtered}** · fully analysed **{_fully_analyzed}**"
+                )
+            caption_parts.append(
+                f"**{len(display_rows)}** met the upside threshold → Showing top **{len(results_df)}**"
             )
+            st.caption(" → ".join(caption_parts))
 
         styled = results_df.style.format(
             {
