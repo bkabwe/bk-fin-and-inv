@@ -8,6 +8,8 @@ class ScreenerRequest(BaseModel):
     min_score: int = 60
     max_results: int = 25
     custom_tickers: list[str] = Field(default_factory=list)
+    use_fast_screen: bool = True
+    fast_screen_margin: int = 15
 
 
 class ProfitRequest(BaseModel):
@@ -38,3 +40,7 @@ class ProgressResponse(BaseModel):
     current_ticker: str | None
     results: list[dict]
     qualified: int
+    fast_filtered: int = 0
+    fully_analyzed: int = 0
+    failed_count: int = 0
+    failed_tickers: list[dict] = Field(default_factory=list)

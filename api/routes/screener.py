@@ -41,6 +41,10 @@ def start_screener(payload: ScreenerRequest) -> JobResponse:
         "current_ticker": None,
         "results": [],
         "qualified": 0,
+        "fast_filtered": 0,
+        "fully_analyzed": 0,
+        "failed_count": 0,
+        "failed_tickers": [],
         "stop_requested": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -62,6 +66,10 @@ def screener_progress(job_id: str) -> ProgressResponse:
         current_ticker=state.get("current_ticker"),
         results=state.get("results", []),
         qualified=int(state.get("qualified", 0)),
+        fast_filtered=int(state.get("fast_filtered", 0)),
+        fully_analyzed=int(state.get("fully_analyzed", 0)),
+        failed_count=int(state.get("failed_count", 0)),
+        failed_tickers=state.get("failed_tickers", []),
     )
 
 
@@ -77,9 +85,12 @@ def stop_screener(job_id: str) -> dict:
 
 @celery_app.task
 def run_screener_task(job_id: str, params: dict):
+    import concurrent.futures
+    import threading
+
     from api.deps import redis_client
     from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers
-    from modules.scoring_engine import analyze_stock
+    from modules.scoring_engine import analyze_stock, fast_screen_score
     from modules.validators import sanitize_ticker
 
     universe_map = {
@@ -109,6 +120,9 @@ def run_screener_task(job_id: str, params: dict):
     total = len(tickers)
     min_score = params.get("min_score", 60)
     max_results = params.get("max_results", 25)
+    use_fast_screen = params.get("use_fast_screen", True)
+    fast_screen_margin = params.get("fast_screen_margin", 15)
+    fast_screen_threshold = min_score - fast_screen_margin
 
     def _save(state):
         redis_client.set(f"job:{job_id}", json.dumps(state), ex=3600)
@@ -117,52 +131,118 @@ def run_screener_task(job_id: str, params: dict):
     state["total"] = total
     _save(state)
 
-    rows = []
-    for i, ticker in enumerate(tickers, 1):
-        current = json.loads(redis_client.get(f"job:{job_id}") or "{}")
-        if current.get("stop_requested"):
-            current["status"] = "stopped"
-            current["screened"] = i - 1
-            current["results"] = sorted(rows, key=lambda x: x.get("Score", 0), reverse=True)[:max_results]
-            current["qualified"] = len(rows)
-            _save(current)
-            return
+    rows: list[dict] = []
+    failed_tickers: list[dict] = []
+    fast_filtered = 0
+    fully_analyzed = 0
+    processed = 0
+    _stop_requested = [False]  # mutable container so _process can check it under lock
+    _lock = threading.Lock()
 
-        current["screened"] = i
-        current["current_ticker"] = ticker
-        current["qualified"] = len(rows)
-        _save(current)
-
+    def _process(ticker: str) -> None:
+        nonlocal fast_filtered, fully_analyzed, processed
         try:
+            # Check stop flag via in-memory lock (avoids a Redis round-trip per ticker)
+            with _lock:
+                if _stop_requested[0]:
+                    return
+            if use_fast_screen:
+                fast_score, err = fast_screen_score(ticker)
+                if err is not None:
+                    with _lock:
+                        failed_tickers.append({"ticker": ticker, "reason": f"fast-screen error: {err}"})
+                    return
+                if fast_score < fast_screen_threshold:
+                    with _lock:
+                        fast_filtered += 1
+                    return
             result = analyze_stock(ticker)
             score = result.get("score", 0)
+            with _lock:
+                fully_analyzed += 1
             if score >= min_score:
-                rows.append(
-                    {
-                        "Ticker": ticker,
-                        "Company": result.get("company", ticker),
-                        "Score": score,
-                        "Recommendation": result.get("recommendation", ""),
-                        "Time Horizon": result.get("time_horizon", ""),
-                        "Current Price": result.get("current_price"),
-                        "Entry Price": result.get("entry_price"),
-                        "Target Price": result.get("target_price"),
-                        "Stop Loss": result.get("stop_loss"),
-                    }
-                )
-        except Exception:
-            pass
+                with _lock:
+                    rows.append(
+                        {
+                            "Ticker": ticker,
+                            "Company": result.get("company", ticker),
+                            "Score": score,
+                            "Recommendation": result.get("recommendation", ""),
+                            "Time Horizon": result.get("time_horizon", ""),
+                            "Current Price": result.get("current_price"),
+                            "Entry Price": result.get("entry_price"),
+                            "Target Price": result.get("target_price"),
+                            "Stop Loss": result.get("stop_loss"),
+                        }
+                    )
+        except Exception as exc:
+            with _lock:
+                failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
+        finally:
+            # Build the progress snapshot from in-memory state under the lock to
+            # avoid a non-atomic Redis read→write that could overwrite newer data.
+            with _lock:
+                processed += 1
+                snap = {
+                    "status": "running",
+                    "screened": processed,
+                    "total": total,
+                    "current_ticker": ticker,
+                    "qualified": len(rows),
+                    "fast_filtered": fast_filtered,
+                    "fully_analyzed": fully_analyzed,
+                    "failed_count": len(failed_tickers),
+                    "results": [],
+                    "stop_requested": _stop_requested[0],
+                    "created_at": state.get("created_at"),
+                }
+            _save(snap)
 
-    final = sorted(rows, key=lambda x: x.get("Score", 0), reverse=True)[:max_results]
-    _save(
-        {
-            "status": "complete",
-            "screened": total,
-            "total": total,
-            "current_ticker": None,
-            "results": final,
-            "qualified": len(rows),
-            "stop_requested": False,
-            "created_at": state.get("created_at"),
-        }
-    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_process, t): t for t in tickers}
+        for future in concurrent.futures.as_completed(futures):
+            snap = json.loads(redis_client.get(f"job:{job_id}") or "{}")
+            if snap.get("stop_requested"):
+                with _lock:
+                    _stop_requested[0] = True
+                executor.shutdown(wait=False, cancel_futures=True)
+                with _lock:
+                    final_rows = sorted(rows, key=lambda x: x.get("Score", 0), reverse=True)[:max_results]
+                    _save({
+                        "status": "stopped",
+                        "screened": processed,
+                        "total": total,
+                        "current_ticker": None,
+                        "results": final_rows,
+                        "qualified": len(rows),
+                        "fast_filtered": fast_filtered,
+                        "fully_analyzed": fully_analyzed,
+                        "failed_count": len(failed_tickers),
+                        "failed_tickers": failed_tickers,
+                        "stop_requested": True,
+                        "created_at": state.get("created_at"),
+                    })
+                return
+            try:
+                future.result()
+            except Exception:
+                pass
+
+    with _lock:
+        final_rows = sorted(rows, key=lambda x: x.get("Score", 0), reverse=True)[:max_results]
+        _save(
+            {
+                "status": "complete",
+                "screened": total,
+                "total": total,
+                "current_ticker": None,
+                "results": final_rows,
+                "qualified": len(rows),
+                "fast_filtered": fast_filtered,
+                "fully_analyzed": fully_analyzed,
+                "failed_count": len(failed_tickers),
+                "failed_tickers": failed_tickers,
+                "stop_requested": False,
+                "created_at": state.get("created_at"),
+            }
+        )

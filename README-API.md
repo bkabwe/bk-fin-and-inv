@@ -30,3 +30,43 @@ http://localhost:8000/docs
 - Redis not running: `brew services start redis`
 - Port conflicts: free ports 5173/8000/6379
 - Celery not connecting: verify Redis on localhost:6379
+
+## Recent changes
+
+### Split-adjusted price data
+All `yfinance` calls in the backend now use `auto_adjust=True`.  Historical
+OHLC series used for indicators, backtests, and forecasting are continuously
+adjusted for splits/dividends — eliminating artificial price jumps in API
+responses.
+
+### TTL-aware cache in non-Streamlit mode
+The `@cache_data(ttl=...)` fallback used by the FastAPI/Celery backend now
+honours the configured TTL (previously it used `lru_cache` which ignored TTL,
+causing potentially stale data to be served indefinitely).
+
+### Screener API changes (`/screener`)
+
+**New request fields** (`POST /screener/start`):
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `use_fast_screen` | bool | `true` | Enable two-tier fast-screen pre-filter |
+| `fast_screen_margin` | int | `15` | Safety margin (points) for fast-screen cutoff |
+
+**New progress fields** (`GET /screener/{job_id}/progress`):
+
+| Field | Type | Description |
+|---|---|---|
+| `fast_filtered` | int | Tickers eliminated by the fast-screen tier |
+| `fully_analyzed` | int | Tickers that went through full analysis |
+| `failed_count` | int | Tickers that raised an exception during analysis |
+| `failed_tickers` | list | `[{"ticker": "X", "reason": "..."}]` objects |
+
+The same `failed_count` / `failed_tickers` fields are also available on the
+`/profit/{job_id}/progress` endpoint.
+
+### Chart accuracy
+The `/analysis/{ticker}/price` endpoint now returns split-adjusted OHLC data
+so the React `PriceChart` component no longer displays artificial price jumps.
+Missing OHLC values in the chart are filtered out client-side rather than
+coerced to `0`, eliminating false collapse-to-zero artifacts.

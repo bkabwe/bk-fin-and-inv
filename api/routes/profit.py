@@ -61,6 +61,8 @@ def profit_progress(job_id: str) -> ProgressResponse:
         current_ticker=state.get("current_ticker"),
         results=state.get("results", []),
         qualified=int(state.get("qualified", 0)),
+        failed_count=int(state.get("failed_count", 0)),
+        failed_tickers=state.get("failed_tickers", []),
     )
 
 
@@ -123,6 +125,7 @@ def run_profit_task(job_id: str, params: dict):
     key = horizon_map.get(horizon, "short_term")
 
     rows: list[dict] = []
+    failed_tickers: list[dict] = []
     for i, ticker in enumerate(tickers, start=1):
         current = _load_state()
         if current.get("stop_requested"):
@@ -130,6 +133,8 @@ def run_profit_task(job_id: str, params: dict):
             current["screened"] = i - 1
             current["current_ticker"] = None
             current["qualified"] = len(rows)
+            current["failed_count"] = len(failed_tickers)
+            current["failed_tickers"] = failed_tickers
             current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
             _save_state(current)
             return
@@ -164,13 +169,14 @@ def run_profit_task(job_id: str, params: dict):
                     "Confidence": confidence,
                 }
             )
-        except Exception:
-            continue
+        except Exception as exc:
+            failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
 
         if i % 50 == 0:
             current = _load_state()
             current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
             current["qualified"] = len(rows)
+            current["failed_count"] = len(failed_tickers)
             _save_state(current)
 
     final = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
@@ -182,6 +188,8 @@ def run_profit_task(job_id: str, params: dict):
             "current_ticker": None,
             "results": final,
             "qualified": len(rows),
+            "failed_count": len(failed_tickers),
+            "failed_tickers": failed_tickers,
             "stop_requested": False,
             "created_at": state.get("created_at"),
         }

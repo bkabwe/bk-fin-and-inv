@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from functools import lru_cache
+import threading
+import time
 
 import pandas as pd
 import yfinance as yf
@@ -14,9 +15,46 @@ try:
 
     cache_data = st.cache_data
 except Exception:  # pragma: no cover
-    def cache_data(ttl: int | None = None):
+    import threading as _threading
+    import time as _time
+
+    def cache_data(ttl: int | None = None):  # type: ignore[misc]
+        """TTL-aware, stampede-safe cache fallback for non-Streamlit (FastAPI) deployments."""
+
         def decorator(func):
-            return lru_cache(maxsize=128)(func)
+            _cache: dict = {}
+            _inflight: dict = {}
+            _lock = _threading.Lock()
+
+            def wrapper(*args, **kwargs):
+                key = (args, tuple(sorted(kwargs.items())))
+                while True:
+                    now = _time.monotonic()
+                    with _lock:
+                        entry = _cache.get(key)
+                        if entry is not None:
+                            value, ts = entry
+                            if ttl is None or (now - ts) < ttl:
+                                return value
+                        event = _inflight.get(key)
+                        if event is None:
+                            ev = _threading.Event()
+                            _inflight[key] = ev
+                            break
+                    event.wait(timeout=300)
+
+                try:
+                    result = func(*args, **kwargs)
+                    with _lock:
+                        _cache[key] = (result, _time.monotonic())
+                    return result
+                finally:
+                    with _lock:
+                        ev = _inflight.pop(key, None)
+                    if ev is not None:
+                        ev.set()
+
+            return wrapper
 
         return decorator
 
@@ -33,8 +71,10 @@ def get_macro_regime() -> dict:
         "market_regime": "neutral",
     }
     try:
-        vix_df = yf.download("^VIX", period="1mo", interval="1d", progress=False, auto_adjust=False)
-        tnx_df = yf.download("^TNX", period="1mo", interval="1d", progress=False, auto_adjust=False)
+        # auto_adjust=True: index/sector ETF prices are adjusted for splits so
+        # SMA/trend calculations across long lookback windows are accurate.
+        vix_df = yf.download("^VIX", period="1mo", interval="1d", progress=False, auto_adjust=True)
+        tnx_df = yf.download("^TNX", period="1mo", interval="1d", progress=False, auto_adjust=True)
 
         vix = float(vix_df["Close"].dropna().iloc[-1]) if not vix_df.empty and "Close" in vix_df else None
         y10 = float(tnx_df["Close"].dropna().iloc[-1]) if not tnx_df.empty and "Close" in tnx_df else None
@@ -51,7 +91,7 @@ def get_macro_regime() -> dict:
         bearish: list[str] = []
 
         for symbol, label in sector_map.items():
-            data = yf.download(symbol, period="6mo", interval="1d", progress=False, auto_adjust=False)
+            data = yf.download(symbol, period="6mo", interval="1d", progress=False, auto_adjust=True)
             if data.empty or "Close" not in data:
                 continue
             close = data["Close"].astype(float)
