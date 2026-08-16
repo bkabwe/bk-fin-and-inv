@@ -17,6 +17,9 @@ class ProfitRequest(BaseModel):
     horizon: str = "Short-Term (1–4 weeks)"
     min_upside_pct: float = 15.0
     max_results: int = 25
+    scan_mode: str = "fast"  # "fast" | "thorough"
+    use_fast_screen: bool = True
+    fast_screen_margin: int = 15
 
 
 class HoldingRequest(BaseModel):

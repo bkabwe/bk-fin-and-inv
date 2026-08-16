@@ -122,6 +122,26 @@ Additionally, per-ticker fetches are now parallelized with a thread pool
 (`max_workers=8` by default, tunable) since yfinance calls are I/O-bound,
 subject to conservative concurrency limits to avoid HTTP 429 rate-limiting.
 
+### Profit Opportunities scan mode (Fast vs Thorough)
+The Profit Opportunities page now offers a **Scan Mode** selector:
+
+- **Fast (Recommended)** — runs per-ticker analysis in a parallel thread pool
+  (`max_workers=8`) and optionally applies a cheap technical-subscore
+  pre-filter before the expensive Prophet/ARIMA/GARCH full analysis.  The
+  pre-filter uses the same safeguarded two-tier approach as the Screener
+  (conservative threshold + 15-point safety margin) and is toggle-able via
+  the "Enable fast-screen pre-filter" checkbox.  Significantly faster on large
+  universes.  Transparency counts (fast-filtered / fully-analysed / failed)
+  are shown in the results summary.
+
+- **Thorough (Original, Slower)** — the original sequential loop: every ticker
+  in the selected universe goes through full analysis with no pre-filtering.
+  Use this when you want a guaranteed exhaustive baseline or are scanning a
+  small universe.
+
+The same `scan_mode`, `use_fast_screen`, and `fast_screen_margin` options are
+available in the API/Celery path via `ProfitRequest` fields.
+
 ### Portfolio split/reverse-split detection
 The portfolio view now detects whether any held ticker has undergone a
 split or reverse split since the recorded purchase date.  When a split is
