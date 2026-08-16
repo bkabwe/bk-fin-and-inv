@@ -266,14 +266,17 @@ if st.button("Run Analysis"):
             # FAST MODE: parallel thread pool + optional fast-screen pre-filter
             # ------------------------------------------------------------------
             failed_tickers: list[dict] = []
-            fast_filtered_count = 0
-            fully_analyzed_count = 0
-            processed_count = 0
+            # NOTE: This page executes as top-level Streamlit script code (not
+            # inside a function), so `_process_ticker` below has no enclosing
+            # *function* scope — only module/global scope. `nonlocal` requires
+            # an enclosing function scope and raises SyntaxError here
+            # ("no binding for nonlocal ... found"). Use a mutable dict instead
+            # so counters can be updated in place without `nonlocal`/`global`.
+            _counters = {"fast_filtered": 0, "fully_analyzed": 0, "processed": 0}
             _lock = threading.Lock()
             total = len(tickers)
 
             def _process_ticker(ticker: str) -> None:
-                nonlocal fast_filtered_count, fully_analyzed_count, processed_count
                 try:
                     if use_fast_screen:
                         fast_score, err = fast_screen_score(ticker)
@@ -287,12 +290,12 @@ if st.button("Run Analysis"):
                         # very unlikely.  The margin keeps borderline tickers safe.
                         if fast_score < _FAST_SCREEN_PROXY_THRESHOLD:
                             with _lock:
-                                fast_filtered_count += 1
+                                _counters["fast_filtered"] += 1
                             return
 
                     analysis = analyze_stock(ticker)
                     with _lock:
-                        fully_analyzed_count += 1
+                        _counters["fully_analyzed"] += 1
                     projections = analysis.get("projections") or {}
                     current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
                     if current_price <= 0:
@@ -314,8 +317,8 @@ if st.button("Run Analysis"):
                         failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
                 finally:
                     with _lock:
-                        processed_count += 1
-                        done = processed_count / total
+                        _counters["processed"] += 1
+                        done = _counters["processed"] / total
                     progress.progress(done)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
@@ -326,8 +329,8 @@ if st.button("Run Analysis"):
                     except Exception:
                         pass
 
-            st.session_state["profit_opportunities_fast_filtered"] = fast_filtered_count
-            st.session_state["profit_opportunities_fully_analyzed"] = fully_analyzed_count
+            st.session_state["profit_opportunities_fast_filtered"] = _counters["fast_filtered"]
+            st.session_state["profit_opportunities_fully_analyzed"] = _counters["fully_analyzed"]
             st.session_state["profit_opportunities_failed"] = failed_tickers
 
         else:
