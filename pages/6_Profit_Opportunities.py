@@ -265,6 +265,15 @@ if st.button("Run Analysis"):
             # ------------------------------------------------------------------
             # FAST MODE: parallel thread pool + optional fast-screen pre-filter
             # ------------------------------------------------------------------
+            # IMPORTANT: Streamlit widgets (including st.progress) are only
+            # supported when called from the main script-execution thread.
+            # Calling progress.progress(...) from a ThreadPoolExecutor worker
+            # thread either silently no-ops or fails to trigger a UI re-render
+            # because Streamlit's ScriptRunContext is not attached to worker
+            # threads. To keep the progress bar working correctly, worker
+            # threads below ONLY update shared, thread-safe counters — the
+            # actual `progress.progress(...)` call happens on the main thread,
+            # inside the `as_completed` loop, once per completed future.
             failed_tickers: list[dict] = []
             # NOTE: This page executes as top-level Streamlit script code (not
             # inside a function), so `_process_ticker` below has no enclosing
@@ -316,18 +325,22 @@ if st.button("Run Analysis"):
                     with _lock:
                         failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
                 finally:
+                    # NOTE: Do NOT call progress.progress(...) here — this runs
+                    # on a worker thread. Only update the shared counter; the
+                    # main thread reads `processed` and updates the widget.
                     with _lock:
                         _counters["processed"] += 1
-                        done = _counters["processed"] / total
-                    progress.progress(done)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
                 futures = {executor.submit(_process_ticker, t): t for t in tickers}
-                for future in concurrent.futures.as_completed(futures):
+                # This loop runs on the main script thread, so it's the correct
+                # place to update Streamlit widgets as each future resolves.
+                for completed, future in enumerate(concurrent.futures.as_completed(futures), start=1):
                     try:
                         future.result()
                     except Exception:
                         pass
+                    progress.progress(completed / total)
 
             st.session_state["profit_opportunities_fast_filtered"] = _counters["fast_filtered"]
             st.session_state["profit_opportunities_fully_analyzed"] = _counters["fully_analyzed"]
