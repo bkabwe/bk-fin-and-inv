@@ -353,7 +353,7 @@ def run_profit_task(job_id: str, params: dict):
         else:
             revalidation_status = "not_requested"
         final_rows = ranked_rows[:max_results]
-
+        final_state = _load_state()
         _save_state(
             {
                 "status": "complete",
@@ -368,7 +368,7 @@ def run_profit_task(job_id: str, params: dict):
                 "failed_tickers": failed_tickers,
                 "revalidation_status": revalidation_status,
                 "stop_requested": False,
-                "created_at": state.get("created_at"),
+                "created_at": final_state.get("created_at"),
             }
         )
 

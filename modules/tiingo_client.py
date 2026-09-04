@@ -187,10 +187,22 @@ def _verification_fields(
 ) -> dict[str, Any]:
     price_delta = _pct_delta(verified_price, current_price)
     target_delta = _pct_delta(verified_target, target_price)
-    flagged = price_delta is not None and abs(price_delta) > threshold_pct
+    flagged = (
+        (price_delta is not None and abs(price_delta) > threshold_pct)
+        or (target_delta is not None and abs(target_delta) > threshold_pct)
+    )
+    if flagged:
+        detail_parts = []
+        if price_delta is not None and abs(price_delta) > threshold_pct:
+            detail_parts.append(f"price diff {price_delta:.2f}%")
+        if target_delta is not None and abs(target_delta) > threshold_pct:
+            detail_parts.append(f"target diff {target_delta:.2f}%")
+        agreement = "; ".join(detail_parts) or "discrepancy flagged"
+    else:
+        agreement = "agree"
     return {
         "Verification": "verified - discrepancy flagged" if flagged else "verified",
-        "Data Source Agreement": f"price diff {price_delta:.2f}%" if flagged and price_delta is not None else "agree",
+        "Data Source Agreement": agreement,
         "Price Difference %": price_delta,
         "Target Difference %": target_delta,
         **(extra_fields or {}),
