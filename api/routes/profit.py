@@ -257,6 +257,11 @@ def run_profit_task(job_id: str, params: dict):
 
         with _lock:
             ranked_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)
+            qualified_count = len(rows)
+            fast_filtered_count = fast_filtered
+            fully_analyzed_count = fully_analyzed
+            failed_count = len(failed_tickers)
+            failed_snapshot = list(failed_tickers)
         if revalidate_with_tiingo:
             state = _load_state()
             state["revalidation_status"] = "running"
@@ -272,11 +277,11 @@ def run_profit_task(job_id: str, params: dict):
             "total": total,
             "current_ticker": None,
             "results": final_rows,
-            "qualified": len(rows),
-            "fast_filtered": fast_filtered,
-            "fully_analyzed": fully_analyzed,
-            "failed_count": len(failed_tickers),
-            "failed_tickers": failed_tickers,
+            "qualified": qualified_count,
+            "fast_filtered": fast_filtered_count,
+            "fully_analyzed": fully_analyzed_count,
+            "failed_count": failed_count,
+            "failed_tickers": failed_snapshot,
             "revalidation_status": revalidation_status,
             "stop_requested": False,
             "created_at": state.get("created_at"),

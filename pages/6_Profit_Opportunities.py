@@ -506,18 +506,17 @@ if scan_rows:
                     )
                 )
 
-        styled = results_df.style.format(
-            {
-                "Current Price": "${:,.2f}",
-                "Target Price": "${:,.2f}",
-                "Projected Upside %": "{:.2f}%",
-                "Verified Current Price": "${:,.2f}",
-                "Verified Target Price": "${:,.2f}",
-                "Verified Projected Upside %": "{:.2f}%",
-                "Price Difference %": "{:.2f}%",
-                "Target Difference %": "{:.2f}%",
-            }
-        )
+        formatters = {
+            "Current Price": "${:,.2f}",
+            "Target Price": "${:,.2f}",
+            "Projected Upside %": "{:.2f}%",
+            "Verified Current Price": "${:,.2f}",
+            "Verified Target Price": "${:,.2f}",
+            "Verified Projected Upside %": "{:.2f}%",
+            "Price Difference %": "{:.2f}%",
+            "Target Difference %": "{:.2f}%",
+        }
+        styled = results_df.style.format({k: v for k, v in formatters.items() if k in results_df.columns})
         st.dataframe(styled, use_container_width=True)
 
         chart_df = results_df[["Ticker", "Projected Upside %", "Confidence"]].copy()
