@@ -52,6 +52,8 @@ causing potentially stale data to be served indefinitely).
 |---|---|---|---|
 | `use_fast_screen` | bool | `true` | Enable two-tier fast-screen pre-filter |
 | `fast_screen_margin` | int | `15` | Safety margin (points) for fast-screen cutoff |
+| `revalidate_with_tiingo` | bool | `false` | Optionally re-check final top results with Tiingo |
+| `revalidate_top_n` | int | `50` | Number of ranked results to revalidate (1-100) |
 
 **New progress fields** (`GET /screener/{job_id}/progress`):
 
@@ -61,6 +63,7 @@ causing potentially stale data to be served indefinitely).
 | `fully_analyzed` | int | Tickers that went through full analysis |
 | `failed_count` | int | Tickers that raised an exception during analysis |
 | `failed_tickers` | list | `[{"ticker": "X", "reason": "..."}]` objects |
+| `revalidation_status` | string | `not_requested`, `pending`, `running`, `complete`, or `unavailable` |
 
 The same `failed_count` / `failed_tickers` fields are also available on the
 `/profit/{job_id}/progress` endpoint.

@@ -45,6 +45,7 @@ def start_screener(payload: ScreenerRequest) -> JobResponse:
         "fully_analyzed": 0,
         "failed_count": 0,
         "failed_tickers": [],
+        "revalidation_status": "not_requested",
         "stop_requested": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -70,6 +71,7 @@ def screener_progress(job_id: str) -> ProgressResponse:
         fully_analyzed=int(state.get("fully_analyzed", 0)),
         failed_count=int(state.get("failed_count", 0)),
         failed_tickers=state.get("failed_tickers", []),
+        revalidation_status=state.get("revalidation_status", "not_requested"),
     )
 
 
@@ -91,6 +93,7 @@ def run_screener_task(job_id: str, params: dict):
     from api.deps import redis_client
     from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers
     from modules.scoring_engine import analyze_stock, fast_screen_score
+    from modules.tiingo_client import is_tiingo_configured, revalidate_screener_rows
     from modules.validators import sanitize_ticker
 
     universe_map = {
@@ -122,6 +125,8 @@ def run_screener_task(job_id: str, params: dict):
     max_results = params.get("max_results", 25)
     use_fast_screen = params.get("use_fast_screen", True)
     fast_screen_margin = params.get("fast_screen_margin", 15)
+    revalidate_with_tiingo = bool(params.get("revalidate_with_tiingo", False))
+    revalidate_top_n = int(params.get("revalidate_top_n", 50))
     fast_screen_threshold = min_score - fast_screen_margin
 
     def _save(state):
@@ -194,6 +199,7 @@ def run_screener_task(job_id: str, params: dict):
                     "failed_count": len(failed_tickers),
                     "results": [],
                     "stop_requested": _stop_requested[0],
+                    "revalidation_status": "pending" if revalidate_with_tiingo else "not_requested",
                     "created_at": state.get("created_at"),
                 }
             _save(snap)
@@ -219,6 +225,7 @@ def run_screener_task(job_id: str, params: dict):
                         "fully_analyzed": fully_analyzed,
                         "failed_count": len(failed_tickers),
                         "failed_tickers": failed_tickers,
+                        "revalidation_status": "not_requested",
                         "stop_requested": True,
                         "created_at": state.get("created_at"),
                     })
@@ -230,6 +237,15 @@ def run_screener_task(job_id: str, params: dict):
 
     with _lock:
         final_rows = sorted(rows, key=lambda x: x.get("Score", 0), reverse=True)[:max_results]
+    if revalidate_with_tiingo:
+        state = json.loads(redis_client.get(f"job:{job_id}") or "{}")
+        state["revalidation_status"] = "running"
+        _save(state)
+        final_rows = revalidate_screener_rows(final_rows, top_n=revalidate_top_n)
+        revalidation_status = "complete" if is_tiingo_configured() else "unavailable"
+    else:
+        revalidation_status = "not_requested"
+    with _lock:
         _save(
             {
                 "status": "complete",
@@ -242,6 +258,7 @@ def run_screener_task(job_id: str, params: dict):
                 "fully_analyzed": fully_analyzed,
                 "failed_count": len(failed_tickers),
                 "failed_tickers": failed_tickers,
+                "revalidation_status": revalidation_status,
                 "stop_requested": False,
                 "created_at": state.get("created_at"),
             }

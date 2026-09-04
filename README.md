@@ -10,6 +10,16 @@ pip install -r requirements.txt
 
 > Note: Installing `prophet` may take a few minutes on macOS because native dependencies are compiled during `pip install prophet`.
 
+## Optional environment variables
+
+- `TIINGO_API_KEY` — enables the optional **Tiingo Top-N Revalidation** step in
+  **Profit Opportunities** and the **Screener**. Create a free Tiingo account,
+  generate an API token, and export it before starting the app:
+
+```bash
+export TIINGO_API_KEY=your_tiingo_api_key
+```
+
 ## Run the dashboard
 
 ```bash
@@ -40,6 +50,7 @@ python analyze_stock.py AAPL
 - Russell 2000 list: chartmill.com (`https://www.chartmill.com/stock/markets/usa/index/russell-2000`)
 - OTC list: stockanalysis.com
 - Market/news/quote data: yfinance
+- Optional top-result verification data: Tiingo REST API
 
 ## Security Notes
 
@@ -63,6 +74,8 @@ python analyze_stock.py AAPL
 - **macOS SSL/cert issues**: run Python from an environment with updated certs and retry `pip install -r requirements.txt`.
 - **Prophet install fails**: try `pip install pystan==2.19.1.1` then `pip install prophet`.
 - **yfinance rate limits (HTTP 429)**: the app retries with backoff for quote/info fetches; wait briefly and retry.
+- **Tiingo revalidation is unavailable**: confirm `TIINGO_API_KEY` is set in the
+  environment before launching Streamlit / the API worker.
 
 ## Disclaimer
 
@@ -141,6 +154,32 @@ The Profit Opportunities page now offers a **Scan Mode** selector:
 
 The same `scan_mode`, `use_fast_screen`, and `fast_screen_margin` options are
 available in the API/Celery path via `ProfitRequest` fields.
+
+### Tiingo Top-N Revalidation
+Yahoo Finance / `yfinance` remains the app's default full-universe scan source
+because it is free and already supports high-volume screening. However, Yahoo's
+unofficial data can occasionally lag or mis-handle corporate actions such as
+splits/dividends.
+
+To improve trust in the final displayed numbers without changing the main scan
+pipeline, both **Profit Opportunities** and the **Screener** now offer an
+optional **Tiingo Top-N Revalidation** step:
+
+1. The app completes the usual yfinance-based full scan and ranking.
+2. Only the top ranked results you choose (default **50**, capped at **100**)
+   are re-fetched from Tiingo's official API.
+3. The same existing scoring / projection logic is re-run on the Tiingo price
+   series and shown alongside the original yfinance-derived values.
+4. If the two sources differ materially, the row is flagged instead of silently
+   overwriting the original result.
+
+If `TIINGO_API_KEY` is missing or Tiingo data is temporarily unavailable, the
+original yfinance result remains untouched and the row is marked as
+`Verification = unavailable`.
+
+This feature is intentionally opt-in because it adds latency and Tiingo's free
+tier has tighter request limits than Yahoo. Keep the Top-N modest when using a
+free account.
 
 ### Portfolio split/reverse-split detection
 The portfolio view now detects whether any held ticker has undergone a

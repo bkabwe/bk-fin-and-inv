@@ -42,6 +42,7 @@ def start_profit(payload: ProfitRequest) -> JobResponse:
             "qualified": 0,
             "fast_filtered": 0,
             "fully_analyzed": 0,
+            "revalidation_status": "not_requested",
             "stop_requested": False,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
@@ -67,6 +68,7 @@ def profit_progress(job_id: str) -> ProgressResponse:
         fully_analyzed=int(state.get("fully_analyzed", 0)),
         failed_count=int(state.get("failed_count", 0)),
         failed_tickers=state.get("failed_tickers", []),
+        revalidation_status=state.get("revalidation_status", "not_requested"),
     )
 
 
@@ -87,7 +89,9 @@ def run_profit_task(job_id: str, params: dict):
 
     from api.deps import redis_client
     from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers
+    from modules.prediction_tracker import record_predictions_from_scan
     from modules.scoring_engine import analyze_stock, fast_screen_score
+    from modules.tiingo_client import is_tiingo_configured, revalidate_profit_rows
 
     universe_map = {
         "S&P 500": get_sp500_tickers,
@@ -102,6 +106,8 @@ def run_profit_task(job_id: str, params: dict):
     scan_mode = str(params.get("scan_mode", "fast"))
     use_fast_screen = bool(params.get("use_fast_screen", True))
     fast_screen_margin = int(params.get("fast_screen_margin", 15))
+    revalidate_with_tiingo = bool(params.get("revalidate_with_tiingo", False))
+    revalidate_top_n = int(params.get("revalidate_top_n", 50))
     # Conservative proxy threshold matching the Streamlit page logic.
     _FAST_SCREEN_BASE = 30  # base proxy cutoff (out of 100, matching Streamlit page)
     _FAST_SCREEN_PROXY_THRESHOLD = _FAST_SCREEN_BASE - fast_screen_margin  # e.g. 15 with default margin
@@ -210,6 +216,7 @@ def run_profit_task(job_id: str, params: dict):
                         "failed_count": len(failed_tickers),
                         "results": [],
                         "stop_requested": _stop_requested[0],
+                        "revalidation_status": "pending" if revalidate_with_tiingo else "not_requested",
                         "created_at": state.get("created_at"),
                     }
                 _save_state(snap)
@@ -237,6 +244,7 @@ def run_profit_task(job_id: str, params: dict):
                             "fully_analyzed": fully_analyzed,
                             "failed_count": len(failed_tickers),
                             "failed_tickers": failed_tickers,
+                            "revalidation_status": "not_requested",
                             "stop_requested": True,
                             "created_at": state.get("created_at"),
                         })
@@ -278,12 +286,14 @@ def run_profit_task(job_id: str, params: dict):
                 current["failed_count"] = len(failed_tickers)
                 current["failed_tickers"] = failed_tickers
                 current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+                current["revalidation_status"] = "not_requested"
                 _save_state(current)
                 return
 
             current["screened"] = i
             current["current_ticker"] = ticker
             current["qualified"] = len(rows)
+            current["revalidation_status"] = "pending" if revalidate_with_tiingo else "not_requested"
             _save_state(current)
 
             try:
@@ -319,9 +329,19 @@ def run_profit_task(job_id: str, params: dict):
                 current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
                 current["qualified"] = len(rows)
                 current["failed_count"] = len(failed_tickers)
+                current["revalidation_status"] = "pending" if revalidate_with_tiingo else "not_requested"
                 _save_state(current)
 
         final_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+
+        if revalidate_with_tiingo:
+            current = _load_state()
+            current["revalidation_status"] = "running"
+            _save_state(current)
+            final_rows = revalidate_profit_rows(final_rows, horizon_key=key, top_n=revalidate_top_n)
+            revalidation_status = "complete" if is_tiingo_configured() else "unavailable"
+        else:
+            revalidation_status = "not_requested"
 
         _save_state(
             {
@@ -335,6 +355,7 @@ def run_profit_task(job_id: str, params: dict):
                 "fully_analyzed": total - len(failed_tickers),
                 "failed_count": len(failed_tickers),
                 "failed_tickers": failed_tickers,
+                "revalidation_status": revalidation_status,
                 "stop_requested": False,
                 "created_at": state.get("created_at"),
             }
@@ -342,8 +363,35 @@ def run_profit_task(job_id: str, params: dict):
 
     # Record predictions for the track-record feature.
     # Use final_rows already computed in each branch (avoids a Redis re-fetch).
+    if scan_mode == "fast" and revalidate_with_tiingo:
+        state = _load_state()
+        state["revalidation_status"] = "running"
+        _save_state(state)
+        final_rows = revalidate_profit_rows(final_rows, horizon_key=key, top_n=revalidate_top_n)
+        revalidation_status = "complete" if is_tiingo_configured() else "unavailable"
+        _save_state(
+            {
+                "status": "complete",
+                "screened": total,
+                "total": total,
+                "current_ticker": None,
+                "results": final_rows,
+                "qualified": len(rows),
+                "fast_filtered": fast_filtered,
+                "fully_analyzed": fully_analyzed,
+                "failed_count": len(failed_tickers),
+                "failed_tickers": failed_tickers,
+                "revalidation_status": revalidation_status,
+                "stop_requested": False,
+                "created_at": state.get("created_at"),
+            }
+        )
+    elif scan_mode == "fast":
+        state = _load_state()
+        state["revalidation_status"] = "not_requested"
+        _save_state(state)
+
     try:
-        from modules.prediction_tracker import record_predictions_from_scan
         record_predictions_from_scan(final_rows, horizon=key, source="profit_opportunities")
     except Exception:
         pass  # Never let tracking failures break the task
