@@ -3,6 +3,10 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from modules.env import load_environment
+
+load_environment()
+
 from modules.data_fetcher import get_stock_data
 from modules.notifications import get_notifications, get_unread_count, mark_all_read
 from modules.portfolio import analyze_portfolio_holdings, get_portfolio
