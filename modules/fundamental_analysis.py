@@ -26,9 +26,42 @@ def _safe_float(value):
         return None
 
 
+_SECTOR_ALIASES = {
+    "Financial Services": "Financials",
+    "Consumer Cyclical": "Consumer Discretionary",
+    "Consumer Defensive": "Consumer Staples",
+    "Basic Materials": "Materials",
+}
+
+
+def normalize_sector_name(sector: str | None) -> str | None:
+    if not sector:
+        return None
+    clean = str(sector).strip()
+    return _SECTOR_ALIASES.get(clean, clean) or None
+
+
+def classify_market_cap_tier(market_cap: float | int | None) -> str:
+    market_cap_value = _safe_float(market_cap)
+    if market_cap_value is None or market_cap_value <= 0:
+        return "unknown"
+
+    # Widely used market-cap buckets for US equities. Keep thresholds explicit so
+    # they are easy to adjust if the app's risk model changes later.
+    if market_cap_value < 300_000_000:
+        return "Micro Cap"
+    if market_cap_value < 2_000_000_000:
+        return "Small Cap"
+    if market_cap_value < 10_000_000_000:
+        return "Mid Cap"
+    if market_cap_value < 200_000_000_000:
+        return "Large Cap"
+    return "Mega Cap"
+
+
 def analyze_fundamentals(info: dict, current_price: float | None = None, risk_free_rate: float = 0.045) -> dict:
     if not info:
-        return {"fundamental_score": 0, "flags": ["missing data"], "metrics": {}}
+        return {"fundamental_score": 0, "flags": ["missing data"], "metrics": {"market_cap_tier": "unknown"}}
 
     trailing_pe = _safe_float(info.get("trailingPE"))
     forward_pe = _safe_float(info.get("forwardPE"))
@@ -44,10 +77,13 @@ def analyze_fundamentals(info: dict, current_price: float | None = None, risk_fr
     rec = info.get("recommendationKey")
     current_price = current_price or _safe_float(info.get("currentPrice")) or _safe_float(info.get("regularMarketPrice"))
     sector = info.get("sector")
+    normalized_sector = normalize_sector_name(sector)
+    market_cap = info.get("marketCap")
+    market_cap_tier = classify_market_cap_tier(market_cap)
 
     score, flags = 50, []
 
-    sector_benchmark_pe = float(SECTOR_BENCHMARK_PE.get(str(sector), 20.0))
+    sector_benchmark_pe = float(SECTOR_BENCHMARK_PE.get(str(normalized_sector), 20.0))
     sector_pe_relative = (pe_used / sector_benchmark_pe) if pe_used and sector_benchmark_pe > 0 else None
     if sector_pe_relative is not None:
         if sector_pe_relative < 0.9:
@@ -115,7 +151,8 @@ def analyze_fundamentals(info: dict, current_price: float | None = None, risk_fr
             "earnings_growth": growth,
             "debt_to_equity": dte,
             "roe": roe,
-            "market_cap": info.get("marketCap"),
+            "market_cap": market_cap,
+            "market_cap_tier": market_cap_tier,
             "sector": sector,
             "52w_high": high,
             "52w_low": low,

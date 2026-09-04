@@ -345,6 +345,8 @@ if st.button("Run Analysis"):
                                 "index": source_labels.get(ticker, ""),
                                 "score": int(analysis.get("score") or 0),
                                 "current_price": current_price,
+                                "sector_trend": analysis.get("sector_trend") or "unknown",
+                                "market_cap_tier": analysis.get("market_cap_tier") or "unknown",
                                 "technical": analysis.get("technical") or {},
                                 "projections": projections,
                             }
@@ -392,6 +394,8 @@ if st.button("Run Analysis"):
                             "index": source_labels.get(ticker, ""),
                             "score": int(analysis.get("score") or 0),
                             "current_price": current_price,
+                            "sector_trend": analysis.get("sector_trend") or "unknown",
+                            "market_cap_tier": analysis.get("market_cap_tier") or "unknown",
                             "technical": analysis.get("technical") or {},
                             "projections": projections,
                         }
@@ -434,6 +438,8 @@ if scan_rows:
                 "Company": row["company"],
                 "Index": row["index"],
                 "Score": row["score"],
+                "Sector Trend": str(row.get("sector_trend") or "unknown").replace("_", " ").title(),
+                "Market Cap Tier": row.get("market_cap_tier") or "unknown",
                 "Current Price": row["current_price"],
                 "Target Price": target_price,
                 "Projected Upside %": upside,
