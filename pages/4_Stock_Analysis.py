@@ -153,6 +153,11 @@ if ticker_input:
         st.json(analysis["technical"])
 
     with t2:
+        metrics = analysis["fundamentals"]["metrics"]
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Sector", metrics.get("sector") or "Unknown")
+        s2.metric("Sector Trend", str(analysis.get("sector_trend") or "unknown").replace("_", " ").title())
+        s3.metric("Market Cap Tier", metrics.get("market_cap_tier") or "unknown")
         st.table(pd.DataFrame([analysis["fundamentals"]["metrics"]]).T)
 
     with t3:

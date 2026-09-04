@@ -58,6 +58,27 @@ python analyze_stock.py AAPL
 - 20–34: 🔴 **DO NOT BUY**
 - 0–19: ⛔ **AVOID**
 
+## Scoring methodology
+
+The composite stock score remains a 0–100 scale built from technicals, fundamentals,
+sentiment, and macro context, with all final scores clamped to that range.
+
+- **Technical score** contributes up to 50 points from trend, momentum, volume,
+  patterns, breakout quality, and relative strength.
+- **Fundamental score** contributes up to 30 points after valuation, growth,
+  balance-sheet, and analyst-sentiment checks.
+- **Sentiment score** contributes up to 20 points from recent news tone.
+- **Overall macro regime** adds a modest overlay (`risk_on` / `risk_off`) of
+  roughly +3 / -5 points.
+- **Sector momentum** now adds a small stock-specific overlay of **+3** when the
+  stock's sector is currently in the macro model's bullish ETF basket and **-3**
+  when that sector is in the bearish basket.
+- **Market-cap risk tier** now classifies stocks as **Micro Cap** (<$300M),
+  **Small Cap** ($300M–$2B), **Mid Cap** ($2B–$10B), **Large Cap** ($10B–$200B),
+  or **Mega Cap** (>$200B). Micro/small caps receive only a modest risk
+  adjustment (up to **-5** points) and can use wider projection confidence caps,
+  reflecting higher volatility without overriding the core valuation logic.
+
 ## Troubleshooting
 
 - **macOS SSL/cert issues**: run Python from an environment with updated certs and retry `pip install -r requirements.txt`.

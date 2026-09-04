@@ -134,6 +134,8 @@ def run_screener(
                     "Score": result["score"],
                     "Recommendation": result["recommendation"],
                     "Time Horizon": result["time_horizon"],
+                    "Sector Trend": str(result.get("sector_trend") or "unknown").replace("_", " ").title(),
+                    "Market Cap Tier": result.get("market_cap_tier") or "unknown",
                     "Entry Price": entry,
                     "Target Price": result["target_price"],
                     "Stop Loss": result["stop_loss"],

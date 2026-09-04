@@ -169,6 +169,8 @@ def run_screener_task(job_id: str, params: dict):
                             "Score": score,
                             "Recommendation": result.get("recommendation", ""),
                             "Time Horizon": result.get("time_horizon", ""),
+                            "Sector Trend": str(result.get("sector_trend") or "unknown").replace("_", " ").title(),
+                            "Market Cap Tier": result.get("market_cap_tier") or "unknown",
                             "Current Price": result.get("current_price"),
                             "Entry Price": result.get("entry_price"),
                             "Target Price": result.get("target_price"),

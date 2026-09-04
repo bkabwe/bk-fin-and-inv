@@ -4,13 +4,23 @@ import numpy as np
 
 from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
-from modules.fundamental_analysis import analyze_fundamentals
+from modules.fundamental_analysis import analyze_fundamentals, classify_market_cap_tier, normalize_sector_name
 from modules.logger import get_logger
 from modules.macro_regime import get_macro_regime
 from modules.sentiment_analysis import analyze_sentiment
 from modules.technical_analysis import analyze_technical, relative_strength_vs_spy
 
 logger = get_logger(__name__)
+
+_SECTOR_MOMENTUM_SCORE = 3
+_MARKET_CAP_RISK_SCORES = {
+    "Micro Cap": -5,
+    "Small Cap": -3,
+}
+_MARKET_CAP_CAP_MULTIPLIERS = {
+    "Micro Cap": 5.0,
+    "Small Cap": 4.0,
+}
 
 try:
     import streamlit as st
@@ -126,6 +136,30 @@ def _recommendation(score: int) -> str:
     if score >= 20:
         return "🔴 DO NOT BUY"
     return "⛔ AVOID"
+
+
+def _sector_momentum_adjustment(sector: str | None, macro_regime: dict) -> tuple[str, int]:
+    normalized_sector = normalize_sector_name(sector)
+    if not normalized_sector:
+        return "unknown", 0
+
+    bullish = {s for s in (normalize_sector_name(value) for value in macro_regime.get("bullish_sectors", [])) if s}
+    bearish = {s for s in (normalize_sector_name(value) for value in macro_regime.get("bearish_sectors", [])) if s}
+    if normalized_sector in bullish:
+        return "bullish", _SECTOR_MOMENTUM_SCORE
+    if normalized_sector in bearish:
+        return "bearish", -_SECTOR_MOMENTUM_SCORE
+    return "neutral", 0
+
+
+def _market_cap_score_adjustment(market_cap_tier: str | None) -> int:
+    return _MARKET_CAP_RISK_SCORES.get(str(market_cap_tier), 0)
+
+
+def _projection_cap_value(current_price: float, market_cap_tier: str, is_speculative_otc: bool) -> float | None:
+    if is_speculative_otc:
+        return None
+    return _MARKET_CAP_CAP_MULTIPLIERS.get(market_cap_tier, 3.0) * current_price
 
 
 def _weighted_ensemble(components: list[tuple[str, float | None, float]]) -> tuple[float | None, str, list[float]]:
@@ -253,7 +287,8 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
     models_skipped: list[str] = []
     exchange = str(info.get("exchange") or info.get("fullExchangeName") or "").upper()
     is_speculative_otc = "OTC" in exchange
-    cap_value = None if is_speculative_otc else (3 * current_price)
+    market_cap_tier = classify_market_cap_tier(info.get("marketCap"))
+    cap_value = _projection_cap_value(current_price, market_cap_tier, is_speculative_otc)
 
     # adaptive model weights from walk-forward
     model_weights = None
@@ -637,6 +672,10 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
     elif macro_regime.get("market_regime") == "risk_on":
         macro_score = 3
 
+    sector_trend, sector_momentum_score = _sector_momentum_adjustment(info.get("sector"), macro_regime)
+    market_cap_tier = str(fundamentals.get("metrics", {}).get("market_cap_tier") or classify_market_cap_tier(info.get("marketCap")))
+    market_cap_score = _market_cap_score_adjustment(market_cap_tier)
+
     technical_total = max(
         0,
         min(
@@ -646,7 +685,10 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
     )
     fundamental_total = round((fundamentals["fundamental_score"] / 100) * 30)
     sentiment_total = round(((sentiment["sentiment_score"] + 1) / 2) * 20)
-    total = max(0, min(100, int(technical_total + fundamental_total + sentiment_total + macro_score)))
+    total = max(
+        0,
+        min(100, int(technical_total + fundamental_total + sentiment_total + macro_score + sector_momentum_score + market_cap_score)),
+    )
 
     horizon = "Medium-Term Setup"
     if macd is not None and signal is not None and macd > signal and technical["trend"] != "uptrend":
@@ -683,6 +725,8 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
         "current_price": current_price,
         "score": total,
         "recommendation": _recommendation(total),
+        "sector_trend": sector_trend,
+        "market_cap_tier": market_cap_tier,
         "time_horizon": horizon,
         "entry_price": entry,
         "target_price": target,
@@ -698,6 +742,8 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
             "fundamental": fundamental_total,
             "sentiment": sentiment_total,
             "macro": macro_score,
+            "sector_momentum": sector_momentum_score,
+            "market_cap": market_cap_score,
             "trend": trend_score,
             "momentum": momentum_score,
             "volume": volume_score,
@@ -715,8 +761,9 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
 # Fast-screen helper
 # ---------------------------------------------------------------------------
 # Maximum possible contribution from non-technical components:
-#   fundamental (0-30) + sentiment (0-20) + macro (-5 to +3) => up to 53
-_MAX_NON_TECHNICAL_SCORE = 53
+#   fundamental (0-30) + sentiment (0-20) + macro (-5 to +3) + sector (±3)
+#   + market-cap risk (0 to -5) => up to 56
+_MAX_NON_TECHNICAL_SCORE = 56
 
 
 def fast_screen_score(ticker: str, period: str = "1y", interval: str = "1d") -> tuple[int, str | None]:
