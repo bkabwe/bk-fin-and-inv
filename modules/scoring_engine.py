@@ -7,6 +7,7 @@ from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
 from modules.fundamental_analysis import analyze_fundamentals, classify_market_cap_tier, normalize_sector_name
 from modules.logger import get_logger
+from modules.longterm_analysis import analyze_longterm_technical_score
 from modules.macro_regime import get_macro_regime
 from modules.sentiment_analysis import analyze_sentiment
 from modules.technical_analysis import analyze_technical, relative_strength_vs_spy
@@ -679,8 +680,36 @@ def analyze_stock(
     data = data_override if data_override is not None else get_stock_data(ticker, period=period, interval=interval)
     info = info_override if info_override is not None else get_stock_info(ticker)
     projection_data = projection_data_override if projection_data_override is not None else data_override
+
+    info = dict(info or {})
+    trailing_52w = pd.DataFrame()
+    if not data.empty:
+        try:
+            max_date = pd.to_datetime(data.index).max()
+            cutoff = max_date - pd.Timedelta(days=365)
+            trailing_52w = data.loc[pd.to_datetime(data.index) >= cutoff]
+        except Exception:
+            trailing_52w = data.tail(252)
+    if "fiftyTwoWeekHigh" not in info and not trailing_52w.empty and "High" in trailing_52w:
+        try:
+            info["fiftyTwoWeekHigh"] = float(trailing_52w["High"].astype(float).max())
+        except Exception:
+            pass
+    if "fiftyTwoWeekLow" not in info and not trailing_52w.empty and "Low" in trailing_52w:
+        try:
+            info["fiftyTwoWeekLow"] = float(trailing_52w["Low"].astype(float).min())
+        except Exception:
+            pass
+
     technical = analyze_technical(data)
-    current_price = float(data["Close"].iloc[-1]) if not data.empty else info.get("currentPrice")
+    if not data.empty:
+        current_price = float(data["Close"].iloc[-1])
+    else:
+        _raw_price = info.get("currentPrice")
+        try:
+            current_price = float(_raw_price) if _raw_price is not None else None
+        except Exception:
+            current_price = None
 
     macro_regime = get_macro_regime()
     risk_free_rate = float(macro_regime.get("risk_free_rate") or 0.045)
@@ -750,16 +779,35 @@ def analyze_stock(
     )
     fundamental_total = round((fundamentals["fundamental_score"] / 100) * 30)
     sentiment_total = round(((sentiment["sentiment_score"] + 1) / 2) * 20)
-    total = max(
-        0,
-        min(100, int(technical_total + fundamental_total + sentiment_total + macro_score + sector_momentum_score + market_cap_score)),
-    )
+    base_total = technical_total + fundamental_total + sentiment_total + macro_score + sector_momentum_score + market_cap_score
 
     horizon = "Medium-Term Setup"
     if macd is not None and signal is not None and macd > signal and technical["trend"] != "uptrend":
         horizon = "Short-Term Opportunity"
     if technical["trend"] == "uptrend" and fundamentals["fundamental_score"] >= 65:
         horizon = "Long-Term Hold"
+
+    longterm = {
+        "longterm_technical_score": 0,
+        "longterm_stage": None,
+        "primary_trend": None,
+        "volume_trend_confirmation": None,
+        "max_drawdown_pct": None,
+        "recovery_days": None,
+        "golden_cross_count": 0,
+        "death_cross_count": 0,
+        "favorable_cross_follow_through_pct": None,
+    }
+    if horizon == "Long-Term Hold":
+        longterm_history = data if data is not None and not data.empty else projection_data
+        current_len = len(longterm_history) if longterm_history is not None else 0
+        if projection_data is not None and not projection_data.empty and len(projection_data) > current_len:
+            longterm_history = projection_data
+        if longterm_history is None or longterm_history.empty or len(longterm_history) < 900:
+            longterm_history = get_stock_data(ticker, period="5y", interval="1d")
+        longterm = analyze_longterm_technical_score(ticker, sector=info.get("sector"), data=longterm_history)
+
+    total = max(0, min(100, int(base_total + int(longterm.get("longterm_technical_score") or 0))))
 
     entry = technical.get("entry_price")
     projections = get_price_projections(
@@ -798,6 +846,14 @@ def analyze_stock(
         "sector_trend": sector_trend,
         "market_cap_tier": market_cap_tier,
         "time_horizon": horizon,
+        "longterm_stage": longterm.get("longterm_stage"),
+        "primary_trend": longterm.get("primary_trend"),
+        "volume_trend_confirmation": longterm.get("volume_trend_confirmation"),
+        "max_drawdown_pct": longterm.get("max_drawdown_pct"),
+        "recovery_days": longterm.get("recovery_days"),
+        "golden_cross_count": longterm.get("golden_cross_count"),
+        "death_cross_count": longterm.get("death_cross_count"),
+        "favorable_cross_follow_through_pct": longterm.get("favorable_cross_follow_through_pct"),
         "entry_price": entry,
         "target_price": target,
         "stop_loss": stop_loss,
@@ -814,6 +870,7 @@ def analyze_stock(
             "macro": macro_score,
             "sector_momentum": sector_momentum_score,
             "market_cap": market_cap_score,
+            **({"longterm_technical": int(longterm.get("longterm_technical_score") or 0)} if horizon == "Long-Term Hold" else {}),
             "trend": trend_score,
             "momentum": momentum_score,
             "volume": volume_score,

@@ -34,10 +34,9 @@ http://localhost:8000/docs
 ## Recent changes
 
 ### Split-adjusted price data
-All `yfinance` calls in the backend now use `auto_adjust=True`.  Historical
-OHLC series used for indicators, backtests, and forecasting are continuously
-adjusted for splits/dividends — eliminating artificial price jumps in API
-responses.
+Backend historical OHLCV now comes from Polygon aggregates with `adjusted=true`,
+which keeps indicator/backtest/forecast series continuous across corporate actions.
+Current price is sourced from Polygon previous-day close (Starter-plan compatible).
 
 ### TTL-aware cache in non-Streamlit mode
 The `@cache_data(ttl=...)` fallback used by the FastAPI/Celery backend now
@@ -52,8 +51,6 @@ causing potentially stale data to be served indefinitely).
 |---|---|---|---|
 | `use_fast_screen` | bool | `true` | Enable two-tier fast-screen pre-filter |
 | `fast_screen_margin` | int | `15` | Safety margin (points) for fast-screen cutoff |
-| `revalidate_with_tiingo` | bool | `false` | Optionally re-check final top results with Tiingo |
-| `revalidate_top_n` | int | `50` | Number of ranked results to revalidate (1-100) |
 
 **New progress fields** (`GET /screener/{job_id}/progress`):
 
@@ -63,9 +60,8 @@ causing potentially stale data to be served indefinitely).
 | `fully_analyzed` | int | Tickers that went through full analysis |
 | `failed_count` | int | Tickers that raised an exception during analysis |
 | `failed_tickers` | list | `[{"ticker": "X", "reason": "..."}]` objects |
-| `revalidation_status` | string | `not_requested`, `pending`, `running`, `complete`, or `unavailable` |
 
-The same `failed_count` / `failed_tickers` / `revalidation_status` fields are
+The same `failed_count` / `failed_tickers` progress fields are
 also available on the `/profit/{job_id}/progress` endpoint.
 
 ### Chart accuracy

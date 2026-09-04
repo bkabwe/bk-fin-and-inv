@@ -8,11 +8,14 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD
 
 from modules.data_fetcher import get_stock_data
+from modules.polygon_client import is_polygon_configured
 from modules.prediction_tracker import record_prediction
 from modules.scoring_engine import analyze_stock
 from modules.validators import sanitize_ticker
 
 st.title("📊 Deep Dive Stock Analysis")
+if not is_polygon_configured():
+    st.warning("POLYGON_API_KEY is not configured. Configure it to load market and fundamentals data.")
 ticker_input = st.text_input("Ticker", value="AAPL")
 period_map = {"1M": "1mo", "3M": "3mo", "6M": "6mo", "1Y": "1y", "2Y": "2y", "5Y": "5y"}
 period = st.selectbox("Time Period", list(period_map.keys()), index=3)
@@ -158,6 +161,8 @@ if ticker_input:
         s1.metric("Sector", metrics.get("sector") or "Unknown")
         s2.metric("Sector Trend", str(analysis.get("sector_trend") or "unknown").replace("_", " ").title())
         s3.metric("Market Cap Tier", analysis.get("market_cap_tier") or "unknown")
+        if analysis.get("time_horizon") == "Long-Term Hold":
+            st.metric("Long-Term Stage", analysis.get("longterm_stage") or "Stage Unknown")
         st.table(pd.DataFrame([analysis["fundamentals"]["metrics"]]).T)
 
     with t3:

@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 
-import yfinance as yf
-
 from modules.logger import get_logger
+from modules.polygon_client import get_reference_splits
 from modules.scoring_engine import analyze_stock, get_price_projections
 from modules.validators import sanitize_ticker
 
@@ -125,23 +125,33 @@ def detect_split_since_purchase(ticker: str, date_purchased: str) -> dict:
     """
     result: dict = {"split_detected": False, "split_factor": None, "events": [], "warning": None}
     try:
-        hist = yf.Ticker(ticker).history(period="max", auto_adjust=False)
-        if hist is None or hist.empty or "Stock Splits" not in hist.columns:
-            return result
-        splits = hist["Stock Splits"].dropna()
-        splits = splits[splits != 0]
+        execution_date_gte = None
         if date_purchased:
             try:
-                splits = splits[splits.index.tz_localize(None) > date_purchased]
+                purchased_day = date.fromisoformat(str(date_purchased).split("T", 1)[0])
+                execution_date_gte = (purchased_day + timedelta(days=1)).isoformat()
             except Exception:
-                splits = splits[splits.index > date_purchased]
-        if splits.empty:
+                raw = str(date_purchased).split("T", 1)[0]
+                try:
+                    fallback_day = date.fromisoformat(raw)
+                    execution_date_gte = (fallback_day + timedelta(days=1)).isoformat()
+                except Exception:
+                    execution_date_gte = raw
+        splits = get_reference_splits(ticker, execution_date_gte=execution_date_gte)
+        if not splits:
             return result
         cumulative = 1.0
         events = []
-        for dt, ratio in splits.items():
-            cumulative *= float(ratio)
-            events.append({"date": str(dt.date()), "ratio": float(ratio)})
+        for event in splits:
+            split_from = float(event.get("split_from") or 0)
+            split_to = float(event.get("split_to") or 0)
+            if split_from <= 0 or split_to <= 0:
+                continue
+            ratio = split_to / split_from
+            cumulative *= ratio
+            events.append({"date": str(event.get("execution_date") or ""), "ratio": float(ratio)})
+        if not events:
+            return result
         result["split_detected"] = True
         result["split_factor"] = round(cumulative, 6)
         result["events"] = events

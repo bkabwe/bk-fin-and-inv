@@ -12,14 +12,8 @@ import streamlit as st
 from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers, get_stock_data
 from modules.portfolio import get_portfolio
 from modules.prediction_tracker import record_predictions_from_scan
+from modules.polygon_client import is_polygon_configured
 from modules.scoring_engine import analyze_stock, fast_screen_score
-from modules.tiingo_client import (
-    TIINGO_REVALIDATION_DEFAULT_TOP_N,
-    TIINGO_REVALIDATION_MAX_TOP_N,
-    is_tiingo_configured,
-    revalidate_profit_rows,
-    summarize_revalidation,
-)
 
 try:  # pragma: no cover
     from prophet import Prophet
@@ -42,6 +36,8 @@ except ImportError:  # pragma: no cover
 
 st.title("💰 Profit Opportunities")
 st.caption("Identifies stocks with the highest projected profit potential based on multi-model predictive analysis.")
+if not is_polygon_configured():
+    st.warning("POLYGON_API_KEY is not configured. Configure it to fetch market and fundamental data.")
 
 horizon = st.radio(
     "Time Horizon",
@@ -83,27 +79,6 @@ if _fast_mode:
             "universes). Disable for exhaustive coverage."
         ),
     )
-
-revalidate_with_tiingo = st.checkbox(
-    "Revalidate Top Results with Tiingo (free tier)",
-    value=False,
-    help=(
-        "After the normal yfinance scan/ranking finishes, re-run only the top ranked "
-        "results against Tiingo's official API as a confirmation pass. Requires "
-        "TIINGO_API_KEY and adds latency."
-    ),
-)
-revalidate_top_n = TIINGO_REVALIDATION_DEFAULT_TOP_N
-if revalidate_with_tiingo:
-    revalidate_top_n = st.number_input(
-        "Top results to revalidate",
-        min_value=1,
-        max_value=TIINGO_REVALIDATION_MAX_TOP_N,
-        value=TIINGO_REVALIDATION_DEFAULT_TOP_N,
-        step=1,
-    )
-    if not is_tiingo_configured():
-        st.info("Set the TIINGO_API_KEY environment variable to enable Tiingo revalidation.")
 
 # Shared constants matching modules/screener.py defaults
 _MAX_WORKERS = 8
@@ -347,6 +322,7 @@ if st.button("Run Analysis"):
                                 "current_price": current_price,
                                 "sector_trend": analysis.get("sector_trend") or "unknown",
                                 "market_cap_tier": analysis.get("market_cap_tier") or "unknown",
+                                "longterm_stage": analysis.get("longterm_stage") or "",
                                 "technical": analysis.get("technical") or {},
                                 "projections": projections,
                             }
@@ -396,6 +372,7 @@ if st.button("Run Analysis"):
                             "current_price": current_price,
                             "sector_trend": analysis.get("sector_trend") or "unknown",
                             "market_cap_tier": analysis.get("market_cap_tier") or "unknown",
+                            "longterm_stage": analysis.get("longterm_stage") or "",
                             "technical": analysis.get("technical") or {},
                             "projections": projections,
                         }
@@ -440,6 +417,7 @@ if scan_rows:
                 "Score": row["score"],
                 "Sector Trend": str(row.get("sector_trend") or "unknown").replace("_", " ").title(),
                 "Market Cap Tier": row.get("market_cap_tier") or "unknown",
+                "Long-Term Stage": row.get("longterm_stage") or "",
                 "Current Price": row["current_price"],
                 "Target Price": target_price,
                 "Projected Upside %": upside,
@@ -470,21 +448,7 @@ if scan_rows:
             st.caption(f"✅ Scanned **{total_scanned}** stocks → **0** met the upside threshold")
     else:
         ranked_rows = pd.DataFrame(display_rows).sort_values("Projected Upside %", ascending=False).reset_index(drop=True)
-        if revalidate_with_tiingo:
-            horizon_key_map = {
-                "Short-Term (1–4 weeks)": "short_term",
-                "Medium-Term (1–6 months)": "medium_term",
-                "Long-Term (6–24 months)": "long_term",
-            }
-            ranked_rows = pd.DataFrame(
-                revalidate_profit_rows(
-                    ranked_rows.to_dict(orient="records"),
-                    horizon_key=horizon_key_map.get(horizon, "short_term"),
-                    top_n=int(revalidate_top_n),
-                )
-            )
         results_df = ranked_rows.head(max_results)
-        revalidation_summary = summarize_revalidation(ranked_rows.to_dict(orient="records"))
         _fast_filtered = st.session_state.get("profit_opportunities_fast_filtered")
         _fully_analyzed = st.session_state.get("profit_opportunities_fully_analyzed")
         if total_scanned:
@@ -497,30 +461,10 @@ if scan_rows:
                 f"**{len(display_rows)}** met the upside threshold → Showing top **{len(results_df)}**"
             )
             st.caption(" → ".join(caption_parts))
-        if revalidate_with_tiingo:
-            if revalidation_summary["status"] == "unavailable" and not is_tiingo_configured():
-                st.warning("Tiingo revalidation was requested but TIINGO_API_KEY was not configured.")
-            elif revalidation_summary["status"] == "unavailable":
-                st.warning("Tiingo revalidation was requested, but no rows could be verified.")
-            else:
-                st.caption(
-                    f"Tiingo verified **{int(revalidation_summary['verified'])}** ranked result(s)"
-                    + (
-                        f"; **{int(revalidation_summary['unavailable'])}** were unavailable."
-                        if int(revalidation_summary["unavailable"])
-                        else "."
-                    )
-                )
-
         formatters = {
             "Current Price": "${:,.2f}",
             "Target Price": "${:,.2f}",
             "Projected Upside %": "{:.2f}%",
-            "Verified Current Price": "${:,.2f}",
-            "Verified Target Price": "${:,.2f}",
-            "Verified Projected Upside %": "{:.2f}%",
-            "Price Difference %": "{:.2f}%",
-            "Target Difference %": "{:.2f}%",
         }
         styled = results_df.style.format({k: v for k, v in formatters.items() if k in results_df.columns})
         st.dataframe(styled, use_container_width=True)

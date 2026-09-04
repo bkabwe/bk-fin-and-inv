@@ -12,13 +12,17 @@ pip install -r requirements.txt
 
 ## Optional environment variables
 
-- `TIINGO_API_KEY` — enables the optional **Tiingo Top-N Revalidation** step in
-  **Profit Opportunities** and the **Screener**. Create a free Tiingo account,
-  generate an API token, and export it before starting the app:
+- `POLYGON_API_KEY` — required for Polygon.io (Massive) market, fundamentals,
+  indicators, splits/dividends, and news endpoints used across the app.
 
 ```bash
-export TIINGO_API_KEY=your_tiingo_api_key
+export POLYGON_API_KEY=your_polygon_api_key
 ```
+
+> Starter-plan behavior used by this app: unlimited API calls, up to 5 years of
+> historical lookback for aggregates, and "current price" sourced from
+> previous-day close (`/v2/aggs/ticker/{ticker}/prev`) because live snapshots
+> are not included on Starter.
 
 ## Run the dashboard
 
@@ -45,12 +49,13 @@ python analyze_stock.py AAPL
 
 ## Data Sources
 
-- S&P 500 list: Wikipedia
-- NASDAQ 100 list: stockanalysis.com
-- Russell 2000 list: chartmill.com (`https://www.chartmill.com/stock/markets/usa/index/russell-2000`)
-- OTC list: stockanalysis.com
-- Market/news/quote data: yfinance
-- Optional top-result verification data: Tiingo REST API
+- S&P 500 list: Wikipedia (index-constituent source)
+- NASDAQ / NYSE American / OTC active universes: Polygon `/v3/reference/tickers`
+- Market OHLCV data: Polygon aggregates `/v2/aggs/...` with `adjusted=true`
+- Current price proxy: Polygon previous-day close `/v2/aggs/ticker/{ticker}/prev`
+- Fundamentals/reference: Polygon ticker overview + financial ratios/statements
+- Splits/dividends: Polygon `/v3/reference/splits` and `/v3/reference/dividends`
+- News: Polygon `/v2/reference/news`
 
 ## Security Notes
 
@@ -89,14 +94,29 @@ sentiment, and macro context, with all final scores clamped to that range.
   ($10B to <$200B), or **Mega Cap** (≥$200B). Micro/small caps receive only a modest risk
   adjustment (up to **-5** points) and can use wider projection confidence bands,
   reflecting higher volatility without overriding the core valuation logic.
+- **Long-Term-only technical overlay** adds up to 20 points (`longterm_technical_score`)
+  from 5-year signals: secular trend (SMA150/SMA200), Weinstein stage analysis,
+  volume confirmation, drawdown/recovery resilience, and golden/death-cross history.
+
+
+### Long-Term methodology details
+
+When `time_horizon` is **Long-Term Hold**, analysis now adds dedicated 5-year
+signals and exposes:
+
+- `score_breakdown.longterm_technical`
+- `longterm_stage` (Stage 1/2/3/4 classification)
+- supporting durability signals (`primary_trend`, volume confirmation,
+  drawdown/recovery stats, golden/death-cross history)
+
+Short-Term and Medium-Term scoring logic/weights are unchanged.
 
 ## Troubleshooting
 
 - **macOS SSL/cert issues**: run Python from an environment with updated certs and retry `pip install -r requirements.txt`.
 - **Prophet install fails**: try `pip install pystan==2.19.1.1` then `pip install prophet`.
-- **yfinance rate limits (HTTP 429)**: the app retries with backoff for quote/info fetches; wait briefly and retry.
-- **Tiingo revalidation is unavailable**: confirm `TIINGO_API_KEY` is set in the
-  environment before launching Streamlit / the API worker.
+- **POLYGON_API_KEY missing**: set the environment variable before launching Streamlit/API workers.
+- **Polygon data unavailable for a ticker**: retry shortly; the app handles missing responses gracefully and skips unavailable symbols.
 
 ## Disclaimer
 
@@ -105,15 +125,12 @@ This project is for educational/research use only and is **not financial advice*
 ## Recent improvements
 
 ### Split/dividend-adjusted price data
-All historical price data fetched via `yfinance` now uses `auto_adjust=True`,
-so OHLC series are continuously back-adjusted for stock splits, reverse splits,
-and dividends.  This ensures that technical indicators, walk-forward backtests,
-Prophet/ARIMA/GARCH forecasts, relative-strength calculations, and charts do
-**not** show artificial price discontinuities caused by corporate actions.
+All historical OHLCV data is now sourced from Polygon aggregates with
+`adjusted=true`, so indicator, backtest, and forecast inputs remain continuous
+across splits/reverse-splits.
 
-The latest real-time quote used for "Current Price" display is sourced from
-`yfinance`'s `info["currentPrice"]` field (unadjusted) and is clearly
-documented as such in the code.
+Current-price display uses Polygon previous-day close (`/v2/aggs/.../prev`),
+which matches Starter-plan availability (no live snapshot feed).
 
 ### TTL-aware caching in API (non-Streamlit) mode
 When the app runs as a FastAPI/Celery backend, `st.cache_data` is unavailable.
@@ -153,8 +170,7 @@ Key safeguards:
   - `fully_analyzed_count` — tickers that went through full analysis.
 
 Additionally, per-ticker fetches are now parallelized with a thread pool
-(`max_workers=8` by default, tunable) since yfinance calls are I/O-bound,
-subject to conservative concurrency limits to avoid HTTP 429 rate-limiting.
+(`max_workers=8` by default, tunable) since Polygon HTTP requests are I/O-bound.
 
 ### Profit Opportunities scan mode (Fast vs Thorough)
 The Profit Opportunities page now offers a **Scan Mode** selector:
@@ -175,32 +191,6 @@ The Profit Opportunities page now offers a **Scan Mode** selector:
 
 The same `scan_mode`, `use_fast_screen`, and `fast_screen_margin` options are
 available in the API/Celery path via `ProfitRequest` fields.
-
-### Tiingo Top-N Revalidation
-Yahoo Finance / `yfinance` remains the app's default full-universe scan source
-because it is free and already supports high-volume screening. However, Yahoo's
-unofficial data can occasionally lag or mis-handle corporate actions such as
-splits/dividends.
-
-To improve trust in the final displayed numbers without changing the main scan
-pipeline, both **Profit Opportunities** and the **Screener** now offer an
-optional **Tiingo Top-N Revalidation** step:
-
-1. The app completes the usual yfinance-based full scan and ranking.
-2. Only the top ranked results you choose (default **50**, capped at **100**)
-   are re-fetched from Tiingo's official API.
-3. The same existing scoring / projection logic is re-run on the Tiingo price
-   series and shown alongside the original yfinance-derived values.
-4. If the two sources differ materially, the row is flagged instead of silently
-   overwriting the original result.
-
-If `TIINGO_API_KEY` is missing or Tiingo data is temporarily unavailable, the
-original yfinance result remains untouched and the row is marked as
-`Verification = unavailable`.
-
-This feature is intentionally opt-in because it adds latency and Tiingo's free
-tier has tighter request limits than Yahoo. Keep the Top-N modest when using a
-free account.
 
 ### Portfolio split/reverse-split detection
 The portfolio view now detects whether any held ticker has undergone a

@@ -3,10 +3,9 @@ from __future__ import annotations
 from functools import lru_cache
 from statistics import mean
 
-import yfinance as yf
 from textblob import TextBlob
 
-from modules.data_fetcher import get_news
+from modules.data_fetcher import get_news, get_stock_info
 from modules.logger import get_logger
 
 logger = get_logger(__name__)
@@ -16,6 +15,7 @@ try:
 
     cache_data = st.cache_data
 except Exception:  # pragma: no cover
+
     def cache_data(ttl: int | None = None):
         def decorator(func):
             return lru_cache(maxsize=128)(func)
@@ -30,20 +30,14 @@ def _get_market_sentiment_signals(ticker: str) -> dict:
     put_call_ratio = None
 
     try:
-        tkr = yf.Ticker(ticker)
-        info = tkr.info or {}
+        # The current Polygon-backed info adapter does not expose short-interest
+        # or options-chain metrics yet, so these sentiment signals remain null
+        # while preserving the existing return-shape contract.
+        info = get_stock_info(ticker) or {}
         short_ratio = info.get("shortRatio")
         short_pct_float = info.get("shortPercentOfFloat")
-
-        expiries = tkr.options or []
-        if expiries:
-            chain = tkr.option_chain(expiries[0])
-            put_vol = float(chain.puts["volume"].fillna(0).sum()) if hasattr(chain, "puts") and not chain.puts.empty else 0.0
-            call_vol = float(chain.calls["volume"].fillna(0).sum()) if hasattr(chain, "calls") and not chain.calls.empty else 0.0
-            if call_vol > 0:
-                put_call_ratio = put_vol / call_vol
     except Exception as exc:
-        logger.warning("Unable to fetch options/short-interest signals for %s: %s", ticker, exc)
+        logger.warning("Unable to fetch market sentiment signals for %s: %s", ticker, exc)
 
     return {
         "short_ratio": round(float(short_ratio), 3) if short_ratio is not None else None,
@@ -64,8 +58,8 @@ def analyze_sentiment(ticker: str) -> dict:
                 "headline": title,
                 "score": round(score, 3),
                 "label": "Positive" if score > 0.1 else "Negative" if score < -0.1 else "Neutral",
-                "publisher": article.get("publisher") or article.get("content", {}).get("provider", {}).get("displayName"),
-                "link": article.get("link") or article.get("content", {}).get("canonicalUrl", {}).get("url"),
+                "publisher": article.get("publisher") or article.get("source") or article.get("content", {}).get("provider", {}).get("displayName"),
+                "link": article.get("article_url") or article.get("link") or article.get("content", {}).get("canonicalUrl", {}).get("url"),
             }
         )
 
