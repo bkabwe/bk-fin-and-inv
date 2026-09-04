@@ -74,9 +74,9 @@ sentiment, and macro context, with all final scores clamped to that range.
   stock's sector is currently in the macro model's bullish ETF basket and **-3**
   when that sector is in the bearish basket.
 - **Market-cap risk tier** now classifies stocks as **Micro Cap** (<$300M),
-  **Small Cap** ($300M–$2B), **Mid Cap** ($2B–$10B), **Large Cap** ($10B–$200B),
-  or **Mega Cap** (>$200B). Micro/small caps receive only a modest risk
-  adjustment (up to **-5** points) and can use wider projection confidence caps,
+  **Small Cap** ($300M to <$2B), **Mid Cap** ($2B to <$10B), **Large Cap**
+  ($10B to <$200B), or **Mega Cap** (≥$200B). Micro/small caps receive only a modest risk
+  adjustment (up to **-5** points) and can use wider projection confidence bands,
   reflecting higher volatility without overriding the core valuation logic.
 
 ## Troubleshooting

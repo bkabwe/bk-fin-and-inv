@@ -17,9 +17,9 @@ _MARKET_CAP_RISK_SCORES = {
     "Micro Cap": -5,
     "Small Cap": -3,
 }
-_MARKET_CAP_CAP_MULTIPLIERS = {
-    "Micro Cap": 5.0,
-    "Small Cap": 4.0,
+_MARKET_CAP_CONFIDENCE_PADDING = {
+    "Micro Cap": 0.10,
+    "Small Cap": 0.05,
 }
 
 try:
@@ -152,14 +152,43 @@ def _sector_momentum_adjustment(sector: str | None, macro_regime: dict) -> tuple
     return "neutral", 0
 
 
+def _normalize_market_cap_tier(market_cap_tier: str | None) -> str:
+    clean = " ".join(str(market_cap_tier or "").strip().lower().split())
+    if clean == "micro cap":
+        return "Micro Cap"
+    if clean == "small cap":
+        return "Small Cap"
+    if clean == "mid cap":
+        return "Mid Cap"
+    if clean == "large cap":
+        return "Large Cap"
+    if clean == "mega cap":
+        return "Mega Cap"
+    return "unknown"
+
+
 def _market_cap_score_adjustment(market_cap_tier: str | None) -> int:
-    return _MARKET_CAP_RISK_SCORES.get(str(market_cap_tier), 0)
+    return _MARKET_CAP_RISK_SCORES.get(_normalize_market_cap_tier(market_cap_tier), 0)
 
 
-def _projection_cap_value(current_price: float, market_cap_tier: str, is_speculative_otc: bool) -> float | None:
-    if is_speculative_otc:
-        return None
-    return _MARKET_CAP_CAP_MULTIPLIERS.get(market_cap_tier, 3.0) * current_price
+def _resolved_market_cap_tier(market_cap: float | int | None) -> str:
+    return _normalize_market_cap_tier(classify_market_cap_tier(market_cap))
+
+
+def _apply_market_cap_confidence_padding(
+    low: float,
+    high: float,
+    current_price: float,
+    market_cap_tier: str,
+) -> tuple[float, float]:
+    padding_ratio = _MARKET_CAP_CONFIDENCE_PADDING.get(_normalize_market_cap_tier(market_cap_tier), 0.0)
+    if padding_ratio <= 0 or current_price <= 0:
+        return low, high
+
+    padding = current_price * padding_ratio
+    widened_low = max(0.0, low - padding)
+    widened_high = high + padding
+    return round(widened_low, 2), round(max(widened_low, widened_high), 2)
 
 
 def _weighted_ensemble(components: list[tuple[str, float | None, float]]) -> tuple[float | None, str, list[float]]:
@@ -287,8 +316,8 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
     models_skipped: list[str] = []
     exchange = str(info.get("exchange") or info.get("fullExchangeName") or "").upper()
     is_speculative_otc = "OTC" in exchange
-    market_cap_tier = classify_market_cap_tier(info.get("marketCap"))
-    cap_value = _projection_cap_value(current_price, market_cap_tier, is_speculative_otc)
+    market_cap_tier = _resolved_market_cap_tier(info.get("marketCap"))
+    cap_value = None if is_speculative_otc else (3 * current_price)
 
     # adaptive model weights from walk-forward
     model_weights = None
@@ -523,6 +552,7 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
         garch_low=garch_low_30,
         garch_high=garch_high_30,
     )
+    short_low, short_high = _apply_market_cap_confidence_padding(short_low, short_high, current_price, market_cap_tier)
     medium_low, medium_high = _confidence_bounds(
         medium_projection,
         medium_values,
@@ -533,6 +563,7 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
         garch_low=garch_low_180,
         garch_high=garch_high_180,
     )
+    medium_low, medium_high = _apply_market_cap_confidence_padding(medium_low, medium_high, current_price, market_cap_tier)
     long_low, long_high = _confidence_bounds(
         long_projection,
         long_values,
@@ -543,6 +574,7 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
         garch_low=garch_low_720,
         garch_high=garch_high_720,
     )
+    long_low, long_high = _apply_market_cap_confidence_padding(long_low, long_high, current_price, market_cap_tier)
 
     near_resistance = current_price >= (technical_resistance * 0.97) if technical_resistance else False
     if is_speculative_otc and "Fundamental Fair Value: no EPS data" in models_skipped:
@@ -673,7 +705,7 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
         macro_score = 3
 
     sector_trend, sector_momentum_score = _sector_momentum_adjustment(info.get("sector"), macro_regime)
-    market_cap_tier = str(fundamentals.get("metrics", {}).get("market_cap_tier") or classify_market_cap_tier(info.get("marketCap")))
+    market_cap_tier = _resolved_market_cap_tier(info.get("marketCap"))
     market_cap_score = _market_cap_score_adjustment(market_cap_tier)
 
     technical_total = max(
@@ -762,7 +794,7 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
 # ---------------------------------------------------------------------------
 # Maximum possible contribution from non-technical components:
 #   fundamental (0-30) + sentiment (0-20) + macro (-5 to +3) + sector (±3)
-#   + market-cap risk (0 to -5) => up to 56
+#   + market-cap risk (0 to -5, penalty-only) => up to 56
 _MAX_NON_TECHNICAL_SCORE = 56
 
 
