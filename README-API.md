@@ -65,8 +65,8 @@ causing potentially stale data to be served indefinitely).
 | `failed_tickers` | list | `[{"ticker": "X", "reason": "..."}]` objects |
 | `revalidation_status` | string | `not_requested`, `pending`, `running`, `complete`, or `unavailable` |
 
-The same `failed_count` / `failed_tickers` fields are also available on the
-`/profit/{job_id}/progress` endpoint.
+The same `failed_count` / `failed_tickers` / `revalidation_status` fields are
+also available on the `/profit/{job_id}/progress` endpoint.
 
 ### Chart accuracy
 The `/analysis/{ticker}/price` endpoint now returns split-adjusted OHLC data

@@ -132,6 +132,21 @@ def run_profit_task(job_id: str, params: dict):
     def _save_state(payload: dict) -> None:
         redis_client.set(f"job:{job_id}", json.dumps(payload), ex=3600)
 
+    def _state_fallback() -> dict:
+        return {
+            "status": "running",
+            "screened": total,
+            "total": total,
+            "current_ticker": None,
+            "results": [],
+            "qualified": len(rows),
+            "failed_count": len(failed_tickers),
+            "failed_tickers": list(failed_tickers),
+            "revalidation_status": "not_requested",
+            "stop_requested": False,
+            "created_at": state.get("created_at"),
+        }
+
     state = _load_state()
     state["total"] = total
     _save_state(state)
@@ -263,7 +278,7 @@ def run_profit_task(job_id: str, params: dict):
             failed_count = len(failed_tickers)
             failed_snapshot = list(failed_tickers)
         if revalidate_with_tiingo:
-            state = _load_state()
+            state = _load_state() or _state_fallback()
             state["revalidation_status"] = "running"
             _save_state(state)
             ranked_rows = revalidate_profit_rows(ranked_rows, horizon_key=key, top_n=revalidate_top_n)
@@ -350,7 +365,7 @@ def run_profit_task(job_id: str, params: dict):
         ranked_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)
 
         if revalidate_with_tiingo:
-            current = _load_state()
+            current = _load_state() or _state_fallback()
             current["revalidation_status"] = "running"
             _save_state(current)
             ranked_rows = revalidate_profit_rows(ranked_rows, horizon_key=key, top_n=revalidate_top_n)
@@ -358,7 +373,7 @@ def run_profit_task(job_id: str, params: dict):
         else:
             revalidation_status = "not_requested"
         final_rows = ranked_rows[:max_results]
-        final_state = _load_state()
+        final_state = _load_state() or _state_fallback()
         _save_state(
             {
                 "status": "complete",
