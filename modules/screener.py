@@ -172,10 +172,11 @@ def run_screener(
         results = pd.DataFrame()
         revalidation_summary = {"requested": 0, "verified": 0, "unavailable": 0, "status": "not_requested"}
     else:
-        results = pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results).reset_index(drop=True)
+        results = pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
         if revalidate_with_tiingo:
             results = pd.DataFrame(revalidate_screener_rows(results.to_dict(orient="records"), top_n=revalidate_top_n))
         revalidation_summary = summarize_revalidation(results.to_dict(orient="records"))
+        results = results.head(max_results).reset_index(drop=True)
 
     results.attrs["source_ticker_count"] = total
     results.attrs["qualified_count"] = len(rows)

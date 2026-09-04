@@ -256,15 +256,16 @@ def run_profit_task(job_id: str, params: dict):
                     pass
 
         with _lock:
-            final_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+            ranked_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)
         if revalidate_with_tiingo:
             state = _load_state()
             state["revalidation_status"] = "running"
             _save_state(state)
-            final_rows = revalidate_profit_rows(final_rows, horizon_key=key, top_n=revalidate_top_n)
-            revalidation_status = str(summarize_revalidation(final_rows).get("status", "unavailable"))
+            ranked_rows = revalidate_profit_rows(ranked_rows, horizon_key=key, top_n=revalidate_top_n)
+            revalidation_status = str(summarize_revalidation(ranked_rows).get("status", "unavailable"))
         else:
             revalidation_status = "not_requested"
+        final_rows = ranked_rows[:max_results]
         _save_state({
             "status": "complete",
             "screened": total,
@@ -341,16 +342,17 @@ def run_profit_task(job_id: str, params: dict):
                 current["revalidation_status"] = "pending" if revalidate_with_tiingo else "not_requested"
                 _save_state(current)
 
-        final_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
+        ranked_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)
 
         if revalidate_with_tiingo:
             current = _load_state()
             current["revalidation_status"] = "running"
             _save_state(current)
-            final_rows = revalidate_profit_rows(final_rows, horizon_key=key, top_n=revalidate_top_n)
-            revalidation_status = str(summarize_revalidation(final_rows).get("status", "unavailable"))
+            ranked_rows = revalidate_profit_rows(ranked_rows, horizon_key=key, top_n=revalidate_top_n)
+            revalidation_status = str(summarize_revalidation(ranked_rows).get("status", "unavailable"))
         else:
             revalidation_status = "not_requested"
+        final_rows = ranked_rows[:max_results]
 
         _save_state(
             {
@@ -372,11 +374,6 @@ def run_profit_task(job_id: str, params: dict):
 
     # Record predictions for the track-record feature.
     # Use final_rows already computed in each branch (avoids a Redis re-fetch).
-    if scan_mode == "fast" and not revalidate_with_tiingo:
-        state = _load_state()
-        state["revalidation_status"] = "not_requested"
-        _save_state(state)
-
     try:
         record_predictions_from_scan(final_rows, horizon=key, source="profit_opportunities")
     except Exception:

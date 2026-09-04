@@ -236,15 +236,16 @@ def run_screener_task(job_id: str, params: dict):
                 pass
 
     with _lock:
-        final_rows = sorted(rows, key=lambda x: x.get("Score", 0), reverse=True)[:max_results]
+        ranked_rows = sorted(rows, key=lambda x: x.get("Score", 0), reverse=True)
     if revalidate_with_tiingo:
         state = json.loads(redis_client.get(f"job:{job_id}") or "{}")
         state["revalidation_status"] = "running"
         _save(state)
-        final_rows = revalidate_screener_rows(final_rows, top_n=revalidate_top_n)
-        revalidation_status = str(summarize_revalidation(final_rows).get("status", "unavailable"))
+        ranked_rows = revalidate_screener_rows(ranked_rows, top_n=revalidate_top_n)
+        revalidation_status = str(summarize_revalidation(ranked_rows).get("status", "unavailable"))
     else:
         revalidation_status = "not_requested"
+    final_rows = ranked_rows[:max_results]
     with _lock:
         _save(
             {
