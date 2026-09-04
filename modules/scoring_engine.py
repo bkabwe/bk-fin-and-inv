@@ -771,7 +771,12 @@ def analyze_stock(
         "favorable_cross_follow_through_pct": None,
     }
     if horizon == "Long-Term Hold":
-        longterm = analyze_longterm_technical_score(ticker, sector=info.get("sector"), data=get_stock_data(ticker, period="5y", interval="1d"))
+        longterm_history = data if data is not None and not data.empty else projection_data
+        if projection_data is not None and not projection_data.empty and len(projection_data) > len(longterm_history or []):
+            longterm_history = projection_data
+        if longterm_history is None or longterm_history.empty or len(longterm_history) < 900:
+            longterm_history = get_stock_data(ticker, period="5y", interval="1d")
+        longterm = analyze_longterm_technical_score(ticker, sector=info.get("sector"), data=longterm_history)
 
     total = max(0, min(100, int(base_total + int(longterm.get("longterm_technical_score") or 0))))
 

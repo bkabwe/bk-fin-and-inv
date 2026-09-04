@@ -385,7 +385,7 @@ def list_active_tickers(
     if primary_exchange:
         params["primary_exchange"] = primary_exchange
     if otc is not None:
-        params["locale"] = "us"
+        params["otc"] = str(bool(otc)).lower()
 
     tickers: list[str] = []
     seen: set[str] = set()

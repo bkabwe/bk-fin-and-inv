@@ -23,6 +23,29 @@ class LongTermSignals:
     longterm_technical_score: int
 
 
+
+try:
+    import streamlit as st
+
+    cache_data = st.cache_data
+except Exception:  # pragma: no cover
+    from functools import lru_cache
+
+    def cache_data(ttl: int | None = None):
+        def decorator(func):
+            return lru_cache(maxsize=128)(func)
+
+        return decorator
+
+
+@cache_data(ttl=3600)
+def _get_benchmark_close(symbol: str) -> pd.Series:
+    df = get_stock_data(symbol, period="5y", interval="1d")
+    if df.empty or "Close" not in df:
+        return pd.Series(dtype=float)
+    return df["Close"].astype(float).dropna()
+
+
 _SECTOR_ETF_MAP = {
     "Technology": "XLK",
     "Financials": "XLF",
@@ -205,15 +228,15 @@ def analyze_longterm_technical_score(ticker: str, sector: str | None = None, dat
 
     trend = _primary_trend(close, sma150, sma200)
 
-    spy = get_stock_data("SPY", period="5y", interval="1d")
-    rs_spy = _relative_strength_ratio(close, spy["Close"].astype(float).dropna()) if not spy.empty and "Close" in spy else None
+    spy_close = _get_benchmark_close("SPY")
+    rs_spy = _relative_strength_ratio(close, spy_close) if not spy_close.empty else None
 
     sector_symbol = _SECTOR_ETF_MAP.get(normalize_sector_name(sector))
     rs_sector = None
     if sector_symbol:
-        sector_df = get_stock_data(sector_symbol, period="5y", interval="1d")
-        if not sector_df.empty and "Close" in sector_df:
-            rs_sector = _relative_strength_ratio(close, sector_df["Close"].astype(float).dropna())
+        sector_close = _get_benchmark_close(sector_symbol)
+        if not sector_close.empty:
+            rs_sector = _relative_strength_ratio(close, sector_close)
 
     stage = _classify_stage(close, sma150, sma200, rs_spy, rs_sector)
     vol_signal = _volume_confirmation(close, volume)
