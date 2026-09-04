@@ -107,11 +107,17 @@ if st.button("Run Screener"):
         )
         if results.attrs.get("revalidation_requested"):
             status = results.attrs.get("revalidation_status", "not_requested")
+            verified_count = int(results.attrs.get("revalidation_verified_count", 0))
+            unavailable_count = int(results.attrs.get("revalidation_unavailable_count", 0))
             if status == "unavailable":
-                st.warning("Tiingo revalidation was requested but TIINGO_API_KEY was not configured.")
+                if not is_tiingo_configured():
+                    st.warning("Tiingo revalidation was requested but TIINGO_API_KEY was not configured.")
+                else:
+                    st.warning("Tiingo revalidation was requested, but no rows could be verified.")
             else:
                 st.caption(
-                    f"Tiingo revalidation applied to the top **{min(len(results), int(revalidate_top_n))}** displayed result(s)."
+                    f"Tiingo verified **{verified_count}** result(s)"
+                    + (f"; **{unavailable_count}** were unavailable." if unavailable_count else ".")
                 )
         st.download_button("Export to CSV", results.to_csv(index=False), "screener_results.csv", "text/csv")
 

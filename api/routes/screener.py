@@ -93,7 +93,7 @@ def run_screener_task(job_id: str, params: dict):
     from api.deps import redis_client
     from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers
     from modules.scoring_engine import analyze_stock, fast_screen_score
-    from modules.tiingo_client import is_tiingo_configured, revalidate_screener_rows
+    from modules.tiingo_client import revalidate_screener_rows, summarize_revalidation
     from modules.validators import sanitize_ticker
 
     universe_map = {
@@ -242,7 +242,7 @@ def run_screener_task(job_id: str, params: dict):
         state["revalidation_status"] = "running"
         _save(state)
         final_rows = revalidate_screener_rows(final_rows, top_n=revalidate_top_n)
-        revalidation_status = "complete" if is_tiingo_configured() else "unavailable"
+        revalidation_status = str(summarize_revalidation(final_rows).get("status", "unavailable"))
     else:
         revalidation_status = "not_requested"
     with _lock:

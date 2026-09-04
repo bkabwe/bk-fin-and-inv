@@ -18,6 +18,7 @@ from modules.tiingo_client import (
     TIINGO_REVALIDATION_MAX_TOP_N,
     is_tiingo_configured,
     revalidate_profit_rows,
+    summarize_revalidation,
 )
 
 try:  # pragma: no cover
@@ -477,6 +478,7 @@ if scan_rows:
                 )
             )
         results_df = ranked_rows.head(max_results)
+        revalidation_summary = summarize_revalidation(ranked_rows.to_dict(orient="records"))
         _fast_filtered = st.session_state.get("profit_opportunities_fast_filtered")
         _fully_analyzed = st.session_state.get("profit_opportunities_fully_analyzed")
         if total_scanned:
@@ -490,11 +492,18 @@ if scan_rows:
             )
             st.caption(" → ".join(caption_parts))
         if revalidate_with_tiingo:
-            if not is_tiingo_configured():
+            if revalidation_summary["status"] == "unavailable" and not is_tiingo_configured():
                 st.warning("Tiingo revalidation was requested but TIINGO_API_KEY was not configured.")
+            elif revalidation_summary["status"] == "unavailable":
+                st.warning("Tiingo revalidation was requested, but no rows could be verified.")
             else:
                 st.caption(
-                    f"Tiingo revalidation applied to the top **{min(len(ranked_rows), int(revalidate_top_n))}** ranked result(s)."
+                    f"Tiingo verified **{int(revalidation_summary['verified'])}** ranked result(s)"
+                    + (
+                        f"; **{int(revalidation_summary['unavailable'])}** were unavailable."
+                        if int(revalidation_summary["unavailable"])
+                        else "."
+                    )
                 )
 
         styled = results_df.style.format(

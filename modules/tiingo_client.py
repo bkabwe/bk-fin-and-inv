@@ -323,3 +323,30 @@ def revalidate_screener_rows(
         except Exception as exc:
             row.update(_unavailable_fields(str(exc), verified_fields))
     return updated_rows
+
+
+def summarize_revalidation(rows: list[dict[str, Any]]) -> dict[str, int | str]:
+    requested = 0
+    verified = 0
+    unavailable = 0
+    for row in rows or []:
+        status = str(row.get("Verification") or "")
+        if not status or status == "not requested":
+            continue
+        requested += 1
+        if status.startswith("verified"):
+            verified += 1
+        elif status == "unavailable":
+            unavailable += 1
+    if requested == 0:
+        overall = "not_requested"
+    elif verified == 0:
+        overall = "unavailable"
+    else:
+        overall = "complete"
+    return {
+        "requested": requested,
+        "verified": verified,
+        "unavailable": unavailable,
+        "status": overall,
+    }
