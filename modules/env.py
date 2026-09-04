@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def load_environment() -> None:
     try:
@@ -10,4 +12,4 @@ def load_environment() -> None:
             "Install dependencies from requirements.txt or requirements-api.txt."
         ) from exc
 
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
