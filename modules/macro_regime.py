@@ -4,6 +4,7 @@ import threading
 
 import pandas as pd
 
+from modules.fred_client import FredNotConfiguredError, get_vix_observations
 from modules.logger import get_logger
 from modules.polygon_client import PolygonNotConfiguredError, get_stock_data_polygon
 
@@ -70,8 +71,9 @@ def get_macro_regime() -> dict:
         "market_regime": "neutral",
     }
     try:
-        # Polygon index tickers use the I: prefix.
-        vix_df = get_stock_data_polygon("I:VIX", period="1mo", interval="1d")
+        lookback_end = pd.Timestamp.now(tz="UTC").normalize()
+        lookback_start = lookback_end - pd.Timedelta(days=30)
+        vix_df = get_vix_observations(lookback_start.date(), lookback_end.date())
         tnx_df = get_stock_data_polygon("I:TNX", period="1mo", interval="1d")
 
         vix = float(vix_df["Close"].dropna().iloc[-1]) if not vix_df.empty and "Close" in vix_df else None
@@ -131,7 +133,7 @@ def get_macro_regime() -> dict:
         }
         logger.info("Macro regime computed: %s", result.get("market_regime"))
         return result
-    except PolygonNotConfiguredError as exc:
+    except (FredNotConfiguredError, PolygonNotConfiguredError) as exc:
         logger.warning("Macro regime unavailable: %s", exc)
         return default
     except Exception as exc:
