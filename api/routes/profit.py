@@ -91,7 +91,6 @@ def run_profit_task(job_id: str, params: dict):
     from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers
     from modules.prediction_tracker import record_predictions_from_scan
     from modules.scoring_engine import analyze_stock, fast_screen_score
-    from modules.tiingo_client import revalidate_profit_rows, summarize_revalidation
 
     universe_map = {
         "S&P 500": get_sp500_tickers,
@@ -106,8 +105,6 @@ def run_profit_task(job_id: str, params: dict):
     scan_mode = str(params.get("scan_mode", "fast"))
     use_fast_screen = bool(params.get("use_fast_screen", True))
     fast_screen_margin = int(params.get("fast_screen_margin", 15))
-    revalidate_with_tiingo = bool(params.get("revalidate_with_tiingo", False))
-    revalidate_top_n = int(params.get("revalidate_top_n", 50))
     # Conservative proxy threshold matching the Streamlit page logic.
     _FAST_SCREEN_BASE = 30  # base proxy cutoff (out of 100, matching Streamlit page)
     _FAST_SCREEN_PROXY_THRESHOLD = _FAST_SCREEN_BASE - fast_screen_margin  # e.g. 15 with default margin
@@ -209,6 +206,7 @@ def run_profit_task(job_id: str, params: dict):
                             "Score": result.get("score", 0),
                             "Sector Trend": str(result.get("sector_trend") or "unknown").replace("_", " ").title(),
                             "Market Cap Tier": result.get("market_cap_tier") or "unknown",
+                            "Long-Term Stage": result.get("longterm_stage") or "",
                             "Current Price": result.get("current_price"),
                             "Target Price": target,
                             "Projected Upside %": round(upside, 2),
@@ -233,7 +231,7 @@ def run_profit_task(job_id: str, params: dict):
                         "failed_count": len(failed_tickers),
                         "results": [],
                         "stop_requested": _stop_requested[0],
-                        "revalidation_status": "pending" if revalidate_with_tiingo else "not_requested",
+                        "revalidation_status": "not_requested",
                         "created_at": state.get("created_at"),
                     }
                 _save_state(snap)
@@ -279,14 +277,7 @@ def run_profit_task(job_id: str, params: dict):
             fully_analyzed_count = fully_analyzed
             failed_count = len(failed_tickers)
             failed_snapshot = list(failed_tickers)
-        if revalidate_with_tiingo:
-            state = _load_state() or _state_fallback()
-            state["revalidation_status"] = "running"
-            _save_state(state)
-            ranked_rows = revalidate_profit_rows(ranked_rows, horizon_key=key, top_n=revalidate_top_n)
-            revalidation_status = str(summarize_revalidation(ranked_rows).get("status", "unavailable"))
-        else:
-            revalidation_status = "not_requested"
+        revalidation_status = "not_requested"
         final_rows = ranked_rows[:max_results]
         _save_state({
             "status": "complete",
@@ -325,7 +316,7 @@ def run_profit_task(job_id: str, params: dict):
             current["screened"] = i
             current["current_ticker"] = ticker
             current["qualified"] = len(rows)
-            current["revalidation_status"] = "pending" if revalidate_with_tiingo else "not_requested"
+            current["revalidation_status"] = "not_requested"
             _save_state(current)
 
             try:
@@ -348,6 +339,7 @@ def run_profit_task(job_id: str, params: dict):
                         "Score": result.get("score", 0),
                         "Sector Trend": str(result.get("sector_trend") or "unknown").replace("_", " ").title(),
                         "Market Cap Tier": result.get("market_cap_tier") or "unknown",
+                        "Long-Term Stage": result.get("longterm_stage") or "",
                         "Current Price": result.get("current_price"),
                         "Target Price": target,
                         "Projected Upside %": round(upside, 2),
@@ -363,19 +355,11 @@ def run_profit_task(job_id: str, params: dict):
                 current["results"] = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)[:max_results]
                 current["qualified"] = len(rows)
                 current["failed_count"] = len(failed_tickers)
-                current["revalidation_status"] = "pending" if revalidate_with_tiingo else "not_requested"
+                current["revalidation_status"] = "not_requested"
                 _save_state(current)
 
         ranked_rows = sorted(rows, key=lambda x: x.get("Projected Upside %", 0), reverse=True)
-
-        if revalidate_with_tiingo:
-            current = _load_state() or _state_fallback()
-            current["revalidation_status"] = "running"
-            _save_state(current)
-            ranked_rows = revalidate_profit_rows(ranked_rows, horizon_key=key, top_n=revalidate_top_n)
-            revalidation_status = str(summarize_revalidation(ranked_rows).get("status", "unavailable"))
-        else:
-            revalidation_status = "not_requested"
+        revalidation_status = "not_requested"
         final_rows = ranked_rows[:max_results]
         final_state = _load_state() or _state_fallback()
         _save_state(

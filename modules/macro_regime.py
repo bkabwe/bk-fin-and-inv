@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import threading
-import time
 
 import pandas as pd
-import yfinance as yf
 
 from modules.logger import get_logger
+from modules.polygon_client import PolygonNotConfiguredError, get_stock_data_polygon
 
 logger = get_logger(__name__)
 
@@ -19,7 +18,7 @@ except Exception:  # pragma: no cover
     import time as _time
 
     def cache_data(ttl: int | None = None):  # type: ignore[misc]
-        """TTL-aware, stampede-safe cache fallback for non-Streamlit (FastAPI) deployments."""
+        """TTL-aware, stampede-safe cache fallback for non-Streamlit deployments."""
 
         def decorator(func):
             _cache: dict = {}
@@ -71,10 +70,9 @@ def get_macro_regime() -> dict:
         "market_regime": "neutral",
     }
     try:
-        # auto_adjust=True: index/sector ETF prices are adjusted for splits so
-        # SMA/trend calculations across long lookback windows are accurate.
-        vix_df = yf.download("^VIX", period="1mo", interval="1d", progress=False, auto_adjust=True)
-        tnx_df = yf.download("^TNX", period="1mo", interval="1d", progress=False, auto_adjust=True)
+        # Polygon index tickers use the I: prefix.
+        vix_df = get_stock_data_polygon("I:VIX", period="1mo", interval="1d")
+        tnx_df = get_stock_data_polygon("I:TNX", period="1mo", interval="1d")
 
         vix = float(vix_df["Close"].dropna().iloc[-1]) if not vix_df.empty and "Close" in vix_df else None
         y10 = float(tnx_df["Close"].dropna().iloc[-1]) if not tnx_df.empty and "Close" in tnx_df else None
@@ -91,7 +89,7 @@ def get_macro_regime() -> dict:
         bearish: list[str] = []
 
         for symbol, label in sector_map.items():
-            data = yf.download(symbol, period="6mo", interval="1d", progress=False, auto_adjust=True)
+            data = get_stock_data_polygon(symbol, period="6mo", interval="1d")
             if data.empty or "Close" not in data:
                 continue
             close = data["Close"].astype(float)
@@ -114,7 +112,6 @@ def get_macro_regime() -> dict:
                 vix_regime = "high"
                 market_regime = "risk_off"
 
-        # Slightly refine with sector breadth when VIX is medium
         if vix_regime == "medium":
             if len(bullish) >= 4:
                 market_regime = "risk_on"
@@ -134,6 +131,9 @@ def get_macro_regime() -> dict:
         }
         logger.info("Macro regime computed: %s", result.get("market_regime"))
         return result
+    except PolygonNotConfiguredError as exc:
+        logger.warning("Macro regime unavailable: %s", exc)
+        return default
     except Exception as exc:
         logger.warning("Macro regime calculation failed: %s", exc)
         return default

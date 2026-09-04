@@ -10,8 +10,6 @@ class ScreenerRequest(BaseModel):
     custom_tickers: list[str] = Field(default_factory=list)
     use_fast_screen: bool = True
     fast_screen_margin: int = 15
-    revalidate_with_tiingo: bool = False
-    revalidate_top_n: int = Field(default=50, ge=1, le=100)
 
 
 class ProfitRequest(BaseModel):
@@ -22,8 +20,6 @@ class ProfitRequest(BaseModel):
     scan_mode: str = "fast"  # "fast" | "thorough"
     use_fast_screen: bool = True
     fast_screen_margin: int = 15
-    revalidate_with_tiingo: bool = False
-    revalidate_top_n: int = Field(default=50, ge=1, le=100)
 
 
 class HoldingRequest(BaseModel):
