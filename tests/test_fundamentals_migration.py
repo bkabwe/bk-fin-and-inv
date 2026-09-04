@@ -3,11 +3,13 @@ from __future__ import annotations
 import unittest
 import sys
 import types
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 
-if "pandas" not in sys.modules:
+try:
+    import pandas  # noqa: F401
+except Exception:
     fake_pandas = types.ModuleType("pandas")
 
     class _DataFrame:  # pragma: no cover - import-time shim only
@@ -18,7 +20,7 @@ if "pandas" not in sys.modules:
     fake_pandas.isna = lambda value: False  # type: ignore[assignment]
     sys.modules["pandas"] = fake_pandas
 
-from modules import polygon_client, sec_edgar_client
+from modules import fred_client, macro_regime, polygon_client, sec_edgar_client
 
 
 def _http_error(status_code: int, retry_after: str | None = None) -> requests.exceptions.HTTPError:
@@ -55,6 +57,34 @@ class RetryBehaviorTests(unittest.TestCase):
 
         with patch("modules.polygon_client.time.sleep") as sleep_mock:
             payload = polygon_client._fetch_with_retry(_fetch, max_retries=3, base_delay=0.01)
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(attempts["count"], 2)
+        sleep_mock.assert_called_once_with(2.0)
+
+    def test_fred_does_not_retry_non_retryable_403(self):
+        attempts = {"count": 0}
+
+        def _fetch():
+            attempts["count"] += 1
+            raise _http_error(403)
+
+        with patch("modules.fred_client.time.sleep") as sleep_mock:
+            with self.assertRaises(requests.exceptions.HTTPError):
+                fred_client._fetch_with_retry(_fetch, max_retries=3, base_delay=0.01)
+        self.assertEqual(attempts["count"], 1)
+        sleep_mock.assert_not_called()
+
+    def test_fred_retries_429_with_retry_after(self):
+        attempts = {"count": 0}
+
+        def _fetch():
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise _http_error(429, retry_after="2")
+            return {"ok": True}
+
+        with patch("modules.fred_client.time.sleep") as sleep_mock:
+            payload = fred_client._fetch_with_retry(_fetch, max_retries=3, base_delay=0.01)
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(attempts["count"], 2)
         sleep_mock.assert_called_once_with(2.0)
@@ -100,6 +130,48 @@ class SecFundamentalsAdapterTests(unittest.TestCase):
         self.assertAlmostEqual(info["sharesOutstanding"], 40.0)
         self.assertIsNone(info["forwardPE"])
         self.assertIsNone(info["forwardEps"])
+
+
+class FredMacroRegimeTests(unittest.TestCase):
+    def test_fred_vix_observations_filter_missing_values(self):
+        payload = {
+            "observations": [
+                {"date": "2026-09-01", "value": "16.12"},
+                {"date": "2026-09-02", "value": "."},
+                {"date": "2026-09-03", "value": "18.45"},
+            ]
+        }
+
+        response = Mock()
+        response.json.return_value = payload
+        response.raise_for_status.return_value = None
+
+        with patch.dict("os.environ", {"FRED_API_KEY": "fred-key"}, clear=False):
+            with patch("modules.fred_client.requests.get") as get_mock:
+                get_mock.return_value = response
+
+                df = fred_client.get_vix_observations("2026-09-01", "2026-09-03")
+
+        self.assertEqual(list(df.columns), ["Close"])
+        self.assertEqual(len(df), 2)
+        self.assertAlmostEqual(float(df["Close"].iloc[-1]), 18.45)
+
+    def test_macro_regime_returns_default_when_fred_not_configured(self):
+        with patch("modules.macro_regime.get_vix_observations", side_effect=fred_client.FredNotConfiguredError("FRED_API_KEY is not configured")):
+            result = macro_regime.get_macro_regime()
+
+        self.assertEqual(
+            result,
+            {
+                "vix": None,
+                "vix_regime": "medium",
+                "yield_10y": None,
+                "risk_free_rate": 0.045,
+                "bullish_sectors": [],
+                "bearish_sectors": [],
+                "market_regime": "neutral",
+            },
+        )
 
 
 if __name__ == "__main__":

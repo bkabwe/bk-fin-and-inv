@@ -14,6 +14,10 @@ pip install -r requirements.txt
 
 - `POLYGON_API_KEY` — required for Polygon.io (Massive) market data, ticker
   reference, indicators, splits/dividends, and news endpoints used across the app.
+- `FRED_API_KEY` — optional FRED (Federal Reserve Economic Data) API key used to
+  fetch free daily VIX (`VIXCLS`) data for macro market-regime context, replacing
+  Polygon's separate paid Indices add-on requirement for `I:VIX`. Get a free key at
+  https://fred.stlouisfed.org/docs/api/api_key.html
 - `SEC_EDGAR_CONTACT_EMAIL` — optional contact email embedded in SEC EDGAR
   `User-Agent` headers. If unset, the app uses a placeholder and logs a warning;
   setting a real contact is recommended by SEC API guidance.
@@ -22,12 +26,14 @@ You can provide it either as a normal shell environment variable:
 
 ```bash
 export POLYGON_API_KEY=your_polygon_api_key
+export FRED_API_KEY=your_fred_api_key
 ```
 
 Or by creating a `.env` file in the project root (automatically loaded at startup via `python-dotenv`):
 
 ```dotenv
 POLYGON_API_KEY=your_polygon_api_key
+FRED_API_KEY=your_fred_api_key
 SEC_EDGAR_CONTACT_EMAIL=you@example.com
 ```
 
@@ -65,6 +71,7 @@ python analyze_stock.py AAPL
 - NASDAQ / NYSE American / OTC active universes: Polygon `/v3/reference/tickers`
 - Market OHLCV data: Polygon aggregates `/v2/aggs/...` with `adjusted=true`
 - Current price proxy: Polygon previous-day close `/v2/aggs/ticker/{ticker}/prev`
+- VIX / macro regime volatility context: FRED `VIXCLS` daily observations API
 - Reference/profile fields (name/sector/market-cap): Polygon ticker overview
 - Fundamentals/ratios (P/E, EPS, ROE, debt-to-equity, growth): SEC EDGAR
   Company Facts XBRL API (10-K/10-Q filing data)
