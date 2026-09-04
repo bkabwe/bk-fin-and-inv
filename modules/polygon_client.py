@@ -120,8 +120,10 @@ def _request_json(path: str, params: dict[str, Any] | None = None) -> dict[str, 
         response = requests.get(f"{POLYGON_API_BASE_URL}{path}", params=params, timeout=REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
         payload = response.json()
-        if isinstance(payload, dict) and payload.get("status") == "ERROR":
-            raise RuntimeError(payload.get("error") or payload.get("message") or "Polygon API error")
+        if isinstance(payload, dict):
+            status = str(payload.get("status") or "").upper()
+            if status in {"ERROR", "NOT_AUTHORIZED", "UNAUTHORIZED", "FORBIDDEN"}:
+                raise RuntimeError(payload.get("error") or payload.get("message") or payload.get("status") or "Polygon API error")
         return payload
 
     return _fetch_with_retry(_fetch) or {}
@@ -130,7 +132,7 @@ def _request_json(path: str, params: dict[str, Any] | None = None) -> dict[str, 
 def _parse_period_to_days(period: str) -> int:
     value = str(period or "1y").strip().lower()
     if value == "max":
-        return MAX_LOOKBACK_YEARS * 365
+        raise ValueError(f"period='max' is not supported on Polygon Starter. Use <= {MAX_LOOKBACK_YEARS}y.")
     mapping = {
         "1d": 1,
         "5d": 5,
@@ -141,20 +143,30 @@ def _parse_period_to_days(period: str) -> int:
         "2y": 730,
         "3y": 1095,
         "5y": 1825,
-        "10y": 3650,
     }
     if value in mapping:
         return mapping[value]
     try:
         if value.endswith("y"):
-            return int(value[:-1]) * 365
+            parsed = int(value[:-1]) * 365
+            if parsed > (MAX_LOOKBACK_YEARS * 365):
+                raise ValueError(f"period exceeds Polygon Starter lookback ({MAX_LOOKBACK_YEARS}y): {value}")
+            return parsed
         if value.endswith("mo"):
-            return int(value[:-2]) * 30
+            parsed = int(value[:-2]) * 30
+            if parsed > (MAX_LOOKBACK_YEARS * 365):
+                raise ValueError(f"period exceeds Polygon Starter lookback ({MAX_LOOKBACK_YEARS}y): {value}")
+            return parsed
         if value.endswith("d"):
-            return int(value[:-1])
+            parsed = int(value[:-1])
+            if parsed > (MAX_LOOKBACK_YEARS * 365):
+                raise ValueError(f"period exceeds Polygon Starter lookback ({MAX_LOOKBACK_YEARS}y): {value}")
+            return parsed
+    except ValueError:
+        raise
     except Exception:
         pass
-    return 365
+    raise ValueError(f"Unsupported period value: {period}")
 
 
 def _interval_to_polygon(interval: str) -> tuple[int, str]:
@@ -301,17 +313,37 @@ def get_reference_dividends(ticker: str, limit: int = 20) -> list[dict[str, Any]
 @cache_data(ttl=3600)
 def get_reference_splits(ticker: str, execution_date_gte: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     clean_ticker = _sanitize_polygon_symbol(ticker)
+    total_limit = int(max(1, limit))
     params: dict[str, Any] = {
         "ticker": clean_ticker,
-        "limit": int(limit),
+        "limit": int(min(total_limit, 1000)),
         "order": "asc",
         "sort": "execution_date",
     }
     if execution_date_gte:
         params["execution_date.gte"] = execution_date_gte
-    payload = _request_json("/v3/reference/splits", params)
-    values = payload.get("results") or []
-    return values if isinstance(values, list) else []
+
+    results: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        call_params = dict(params)
+        if cursor:
+            call_params["cursor"] = cursor
+        payload = _request_json("/v3/reference/splits", call_params)
+        page_values = payload.get("results") or []
+        if isinstance(page_values, list) and page_values:
+            results.extend(page_values)
+            if len(results) >= total_limit:
+                return results[:total_limit]
+        next_url = payload.get("next_url")
+        if not next_url:
+            break
+        cursor = None
+        if "cursor=" in str(next_url):
+            cursor = str(next_url).split("cursor=", 1)[-1].split("&", 1)[0]
+        if not cursor:
+            break
+    return results[:total_limit]
 
 
 @cache_data(ttl=900)
@@ -507,12 +539,8 @@ def build_info_adapter(ticker: str) -> dict[str, Any]:
         revenue_growth = _extract_ratio(ratios, ["revenue_growth", "sales_growth"])
 
     trailing_year = date.today() - timedelta(days=365)
-    try:
-        last_year = get_stock_data_polygon(clean_ticker, period="1y", interval="1d")
-    except Exception:
-        last_year = _empty_ohlcv()
-    high_52w = float(last_year["High"].max()) if not last_year.empty and "High" in last_year else None
-    low_52w = float(last_year["Low"].min()) if not last_year.empty and "Low" in last_year else None
+    high_52w = _safe_float(overview.get("fifty_two_week_high") or overview.get("52_week_high"))
+    low_52w = _safe_float(overview.get("fifty_two_week_low") or overview.get("52_week_low"))
 
     dividend_yield = _extract_ratio(ratios, ["dividend_yield", "dividend_yield_ttm"])
     if dividend_yield is None and current_price and current_price > 0:

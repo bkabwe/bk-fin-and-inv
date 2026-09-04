@@ -30,9 +30,9 @@ def _get_market_sentiment_signals(ticker: str) -> dict:
     put_call_ratio = None
 
     try:
-        # Polygon Starter does not include legacy options-chain fields used
-        # previously; we keep these fields nullable so sentiment scoring degrades
-        # gracefully while preserving return-shape compatibility.
+        # The current Polygon-backed info adapter does not expose short-interest
+        # or options-chain metrics yet, so these sentiment signals remain null
+        # while preserving the existing return-shape contract.
         info = get_stock_info(ticker) or {}
         short_ratio = info.get("shortRatio")
         short_pct_float = info.get("shortPercentOfFloat")

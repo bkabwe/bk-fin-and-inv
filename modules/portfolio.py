@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 
 from modules.logger import get_logger
@@ -124,7 +125,19 @@ def detect_split_since_purchase(ticker: str, date_purchased: str) -> dict:
     """
     result: dict = {"split_detected": False, "split_factor": None, "events": [], "warning": None}
     try:
-        splits = get_reference_splits(ticker, execution_date_gte=date_purchased or None)
+        execution_date_gte = None
+        if date_purchased:
+            try:
+                purchased_day = date.fromisoformat(str(date_purchased).split("T", 1)[0])
+                execution_date_gte = (purchased_day + timedelta(days=1)).isoformat()
+            except Exception:
+                raw = str(date_purchased).split("T", 1)[0]
+                try:
+                    fallback_day = date.fromisoformat(raw)
+                    execution_date_gte = (fallback_day + timedelta(days=1)).isoformat()
+                except Exception:
+                    execution_date_gte = raw
+        splits = get_reference_splits(ticker, execution_date_gte=execution_date_gte)
         if not splits:
             return result
         cumulative = 1.0

@@ -46,6 +46,10 @@ def _get_benchmark_close(symbol: str) -> pd.Series:
     return df["Close"].astype(float).dropna()
 
 
+_STAGE_MA_SPREAD_THRESHOLD = 0.01
+_STAGE_PRICE_DISTANCE_THRESHOLD = 0.06
+_STAGE_RS_BASELINE = 1.0
+
 _SECTOR_ETF_MAP = {
     "Technology": "XLK",
     "Financials": "XLF",
@@ -65,19 +69,26 @@ def _safe_last(value: pd.Series) -> float | None:
 
 
 def _latest_sma_from_polygon(ticker: str, window: int, close: pd.Series) -> float | None:
+    non_null_close = close.dropna()
+    if len(non_null_close) >= window:
+        local = non_null_close.rolling(window).mean().iloc[-1]
+        if not pd.isna(local):
+            return float(local)
     series = get_indicator_series("sma", ticker, window=window)
     if not series.empty and "value" in series:
         return _safe_last(series["value"])
-    if len(close) >= window:
-        return float(close.rolling(window).mean().iloc[-1])
     return None
 
 
-def _sma_history_from_polygon(ticker: str, window: int, close: pd.Series) -> pd.Series:
+def _sma_history_from_polygon(ticker: str, window: int, close: pd.Series, *, min_local_history: int | None = None) -> pd.Series:
+    non_null_close = close.dropna()
+    threshold = max(window, int(min_local_history or 0))
+    if len(non_null_close) >= threshold:
+        return non_null_close.rolling(window).mean().astype(float)
     series = get_indicator_series("sma", ticker, window=window)
     if not series.empty and "value" in series:
         return series["value"].astype(float)
-    return close.rolling(window).mean().astype(float)
+    return non_null_close.rolling(window).mean().astype(float)
 
 
 def _primary_trend(close: pd.Series, sma150: float | None, sma200: float | None) -> str:
@@ -101,10 +112,20 @@ def _primary_trend(close: pd.Series, sma150: float | None, sma200: float | None)
 
 def _relative_strength_ratio(stock: pd.Series, benchmark: pd.Series, lookback: int = 126) -> float | None:
     merged = pd.concat([stock.rename("s"), benchmark.rename("b")], axis=1).dropna()
-    if len(merged) <= lookback:
+    if merged.empty:
         return None
-    sret = (merged["s"].iloc[-1] / merged["s"].iloc[-lookback - 1]) - 1
-    bret = (merged["b"].iloc[-1] / merged["b"].iloc[-lookback - 1]) - 1
+
+    trailing_days = max(30, int(round((lookback / 252.0) * 365.0)))
+    try:
+        cutoff = pd.to_datetime(merged.index).max() - pd.Timedelta(days=trailing_days)
+        merged = merged.loc[pd.to_datetime(merged.index) >= cutoff]
+    except Exception:
+        pass
+
+    if len(merged) < 2:
+        return None
+    sret = (merged["s"].iloc[-1] / merged["s"].iloc[0]) - 1
+    bret = (merged["b"].iloc[-1] / merged["b"].iloc[0]) - 1
     if abs(float(bret)) < 1e-9:
         return None
     return float((1 + sret) / (1 + bret))
@@ -124,11 +145,11 @@ def _classify_stage(
     ma_spread = (sma150 - sma200) / max(abs(sma200), 1e-9)
     sector_rs_ok = rs_sector is None or rs_sector >= 1.0
 
-    if current > sma150 > sma200 and ma_spread > 0.01 and (rs_spy or 0) >= 1.0 and sector_rs_ok:
+    if current > sma150 > sma200 and ma_spread > _STAGE_MA_SPREAD_THRESHOLD and (rs_spy or 0) >= _STAGE_RS_BASELINE and sector_rs_ok:
         return "Stage 2 (Advancing)"
-    if current < sma150 < sma200 and ma_spread < -0.01 and (rs_spy or 1.0) < 1.0:
+    if current < sma150 < sma200 and ma_spread < -_STAGE_MA_SPREAD_THRESHOLD and (rs_spy or _STAGE_RS_BASELINE) < _STAGE_RS_BASELINE:
         return "Stage 4 (Declining)"
-    if abs(ma_spread) <= 0.01 and abs((current - sma200) / max(abs(sma200), 1e-9)) < 0.06:
+    if abs(ma_spread) <= _STAGE_MA_SPREAD_THRESHOLD and abs((current - sma200) / max(abs(sma200), 1e-9)) < _STAGE_PRICE_DISTANCE_THRESHOLD:
         return "Stage 1 (Basing)"
     return "Stage 3 (Topping)"
 
@@ -175,8 +196,8 @@ def _cross_history(close: pd.Series, ticker: str) -> tuple[int, int, float | Non
     if len(close) < 220:
         return 0, 0, None
 
-    sma50 = _sma_history_from_polygon(ticker, 50, close)
-    sma200 = _sma_history_from_polygon(ticker, 200, close)
+    sma50 = _sma_history_from_polygon(ticker, 50, close, min_local_history=220)
+    sma200 = _sma_history_from_polygon(ticker, 200, close, min_local_history=220)
     merged = pd.concat([close.rename("close"), sma50.rename("sma50"), sma200.rename("sma200")], axis=1).dropna()
     if len(merged) < 220:
         return 0, 0, None

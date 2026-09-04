@@ -60,9 +60,8 @@ causing potentially stale data to be served indefinitely).
 | `fully_analyzed` | int | Tickers that went through full analysis |
 | `failed_count` | int | Tickers that raised an exception during analysis |
 | `failed_tickers` | list | `[{"ticker": "X", "reason": "..."}]` objects |
-| `revalidation_status` | string | `not_requested` |
 
-The same `failed_count` / `failed_tickers` / `revalidation_status` fields are
+The same `failed_count` / `failed_tickers` progress fields are
 also available on the `/profit/{job_id}/progress` endpoint.
 
 ### Chart accuracy

@@ -680,8 +680,36 @@ def analyze_stock(
     data = data_override if data_override is not None else get_stock_data(ticker, period=period, interval=interval)
     info = info_override if info_override is not None else get_stock_info(ticker)
     projection_data = projection_data_override if projection_data_override is not None else data_override
+
+    info = dict(info or {})
+    trailing_52w = pd.DataFrame()
+    if not data.empty:
+        try:
+            max_date = pd.to_datetime(data.index).max()
+            cutoff = max_date - pd.Timedelta(days=365)
+            trailing_52w = data.loc[pd.to_datetime(data.index) >= cutoff]
+        except Exception:
+            trailing_52w = data.tail(252)
+    if "fiftyTwoWeekHigh" not in info and not trailing_52w.empty and "High" in trailing_52w:
+        try:
+            info["fiftyTwoWeekHigh"] = float(trailing_52w["High"].astype(float).max())
+        except Exception:
+            pass
+    if "fiftyTwoWeekLow" not in info and not trailing_52w.empty and "Low" in trailing_52w:
+        try:
+            info["fiftyTwoWeekLow"] = float(trailing_52w["Low"].astype(float).min())
+        except Exception:
+            pass
+
     technical = analyze_technical(data)
-    current_price = float(data["Close"].iloc[-1]) if not data.empty else float(info.get("currentPrice") or 0)
+    if not data.empty:
+        current_price = float(data["Close"].iloc[-1])
+    else:
+        _raw_price = info.get("currentPrice")
+        try:
+            current_price = float(_raw_price) if _raw_price is not None else None
+        except Exception:
+            current_price = None
 
     macro_regime = get_macro_regime()
     risk_free_rate = float(macro_regime.get("risk_free_rate") or 0.045)
@@ -772,7 +800,8 @@ def analyze_stock(
     }
     if horizon == "Long-Term Hold":
         longterm_history = data if data is not None and not data.empty else projection_data
-        if projection_data is not None and not projection_data.empty and len(projection_data) > len(longterm_history or []):
+        current_len = len(longterm_history) if longterm_history is not None else 0
+        if projection_data is not None and not projection_data.empty and len(projection_data) > current_len:
             longterm_history = projection_data
         if longterm_history is None or longterm_history.empty or len(longterm_history) < 900:
             longterm_history = get_stock_data(ticker, period="5y", interval="1d")
