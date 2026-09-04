@@ -9,8 +9,11 @@ from typing import Any
 import pandas as pd
 import requests
 
+from modules.env import load_environment
 from modules.logger import get_logger
 from modules.validators import sanitize_ticker
+
+load_environment()
 
 logger = get_logger(__name__)
 

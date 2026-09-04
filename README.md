@@ -15,8 +15,16 @@ pip install -r requirements.txt
 - `POLYGON_API_KEY` — required for Polygon.io (Massive) market, fundamentals,
   indicators, splits/dividends, and news endpoints used across the app.
 
+You can provide it either as a normal shell environment variable:
+
 ```bash
 export POLYGON_API_KEY=your_polygon_api_key
+```
+
+Or by creating a `.env` file in the project root (automatically loaded at startup via `python-dotenv`):
+
+```dotenv
+POLYGON_API_KEY=your_polygon_api_key
 ```
 
 > Starter-plan behavior used by this app: unlimited API calls, up to 5 years of
@@ -115,7 +123,7 @@ Short-Term and Medium-Term scoring logic/weights are unchanged.
 
 - **macOS SSL/cert issues**: run Python from an environment with updated certs and retry `pip install -r requirements.txt`.
 - **Prophet install fails**: try `pip install pystan==2.19.1.1` then `pip install prophet`.
-- **POLYGON_API_KEY missing**: set the environment variable before launching Streamlit/API workers.
+- **POLYGON_API_KEY missing**: either export it in your shell or add it to a project-root `.env` file before launching Streamlit/API workers.
 - **Polygon data unavailable for a ticker**: retry shortly; the app handles missing responses gracefully and skips unavailable symbols.
 
 ## Disclaimer
