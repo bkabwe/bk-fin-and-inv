@@ -9,6 +9,7 @@ import pandas as pd
 from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers
 from modules.logger import get_logger
 from modules.scoring_engine import analyze_stock, fast_screen_score
+from modules.tiingo_client import revalidate_screener_rows, summarize_revalidation
 from modules.validators import sanitize_ticker_list
 
 logger = get_logger(__name__)
@@ -51,6 +52,8 @@ def run_screener(
     max_workers: int = _DEFAULT_MAX_WORKERS,
     use_fast_screen: bool = True,
     fast_screen_margin: int = _DEFAULT_FAST_SCREEN_MARGIN,
+    revalidate_with_tiingo: bool = False,
+    revalidate_top_n: int = 50,
 ) -> pd.DataFrame:
     """Run the stock screener across the selected universe.
 
@@ -167,8 +170,13 @@ def run_screener(
 
     if not rows:
         results = pd.DataFrame()
+        revalidation_summary = {"requested": 0, "verified": 0, "unavailable": 0, "status": "not_requested"}
     else:
-        results = pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results).reset_index(drop=True)
+        results = pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
+        if revalidate_with_tiingo:
+            results = pd.DataFrame(revalidate_screener_rows(results.to_dict(orient="records"), top_n=revalidate_top_n))
+        revalidation_summary = summarize_revalidation(results.to_dict(orient="records"))
+        results = results.head(max_results).reset_index(drop=True)
 
     results.attrs["source_ticker_count"] = total
     results.attrs["qualified_count"] = len(rows)
@@ -178,6 +186,11 @@ def run_screener(
     results.attrs["fully_analyzed_count"] = fully_analyzed_count
     results.attrs["failed_count"] = len(failed_tickers)
     results.attrs["failed_tickers"] = failed_tickers
+    results.attrs["revalidation_requested"] = revalidate_with_tiingo
+    results.attrs["revalidation_status"] = revalidation_summary["status"]
+    results.attrs["revalidation_count"] = revalidation_summary["requested"]
+    results.attrs["revalidation_verified_count"] = revalidation_summary["verified"]
+    results.attrs["revalidation_unavailable_count"] = revalidation_summary["unavailable"]
 
     logger.info(
         "Screener complete | universe=%s | total=%s | fast_filtered=%s | fully_analyzed=%s | failed=%s | qualified=%s | displayed=%s",

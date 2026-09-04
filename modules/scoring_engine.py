@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
@@ -210,10 +211,15 @@ def _garch_confidence_from_returns(current_price: float, log_returns: np.ndarray
         return None, None
 
 
-@cache_data(ttl=3600)
-def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
-    info = get_stock_info(ticker)
-    data = get_stock_data(ticker, period="2y", interval="1d")
+def _get_price_projections_core(
+    ticker: str,
+    *,
+    info: dict | None = None,
+    data: pd.DataFrame | None = None,
+    avg_cost: float | None = None,
+) -> dict:
+    info = info or get_stock_info(ticker)
+    data = data if data is not None else get_stock_data(ticker, period="2y", interval="1d")
     technical = analyze_technical(data)
     macro = get_macro_regime()
     risk_free_rate = float(macro.get("risk_free_rate") or 0.045)
@@ -576,9 +582,36 @@ def get_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
     }
 
 
-def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cost: float | None = None) -> dict:
-    data = get_stock_data(ticker, period=period, interval=interval)
-    info = get_stock_info(ticker)
+@cache_data(ttl=3600)
+def _get_cached_price_projections(ticker: str, avg_cost: float | None = None) -> dict:
+    return _get_price_projections_core(ticker, avg_cost=avg_cost)
+
+
+def get_price_projections(
+    ticker: str,
+    avg_cost: float | None = None,
+    *,
+    data_override: pd.DataFrame | None = None,
+    info_override: dict | None = None,
+) -> dict:
+    if data_override is None and info_override is None:
+        return _get_cached_price_projections(ticker, avg_cost=avg_cost)
+    return _get_price_projections_core(ticker, info=info_override, data=data_override, avg_cost=avg_cost)
+
+
+def analyze_stock(
+    ticker: str,
+    period: str = "1y",
+    interval: str = "1d",
+    avg_cost: float | None = None,
+    *,
+    data_override: pd.DataFrame | None = None,
+    info_override: dict | None = None,
+    projection_data_override: pd.DataFrame | None = None,
+) -> dict:
+    data = data_override if data_override is not None else get_stock_data(ticker, period=period, interval=interval)
+    info = info_override if info_override is not None else get_stock_info(ticker)
+    projection_data = projection_data_override if projection_data_override is not None else data_override
     technical = analyze_technical(data)
     current_price = float(data["Close"].iloc[-1]) if not data.empty else info.get("currentPrice")
 
@@ -655,7 +688,12 @@ def analyze_stock(ticker: str, period: str = "1y", interval: str = "1d", avg_cos
         horizon = "Long-Term Hold"
 
     entry = technical.get("entry_price")
-    projections = get_price_projections(ticker, avg_cost=avg_cost)
+    projections = get_price_projections(
+        ticker,
+        avg_cost=avg_cost,
+        data_override=projection_data,
+        info_override=info,
+    )
     target = projections.get("short_term_target") or technical.get("target_price")
     atr = technical.get("atr") or 0
     stop_loss = round((entry or current_price or 0) - (1.5 * atr), 2) if (entry or current_price) else None

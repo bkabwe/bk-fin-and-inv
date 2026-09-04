@@ -3,6 +3,11 @@ from __future__ import annotations
 import streamlit as st
 
 from modules.screener import run_screener
+from modules.tiingo_client import (
+    TIINGO_REVALIDATION_DEFAULT_TOP_N,
+    TIINGO_REVALIDATION_MAX_TOP_N,
+    is_tiingo_configured,
+)
 from modules.validators import sanitize_ticker_list
 
 st.title("🔍 Stock Screener")
@@ -34,6 +39,26 @@ if map_universe[label] in ("nasdaq", "otc"):
     )
 time_filter = st.multiselect("Time Horizon", ["Short-Term Opportunity", "Medium-Term Setup", "Long-Term Hold"])
 sector_filter = st.text_input("Sector filter (optional)").strip().lower()
+revalidate_with_tiingo = st.checkbox(
+    "Revalidate Top Results with Tiingo (free tier)",
+    value=False,
+    help=(
+        "After the normal yfinance scan finishes, re-check the top ranked results "
+        "with Tiingo's official API as a higher-quality price-data confirmation. "
+        "Requires TIINGO_API_KEY and adds extra latency."
+    ),
+)
+revalidate_top_n = TIINGO_REVALIDATION_DEFAULT_TOP_N
+if revalidate_with_tiingo:
+    revalidate_top_n = st.number_input(
+        "Top results to revalidate",
+        min_value=1,
+        max_value=TIINGO_REVALIDATION_MAX_TOP_N,
+        value=TIINGO_REVALIDATION_DEFAULT_TOP_N,
+        step=1,
+    )
+    if not is_tiingo_configured():
+        st.info("Set the TIINGO_API_KEY environment variable to enable Tiingo revalidation.")
 
 if st.button("Run Screener"):
     progress = st.progress(0)
@@ -49,6 +74,8 @@ if st.button("Run Screener"):
                 max_results=max_results,
                 custom_tickers=custom,
                 progress_callback=_cb,
+                revalidate_with_tiingo=revalidate_with_tiingo,
+                revalidate_top_n=int(revalidate_top_n),
             )
     except RuntimeError as e:
         st.error(str(e))
@@ -78,6 +105,20 @@ if st.button("Run Screener"):
             f"**{total_qualified}** scored ≥{min_score} → "
             f"Showing top **{len(results)}** by score"
         )
+        if results.attrs.get("revalidation_requested"):
+            status = results.attrs.get("revalidation_status", "not_requested")
+            verified_count = int(results.attrs.get("revalidation_verified_count", 0))
+            unavailable_count = int(results.attrs.get("revalidation_unavailable_count", 0))
+            if status == "unavailable":
+                if not is_tiingo_configured():
+                    st.warning("Tiingo revalidation was requested but TIINGO_API_KEY was not configured.")
+                else:
+                    st.warning("Tiingo revalidation was requested, but no rows could be verified.")
+            else:
+                st.caption(
+                    f"Tiingo verified **{verified_count}** result(s)"
+                    + (f"; **{unavailable_count}** were unavailable." if unavailable_count else ".")
+                )
         st.download_button("Export to CSV", results.to_csv(index=False), "screener_results.csv", "text/csv")
 
 st.markdown(
