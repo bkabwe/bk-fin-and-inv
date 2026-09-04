@@ -12,8 +12,11 @@ pip install -r requirements.txt
 
 ## Optional environment variables
 
-- `POLYGON_API_KEY` — required for Polygon.io (Massive) market, fundamentals,
-  indicators, splits/dividends, and news endpoints used across the app.
+- `POLYGON_API_KEY` — required for Polygon.io (Massive) market data, ticker
+  reference, indicators, splits/dividends, and news endpoints used across the app.
+- `SEC_EDGAR_CONTACT_EMAIL` — optional contact email embedded in SEC EDGAR
+  `User-Agent` headers. If unset, the app uses a placeholder and logs a warning;
+  setting a real contact is recommended by SEC API guidance.
 
 You can provide it either as a normal shell environment variable:
 
@@ -25,6 +28,7 @@ Or by creating a `.env` file in the project root (automatically loaded at startu
 
 ```dotenv
 POLYGON_API_KEY=your_polygon_api_key
+SEC_EDGAR_CONTACT_EMAIL=you@example.com
 ```
 
 > Starter-plan behavior used by this app: unlimited API calls, up to 5 years of
@@ -61,7 +65,9 @@ python analyze_stock.py AAPL
 - NASDAQ / NYSE American / OTC active universes: Polygon `/v3/reference/tickers`
 - Market OHLCV data: Polygon aggregates `/v2/aggs/...` with `adjusted=true`
 - Current price proxy: Polygon previous-day close `/v2/aggs/ticker/{ticker}/prev`
-- Fundamentals/reference: Polygon ticker overview + financial ratios/statements
+- Reference/profile fields (name/sector/market-cap): Polygon ticker overview
+- Fundamentals/ratios (P/E, EPS, ROE, debt-to-equity, growth): SEC EDGAR
+  Company Facts XBRL API (10-K/10-Q filing data)
 - Splits/dividends: Polygon `/v3/reference/splits` and `/v3/reference/dividends`
 - News: Polygon `/v2/reference/news`
 
@@ -125,6 +131,8 @@ Short-Term and Medium-Term scoring logic/weights are unchanged.
 - **Prophet install fails**: try `pip install pystan==2.19.1.1` then `pip install prophet`.
 - **POLYGON_API_KEY missing**: either export it in your shell or add it to a project-root `.env` file before launching Streamlit/API workers.
 - **Polygon data unavailable for a ticker**: retry shortly; the app handles missing responses gracefully and skips unavailable symbols.
+- **Fundamental metric timing**: SEC EDGAR fundamentals update on filing cadence
+  (10-Q/10-K), not daily like market-price feeds.
 
 ## Disclaimer
 
