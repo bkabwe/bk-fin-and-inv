@@ -11,6 +11,7 @@ import requests
 
 from modules.env import load_environment
 from modules.logger import get_logger
+from modules.sec_edgar_client import get_fundamentals_info_adapter
 from modules.validators import sanitize_ticker
 
 load_environment()
@@ -23,6 +24,8 @@ MAX_LOOKBACK_YEARS = 5
 REQUEST_TIMEOUT_SECONDS = 20
 REQUEST_MAX_RETRIES = 3
 REQUEST_BACKOFF_BASE_SECONDS = 1.0
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
 
 
 class PolygonNotConfiguredError(RuntimeError):
@@ -96,14 +99,62 @@ def _api_key() -> str:
     return key
 
 
+def _status_code_from_exception(exc: Exception) -> int | None:
+    response = None
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = exc.response
+    elif isinstance(exc, requests.exceptions.RequestException):
+        response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    return int(response.status_code) if response.status_code is not None else None
+
+
+def _retry_after_delay_from_exception(exc: Exception) -> float | None:
+    response = None
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = exc.response
+    elif isinstance(exc, requests.exceptions.RequestException):
+        response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return None
+    try:
+        delay = float(retry_after)
+        return delay if delay > 0 else None
+    except Exception:
+        return None
+
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    status_code = _status_code_from_exception(exc)
+    if status_code is None:
+        return False
+    return status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
+
+
 def _fetch_with_retry(fetch_fn, max_retries: int = REQUEST_MAX_RETRIES, base_delay: float = REQUEST_BACKOFF_BASE_SECONDS):
     for attempt in range(max_retries):
         try:
             return fetch_fn()
         except Exception as exc:
+            status_code = _status_code_from_exception(exc)
+            retryable = _is_retryable_exception(exc)
+            if not retryable:
+                if status_code in _NON_RETRYABLE_STATUS_CODES:
+                    logger.warning(
+                        "Polygon request failed with non-retryable status %s (entitlement/permissions or client issue) — not retrying",
+                        status_code,
+                    )
+                raise
             if attempt >= max_retries - 1:
                 raise
-            delay = base_delay * (2**attempt)
+            retry_after_delay = _retry_after_delay_from_exception(exc) if status_code == 429 else None
+            delay = retry_after_delay if retry_after_delay is not None else (base_delay * (2**attempt))
             logger.warning(
                 "Polygon fetch attempt %s/%s failed: %s. Retrying in %.1fs",
                 attempt + 1,
@@ -280,31 +331,6 @@ def get_ticker_overview(ticker: str) -> dict[str, Any]:
     return payload.get("results") or {}
 
 
-def _extract_latest_record(payload: dict[str, Any]) -> dict[str, Any]:
-    for key in ("results", "data"):
-        values = payload.get(key)
-        if isinstance(values, list) and values:
-            return values[0] or {}
-        if isinstance(values, dict):
-            return values
-    return payload if isinstance(payload, dict) else {}
-
-
-@cache_data(ttl=3600)
-def get_financial_ratios(ticker: str) -> dict[str, Any]:
-    clean_ticker = _sanitize_polygon_symbol(ticker)
-    payload = _request_json("/stocks/financials/v1/ratios", {"ticker": clean_ticker, "limit": 1})
-    return _extract_latest_record(payload)
-
-
-@cache_data(ttl=3600)
-def get_income_statements(ticker: str, limit: int = 6) -> list[dict[str, Any]]:
-    clean_ticker = _sanitize_polygon_symbol(ticker)
-    payload = _request_json("/stocks/financials/v1/income-statements", {"ticker": clean_ticker, "limit": int(limit)})
-    values = payload.get("results") or payload.get("data") or []
-    return values if isinstance(values, list) else []
-
-
 @cache_data(ttl=3600)
 def get_reference_dividends(ticker: str, limit: int = 20) -> list[dict[str, Any]]:
     clean_ticker = _sanitize_polygon_symbol(ticker)
@@ -469,84 +495,27 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
-def _extract_ratio(record: dict[str, Any], keys: list[str]) -> float | None:
-    for key in keys:
-        value = record.get(key)
-        if isinstance(value, dict):
-            for nested in ("value", "amount", "ratio"):
-                if nested in value:
-                    parsed = _safe_float(value.get(nested))
-                    if parsed is not None:
-                        return parsed
-        parsed = _safe_float(value)
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def _compute_growth_from_income(income_rows: list[dict[str, Any]]) -> tuple[float | None, float | None]:
-    if len(income_rows) < 2:
-        return None, None
-
-    def _metric(record: dict[str, Any], keys: list[str]) -> float | None:
-        return _extract_ratio(record, keys)
-
-    current = income_rows[0]
-    prior = income_rows[1]
-
-    rev_cur = _metric(current, ["revenue", "total_revenue", "revenues"])
-    rev_prev = _metric(prior, ["revenue", "total_revenue", "revenues"])
-    eps_cur = _metric(current, ["diluted_eps", "basic_eps", "eps", "earnings_per_share"])
-    eps_prev = _metric(prior, ["diluted_eps", "basic_eps", "eps", "earnings_per_share"])
-
-    revenue_growth = None
-    earnings_growth = None
-    if rev_cur is not None and rev_prev is not None and abs(rev_prev) > 1e-9:
-        revenue_growth = (rev_cur - rev_prev) / abs(rev_prev)
-    if eps_cur is not None and eps_prev is not None and abs(eps_prev) > 1e-9:
-        earnings_growth = (eps_cur - eps_prev) / abs(eps_prev)
-
-    return revenue_growth, earnings_growth
-
-
 @cache_data(ttl=1800)
 def build_info_adapter(ticker: str) -> dict[str, Any]:
     """Return a legacy info-schema-compatible dict populated from Polygon endpoints.
 
     Field mapping notes:
-    - trailingPE/forwardPE: sourced from ratios endpoint (closest available P/E fields)
-    - trailingEps/forwardEps: sourced from ratios + income statements EPS fields
-    - debtToEquity: debt/equity ratio from Polygon converted to Yahoo-like percent scale
-    - returnOnEquity: ROE ratio from Polygon (decimal)
-    - earningsGrowth/revenueGrowth: derived from latest two income statements when not explicit
+    - trailingPE/trailingEps/debtToEquity/returnOnEquity/growth metrics: computed from SEC EDGAR filings
+      via modules.sec_edgar_client and mapped into Yahoo-compatible field names
+    - forwardPE/forwardEps/analyst fields: intentionally unavailable from SEC filings and left None
     - currentPrice: previous-day close from /v2/aggs/ticker/{ticker}/prev (Starter plan constraint)
     """
     clean_ticker = _sanitize_polygon_symbol(ticker)
     overview = get_ticker_overview(clean_ticker)
-    ratios = get_financial_ratios(clean_ticker)
-    income_rows = get_income_statements(clean_ticker)
     current_price = get_previous_close(clean_ticker)
-
-    revenue_growth, earnings_growth = _compute_growth_from_income(income_rows)
-
-    trailing_pe = _extract_ratio(ratios, ["price_to_earnings_ratio", "pe_ratio", "trailing_pe", "price_earnings"])
-    forward_pe = _extract_ratio(ratios, ["forward_pe_ratio", "forward_pe"])
-    trailing_eps = _extract_ratio(ratios, ["earnings_per_share", "eps", "basic_eps", "diluted_eps"])
-    forward_eps = _extract_ratio(ratios, ["forward_eps", "projected_eps", "estimated_eps"])
-    debt_to_equity_raw = _extract_ratio(ratios, ["debt_to_equity_ratio", "debt_equity_ratio", "debt_to_equity"])
-    roe = _extract_ratio(ratios, ["return_on_equity", "return_on_equity_ratio", "roe"])
-
-    if earnings_growth is None:
-        earnings_growth = _extract_ratio(ratios, ["earnings_growth", "net_income_growth", "eps_growth"])
-    if revenue_growth is None:
-        revenue_growth = _extract_ratio(ratios, ["revenue_growth", "sales_growth"])
+    sec_fundamentals = get_fundamentals_info_adapter(clean_ticker, current_price=current_price)
 
     trailing_year = date.today() - timedelta(days=365)
     high_52w = _safe_float(overview.get("fifty_two_week_high") or overview.get("52_week_high"))
     low_52w = _safe_float(overview.get("fifty_two_week_low") or overview.get("52_week_low"))
 
-    dividend_yield = _extract_ratio(ratios, ["dividend_yield", "dividend_yield_ttm"])
-    if dividend_yield is None and current_price and current_price > 0:
+    dividend_yield = None
+    if current_price and current_price > 0:
         dividends = get_reference_dividends(clean_ticker, limit=40)
         trailing_divs = 0.0
         for event in dividends:
@@ -562,9 +531,6 @@ def build_info_adapter(ticker: str) -> dict[str, Any]:
         if trailing_divs > 0:
             dividend_yield = trailing_divs / current_price
 
-    # Legacy debtToEquity consumers expect a percent-like scale (e.g., 150 == 1.5x)
-    debt_to_equity = debt_to_equity_raw * 100.0 if debt_to_equity_raw is not None and debt_to_equity_raw < 20 else debt_to_equity_raw
-
     info = {
         "symbol": clean_ticker,
         "shortName": overview.get("name") or clean_ticker,
@@ -577,14 +543,14 @@ def build_info_adapter(ticker: str) -> dict[str, Any]:
         "regularMarketPrice": current_price,
         "targetMeanPrice": None,
         "recommendationKey": None,
-        "trailingPE": trailing_pe,
-        "forwardPE": forward_pe,
-        "trailingEps": trailing_eps,
-        "forwardEps": forward_eps,
-        "earningsGrowth": earnings_growth,
-        "revenueGrowth": revenue_growth,
-        "debtToEquity": debt_to_equity,
-        "returnOnEquity": roe,
+        "trailingPE": sec_fundamentals.get("trailingPE"),
+        "forwardPE": sec_fundamentals.get("forwardPE"),
+        "trailingEps": sec_fundamentals.get("trailingEps"),
+        "forwardEps": sec_fundamentals.get("forwardEps"),
+        "earningsGrowth": sec_fundamentals.get("earningsGrowth"),
+        "revenueGrowth": sec_fundamentals.get("revenueGrowth"),
+        "debtToEquity": sec_fundamentals.get("debtToEquity"),
+        "returnOnEquity": sec_fundamentals.get("returnOnEquity"),
         "fiftyTwoWeekHigh": high_52w,
         "fiftyTwoWeekLow": low_52w,
         "dividendYield": dividend_yield,
