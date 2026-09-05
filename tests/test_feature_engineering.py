@@ -43,6 +43,19 @@ class FeatureEngineeringTechnicalTests(unittest.TestCase):
         self.assertAlmostEqual(float(table["technical_ema_12d"].iloc[-1]), float(ema_manual), places=6)
         self.assertAlmostEqual(float(table["technical_volatility_10d"].iloc[-1]), vol10_manual, places=12)
         self.assertGreater(float(table["technical_rsi_14d"].iloc[-1]), 99.9)
+        self.assertTrue(table["technical_ema_12d"].iloc[:11].isna().all())
+        self.assertTrue(table["technical_ema_26d"].iloc[:25].isna().all())
+
+    def test_rsi_flat_series_is_neutral_after_warmup(self):
+        price_data = _sample_price_frame(30)
+        price_data["Close"] = 10.0
+        price_data["High"] = 10.5
+        price_data["Low"] = 9.5
+        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}):
+            with patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()):
+                table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=30)
+
+        self.assertAlmostEqual(float(table["technical_rsi_14d"].iloc[-1]), 50.0, places=6)
 
 
 class FeatureEngineeringFundamentalTests(unittest.TestCase):
@@ -94,7 +107,9 @@ class FeatureEngineeringFundamentalTests(unittest.TestCase):
         self.assertAlmostEqual(float(table.loc["2024-01-20", "fundamental_gross_margin"]), 0.40, places=6)
         self.assertAlmostEqual(float(table.loc["2024-04-10", "fundamental_gross_margin"]), 0.40, places=6)
         self.assertAlmostEqual(float(table.loc["2024-04-16", "fundamental_gross_margin"]), 0.50, places=6)
+        self.assertTrue(pd.isna(table.loc["2024-01-10", "fundamental_gross_margin"]))
 
+        # Feature follows existing SEC adapter scaling (ratio * 100).
         self.assertAlmostEqual(float(table.loc["2024-01-20", "fundamental_debt_to_equity"]), 50.0, places=6)
         self.assertAlmostEqual(float(table.loc["2024-04-16", "fundamental_debt_to_equity"]), 50.0, places=6)
         self.assertTrue(pd.isna(table.loc["2024-01-20", "fundamental_revenue_growth"]))
@@ -126,6 +141,20 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
         self.assertTrue(table["technical_volatility_30d"].isna().all())
         self.assertTrue(table["technical_ema_26d"].isna().all())
         self.assertTrue(table["technical_volume_vs_avg_20d"].isna().all())
+        self.assertTrue(table["technical_rsi_14d"].isna().all())
+
+    def test_feature_table_uses_cached_result_for_same_inputs(self):
+        price_data = _sample_price_frame(40)
+        if hasattr(feature_engineering._build_feature_table_cached, "clear"):
+            feature_engineering._build_feature_table_cached.clear()
+        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}) as sec_mock:
+            with patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()) as macro_mock:
+                first = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
+                second = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
+
+        self.assertEqual(sec_mock.call_count, 1)
+        self.assertEqual(macro_mock.call_count, 1)
+        self.assertEqual(len(first), len(second))
 
 
 if __name__ == "__main__":

@@ -170,10 +170,12 @@ feature-based forecasting model (not yet wired into scoring/projections in this
 phase). The table combines:
 - Technical features (rolling volatility, EMA, RSI, daily-bar VWAP approximation,
   and volume-vs-average)
-- SEC EDGAR fundamentals (`revenueGrowth`, `debtToEquity`, and gross margin),
-  forward-filled from filing dates across daily rows
+- SEC EDGAR fundamentals (`fundamental_revenue_growth`,
+  `fundamental_debt_to_equity` (percent points, matching existing SEC adapter
+  scaling), and `fundamental_gross_margin`), forward-filled from filing dates
+  across daily rows
 - Shared macro features from FRED (`DGS10`, `CPIAUCSL`, `FEDFUNDS`) with level and
-  5-day/30-day delta metrics
+  5-day/30-day delta and percent-change metrics
 
 Design principle: feature assembly is TTL-cached incrementally and decoupled from
 scan cadence so repeated scans avoid unnecessary recomputation/refetching.

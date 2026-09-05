@@ -280,6 +280,13 @@ def get_macro_feature_table(start_date: date | datetime | str, end_date: date | 
         return pd.DataFrame()
 
     macro = pd.concat(frames, axis=1).sort_index()
+    daily_index = pd.date_range(
+        start=pd.to_datetime(_normalize_date(start_date), errors="coerce"),
+        end=pd.to_datetime(_normalize_date(end_date), errors="coerce"),
+        freq="D",
+    )
+    if len(daily_index) > 0:
+        macro = macro.reindex(daily_index).ffill()
     for prefix in series_map:
         level_col = f"{prefix}_level"
         if level_col not in macro.columns:

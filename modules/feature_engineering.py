@@ -26,8 +26,19 @@ except Exception:  # pragma: no cover
             _inflight: dict = {}
             _lock = threading.Lock()
 
+            def _stable_value(value):
+                if isinstance(value, float) and np.isnan(value):
+                    return "__nan__"
+                if isinstance(value, tuple):
+                    return tuple(_stable_value(item) for item in value)
+                if isinstance(value, list):
+                    return tuple(_stable_value(item) for item in value)
+                if isinstance(value, dict):
+                    return tuple(sorted((k, _stable_value(v)) for k, v in value.items()))
+                return value
+
             def wrapper(*args, **kwargs):
-                key = (args, tuple(sorted(kwargs.items())))
+                key = (_stable_value(args), _stable_value(tuple(sorted(kwargs.items()))))
                 while True:
                     now = time.monotonic()
                     with _lock:
@@ -101,8 +112,10 @@ def _compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.where(avg_loss > 0, 100.0)
-    rsi = rsi.where(avg_gain > 0, 0.0)
+    valid = avg_gain.notna() & avg_loss.notna()
+    rsi = rsi.where(~(valid & (avg_loss == 0) & (avg_gain > 0)), 100.0)
+    rsi = rsi.where(~(valid & (avg_gain == 0) & (avg_loss > 0)), 0.0)
+    rsi = rsi.where(~(valid & (avg_gain == 0) & (avg_loss == 0)), 50.0)
     return rsi
 
 
@@ -131,23 +144,24 @@ def _technical_features(price_frame: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-def _select_tag_series(company_facts: dict, tags: list[str], units: list[str]) -> pd.Series:
-    for tag in tags:
-        entries = sec_edgar_client._collect_tag_entries(company_facts, tag, units)  # type: ignore[attr-defined]
-        if not entries:
+def _select_concept_series(company_facts: dict, concept_name: str) -> pd.Series:
+    entries = sec_edgar_client.get_concept_entries(company_facts, concept_name)
+    if not entries:
+        return pd.Series(dtype="float64")
+    rows: list[dict[str, float | pd.Timestamp]] = []
+    for entry in sorted(entries, key=lambda item: (item["filed"], item["end"])):
+        filed = pd.to_datetime(entry.get("filed"), errors="coerce")
+        if pd.isna(filed):
             continue
-        rows: list[dict[str, float | pd.Timestamp]] = []
-        for entry in sorted(entries, key=lambda item: (item["filed"], item["end"])):
-            filed = pd.to_datetime(entry.get("filed"), errors="coerce")
-            if pd.isna(filed):
-                continue
-            rows.append({"filed": filed.normalize(), "value": float(entry.get("value"))})
-        if not rows:
+        value = entry.get("value", entry.get("val"))
+        if value is None:
             continue
-        df = pd.DataFrame(rows).sort_values("filed")
-        df = df.drop_duplicates(subset=["filed"], keep="last")
-        return pd.Series(df["value"].values, index=pd.DatetimeIndex(df["filed"]))
-    return pd.Series(dtype="float64")
+        rows.append({"filed": filed.normalize(), "value": float(value)})
+    if not rows:
+        return pd.Series(dtype="float64")
+    df = pd.DataFrame(rows).sort_values("filed")
+    df = df.drop_duplicates(subset=["filed"], keep="last")
+    return pd.Series(df["value"].values, index=pd.DatetimeIndex(df["filed"]))
 
 
 def _fundamental_daily_features(ticker: str, daily_index: pd.DatetimeIndex) -> pd.DataFrame:
@@ -162,27 +176,28 @@ def _fundamental_daily_features(ticker: str, daily_index: pd.DatetimeIndex) -> p
         logger.warning("Fundamental features unavailable for %s: no SEC company facts", ticker)
         return features
 
-    revenue = _select_tag_series(company_facts, sec_edgar_client._CONCEPT_TAGS["revenue"], sec_edgar_client._CONCEPT_UNITS["revenue"])  # type: ignore[attr-defined]
-    liabilities = _select_tag_series(
-        company_facts, sec_edgar_client._CONCEPT_TAGS["liabilities"], sec_edgar_client._CONCEPT_UNITS["liabilities"]  # type: ignore[attr-defined]
-    )
-    equity = _select_tag_series(company_facts, sec_edgar_client._CONCEPT_TAGS["equity"], sec_edgar_client._CONCEPT_UNITS["equity"])  # type: ignore[attr-defined]
-    gross_profit = _select_tag_series(company_facts, ["GrossProfit"], ["USD"])
+    revenue = _select_concept_series(company_facts, "revenue")
+    liabilities = _select_concept_series(company_facts, "liabilities")
+    equity = _select_concept_series(company_facts, "equity")
+    gross_profit = _select_concept_series(company_facts, "gross_profit")
 
     filed_features = pd.DataFrame(index=revenue.index.union(liabilities.index).union(equity.index).union(gross_profit.index).sort_values())
     filed_features["gross_margin"] = [
         _safe_div(gp, rev) for gp, rev in zip(gross_profit.reindex(filed_features.index), revenue.reindex(filed_features.index))
     ]
-    filed_features["debt_to_equity"] = [
-        (_safe_div(liab, eq) * 100.0 if _safe_div(liab, eq) is not None else np.nan)
-        for liab, eq in zip(liabilities.reindex(filed_features.index), equity.reindex(filed_features.index))
-    ]
+    debt_to_equity_values: list[float] = []
+    for liab, eq in zip(liabilities.reindex(filed_features.index), equity.reindex(filed_features.index)):
+        ratio = _safe_div(liab, eq)
+        # Keep SEC adapter compatibility: debtToEquity is represented as percent points (ratio * 100).
+        debt_to_equity_values.append((ratio * 100.0) if ratio is not None else np.nan)
+    filed_features["debt_to_equity"] = debt_to_equity_values
     filed_features["revenue_growth"] = revenue.reindex(filed_features.index).pct_change(periods=1)
 
     if filed_features.empty:
         return features
 
-    daily_filled = filed_features.reindex(daily_index).ffill()
+    expanded_index = daily_index.union(filed_features.index).sort_values()
+    daily_filled = filed_features.reindex(expanded_index).ffill().reindex(daily_index)
     features["fundamental_gross_margin"] = daily_filled["gross_margin"]
     features["fundamental_debt_to_equity"] = daily_filled["debt_to_equity"]
     features["fundamental_revenue_growth"] = daily_filled["revenue_growth"]
