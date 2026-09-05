@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -75,10 +77,16 @@ except Exception:  # pragma: no cover
 
 try:  # pragma: no cover
     from statsmodels.tsa.arima.model import ARIMA
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
     STATSMODELS_AVAILABLE = True
 except ImportError:  # pragma: no cover
+    ConvergenceWarning = Warning  # type: ignore[assignment]
     STATSMODELS_AVAILABLE = False
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+# Higher than statsmodels defaults to reduce ARIMA optimizer non-convergence on noisier equity series.
+_ARIMA_MAXITER = 200
 
 try:  # pragma: no cover
     from sklearn.linear_model import LinearRegression
@@ -109,7 +117,7 @@ def _select_arima_order(ticker: str, series_values: tuple[float, ...]) -> tuple[
         for d in range(2):
             for q in range(3):
                 try:
-                    fit = ARIMA(series, order=(p, d, q)).fit()
+                    fit = _fit_arima_with_hardening(series, order=(p, d, q))
                     if fit.aic < best_aic:
                         best_aic = float(fit.aic)
                         best_order = (p, d, q)
@@ -131,6 +139,35 @@ def _recommendation(score: int) -> str:
     if score >= 20:
         return "🔴 DO NOT BUY"
     return "⛔ AVOID"
+
+
+def _fit_arima_with_hardening(series: pd.Series | np.ndarray, order: tuple[int, int, int]):
+    """Use smarter initialization + higher maxiter; retry once with alternate optimizer on convergence warnings."""
+    model = ARIMA(series, order=order)
+    start_params = None
+    try:
+        initial = model.fit(method="innovations_mle")
+        start_params = np.asarray(initial.params, dtype=float)
+    except Exception:
+        start_params = None
+
+    with warnings.catch_warnings(record=True) as primary_warnings:
+        warnings.simplefilter("always", ConvergenceWarning)
+        result = model.fit(
+            method="statespace",
+            start_params=start_params,
+            method_kwargs={"maxiter": _ARIMA_MAXITER, "disp": 0},
+        )
+    converged_with_warning = any(issubclass(w.category, ConvergenceWarning) for w in primary_warnings)
+    if not converged_with_warning:
+        return result
+
+    logger.info("ARIMA fit convergence warning for order=%s; retrying with Powell optimizer", order)
+    return model.fit(
+        method="statespace",
+        start_params=start_params,
+        method_kwargs={"maxiter": _ARIMA_MAXITER, "disp": 0, "method": "powell"},
+    )
 
 
 def _sector_momentum_adjustment(sector: str | None, macro_regime: dict) -> tuple[str, int]:
@@ -357,7 +394,7 @@ def _get_price_projections_core(
                 raise ValueError("not enough history")
             series = close.tail(252).astype(float)
             order = _select_arima_order(ticker.upper(), tuple(np.round(series.values, 6).tolist()))
-            arima_forecast = ARIMA(series, order=order).fit().forecast(steps=720)
+            arima_forecast = _fit_arima_with_hardening(series, order=order).forecast(steps=720)
             arima_30 = float(arima_forecast.iloc[29]) if len(arima_forecast) >= 30 else float(arima_forecast.iloc[-1])
             arima_180 = float(arima_forecast.iloc[179]) if len(arima_forecast) >= 180 else float(arima_forecast.iloc[-1])
             arima_720 = float(arima_forecast.iloc[719]) if len(arima_forecast) >= 720 else float(arima_forecast.iloc[-1])
