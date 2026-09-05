@@ -10,5 +10,6 @@ beautifulsoup4==4.13.4
 lxml==6.1.0
 statsmodels
 scikit-learn
+lightgbm==4.7.0
 Pillow
 arch

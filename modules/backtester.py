@@ -5,16 +5,10 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 
+from modules.arima_hardening import ARIMA_AVAILABLE, fit_arima_with_hardening
 from modules.logger import get_logger
 
 logger = get_logger(__name__)
-
-try:
-    from statsmodels.tsa.arima.model import ARIMA
-
-    ARIMA_AVAILABLE = True
-except Exception:  # pragma: no cover
-    ARIMA_AVAILABLE = False
 
 try:
     from sklearn.linear_model import LinearRegression
@@ -88,7 +82,7 @@ def _select_arima_order(series: pd.Series) -> tuple[int, int, int]:
         for d in range(2):
             for q in range(3):
                 try:
-                    fit = ARIMA(series, order=(p, d, q)).fit()
+                    fit = fit_arima_with_hardening(series, order=(p, d, q), logger=logger)
                     if fit.aic < best_aic:
                         best_aic = float(fit.aic)
                         best_order = (p, d, q)
@@ -128,7 +122,7 @@ def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
             if ARIMA_AVAILABLE:
                 try:
                     order = _select_arima_order(train)
-                    pred = ARIMA(train, order=order).fit().forecast(steps=test_len)
+                    pred = fit_arima_with_hardening(train, order=order, logger=logger).forecast(steps=test_len)
                     arima_errors.append(_rmse(test_vals, np.array(pred.values, dtype=float)))
                 except Exception:
                     pass

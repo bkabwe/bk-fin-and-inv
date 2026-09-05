@@ -180,6 +180,21 @@ phase). The table combines:
 Design principle: feature assembly is TTL-cached incrementally and decoupled from
 scan cadence so repeated scans avoid unnecessary recomputation/refetching.
 
+### LightGBM return model candidate (standalone, not yet in live ensemble)
+The app now includes `modules/lightgbm_model.py` as an explicit Phase 2 candidate
+model module. It predicts **forward return** (not raw price) for the existing
+30/180/720-day horizons using the shared engineered feature table and historical
+close prices. Training/inference are intentionally decoupled via save/load helpers
+so scan-time inference does not require retraining. This module is not yet wired
+into live scoring/ensemble weighting pending dedicated backtest validation.
+
+### ARIMA convergence hardening
+ARIMA fitting paths in both backtesting and scoring now use stronger convergence
+settings: higher optimizer iteration budget, smarter initialization, and a
+single fallback retry with an alternate optimizer when convergence warnings occur.
+The ARIMA order-grid candidates and AIC selection logic are unchanged, preserving
+comparability with prior walk-forward results while reducing non-convergence risk.
+
 ### Failed-ticker visibility in screener results
 Exceptions during per-ticker analysis are no longer silently swallowed.
 Screener results (Streamlit and API) now track and surface:

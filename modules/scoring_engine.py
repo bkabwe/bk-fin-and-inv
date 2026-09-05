@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from modules.arima_hardening import ARIMA_AVAILABLE, fit_arima_with_hardening
 from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
 from modules.fundamental_analysis import analyze_fundamentals, classify_market_cap_tier, normalize_sector_name
@@ -73,12 +74,7 @@ except Exception:  # pragma: no cover
         return decorator
 
 
-try:  # pragma: no cover
-    from statsmodels.tsa.arima.model import ARIMA
-
-    STATSMODELS_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    STATSMODELS_AVAILABLE = False
+STATSMODELS_AVAILABLE = ARIMA_AVAILABLE
 
 try:  # pragma: no cover
     from sklearn.linear_model import LinearRegression
@@ -109,7 +105,7 @@ def _select_arima_order(ticker: str, series_values: tuple[float, ...]) -> tuple[
         for d in range(2):
             for q in range(3):
                 try:
-                    fit = ARIMA(series, order=(p, d, q)).fit()
+                    fit = fit_arima_with_hardening(series, order=(p, d, q), logger=logger)
                     if fit.aic < best_aic:
                         best_aic = float(fit.aic)
                         best_order = (p, d, q)
@@ -357,7 +353,7 @@ def _get_price_projections_core(
                 raise ValueError("not enough history")
             series = close.tail(252).astype(float)
             order = _select_arima_order(ticker.upper(), tuple(np.round(series.values, 6).tolist()))
-            arima_forecast = ARIMA(series, order=order).fit().forecast(steps=720)
+            arima_forecast = fit_arima_with_hardening(series, order=order, logger=logger).forecast(steps=720)
             arima_30 = float(arima_forecast.iloc[29]) if len(arima_forecast) >= 30 else float(arima_forecast.iloc[-1])
             arima_180 = float(arima_forecast.iloc[179]) if len(arima_forecast) >= 180 else float(arima_forecast.iloc[-1])
             arima_720 = float(arima_forecast.iloc[719]) if len(arima_forecast) >= 720 else float(arima_forecast.iloc[-1])
