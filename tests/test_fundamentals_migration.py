@@ -21,6 +21,7 @@ except Exception:
     sys.modules["pandas"] = fake_pandas
 
 from modules import fred_client, macro_regime, polygon_client, sec_edgar_client
+from modules import backtester, scoring_engine
 
 
 def _http_error(status_code: int, retry_after: str | None = None) -> requests.exceptions.HTTPError:
@@ -172,6 +173,22 @@ class FredMacroRegimeTests(unittest.TestCase):
                 "market_regime": "neutral",
             },
         )
+
+
+class ForecastingEnsembleTests(unittest.TestCase):
+    def test_inverse_rmse_weights_ignore_prophet_key(self):
+        weights = scoring_engine._inverse_rmse_weights(
+            {"prophet_rmse": 0.0001, "arima_rmse": 2.0, "trend_rmse": 1.0, "n_windows": 4}
+        )
+        self.assertIsNotNone(weights)
+        self.assertEqual(set(weights.keys()), {"arima", "trend"})
+        self.assertGreater(weights["trend"], weights["arima"])
+        self.assertAlmostEqual(sum(weights.values()), 1.0, places=6)
+
+    def test_walk_forward_default_shape_has_no_prophet_rmse(self):
+        pd_mod = __import__("pandas")
+        result = backtester.run_walk_forward("AAPL", pd_mod.DataFrame())
+        self.assertEqual(set(result.keys()), {"arima_rmse", "trend_rmse", "n_windows"})
 
 
 if __name__ == "__main__":

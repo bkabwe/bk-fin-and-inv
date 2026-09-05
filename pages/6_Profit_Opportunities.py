@@ -16,12 +16,6 @@ from modules.polygon_client import is_polygon_configured
 from modules.scoring_engine import analyze_stock, fast_screen_score
 
 try:  # pragma: no cover
-    from prophet import Prophet
-    PROPHET_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    PROPHET_AVAILABLE = False
-
-try:  # pragma: no cover
     from statsmodels.tsa.arima.model import ARIMA
     ARIMA_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -62,7 +56,7 @@ scan_mode = st.radio(
         "(technical subscore proxy). Significantly quicker on large universes. "
         "May very rarely miss a borderline candidate near the upside threshold.\n\n"
         "**Thorough**: Original sequential behaviour — every ticker gets full "
-        "Prophet/ARIMA/GARCH analysis. Slower but no pre-filtering shortcuts."
+        "ARIMA/trend/GARCH analysis. Slower but no pre-filtering shortcuts."
     ),
 )
 _fast_mode = scan_mode.startswith("Fast")
@@ -156,34 +150,20 @@ def estimate_target_date(ticker: str, target_price: float, horizon_value: str, r
         est = today + timedelta(days=fallback_days)
         return _format_date_range(est, "Low"), "Low"
 
-    prophet_day: int | None = None
+    arima_day: int | None = None
     arima_hit = False
     trend_day: int | None = None
-
-    if PROPHET_AVAILABLE and len(close) >= 60:
-        try:
-            prophet_df = close.reset_index().rename(columns={close.index.name or "Date": "ds", "Close": "y"})
-            if "ds" not in prophet_df.columns:
-                prophet_df = prophet_df.rename(columns={prophet_df.columns[0]: "ds"})
-            prophet_df["ds"] = pd.to_datetime(prophet_df["ds"]).dt.tz_localize(None)
-            prophet_df = prophet_df[["ds", "y"]]
-            model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
-            model.fit(prophet_df)
-            forecast = model.predict(model.make_future_dataframe(periods=max_days, freq="D"))
-            future_only = forecast.tail(max_days)
-            crossing = future_only[future_only["yhat"] >= float(target_price)]
-            if not crossing.empty:
-                cross_ds = pd.to_datetime(crossing.iloc[0]["ds"]).date()
-                prophet_day = max(1, (cross_ds - today).days)
-        except Exception:
-            prophet_day = None
 
     if ARIMA_AVAILABLE and len(close) >= 60:
         try:
             arima_forecast = ARIMA(close.tail(252), order=(5, 1, 0)).fit().forecast(steps=max_days)
-            arima_hit = bool((arima_forecast >= float(target_price)).any())
+            crossing_idx = np.where(arima_forecast.values.astype(float) >= float(target_price))[0]
+            arima_hit = len(crossing_idx) > 0
+            if arima_hit:
+                arima_day = int(crossing_idx[0]) + 1
         except Exception:
             arima_hit = False
+            arima_day = None
 
     if len(close) >= 30:
         try:
@@ -203,9 +183,9 @@ def estimate_target_date(ticker: str, target_price: float, horizon_value: str, r
         except Exception:
             trend_day = None
 
-    if prophet_day is not None:
-        est = today + timedelta(days=min(max_days, prophet_day))
-        confidence = "High" if arima_hit else "Medium"
+    if arima_day is not None:
+        est = today + timedelta(days=min(max_days, max(1, arima_day)))
+        confidence = "Medium"
         return _format_date_range(est, confidence), confidence
 
     if trend_day is not None:
