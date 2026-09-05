@@ -36,6 +36,7 @@ _NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
 
 _CONCEPT_TAGS: dict[str, list[str]] = {
     "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
+    "gross_profit": ["GrossProfit"],
     "net_income": ["NetIncomeLoss"],
     "assets": ["Assets"],
     "liabilities": ["Liabilities"],
@@ -46,6 +47,7 @@ _CONCEPT_TAGS: dict[str, list[str]] = {
 
 _CONCEPT_UNITS: dict[str, list[str]] = {
     "revenue": ["USD"],
+    "gross_profit": ["USD"],
     "net_income": ["USD"],
     "assets": ["USD"],
     "liabilities": ["USD"],
@@ -310,6 +312,17 @@ def _collect_tag_entries(company_facts: dict[str, Any], tag: str, preferred_unit
                 }
             )
     return rows
+
+
+def get_concept_entries(company_facts: dict[str, Any], concept_name: str) -> list[dict[str, Any]]:
+    """Return normalized Company Facts entries for the first available tag in a concept."""
+    tags = _CONCEPT_TAGS.get(concept_name, [])
+    units = _CONCEPT_UNITS.get(concept_name, [])
+    for tag in tags:
+        entries = _collect_tag_entries(company_facts, tag, units)
+        if entries:
+            return entries
+    return []
 
 
 def _select_preferred_latest(entries: list[dict[str, Any]], older_than: date | None = None) -> dict[str, Any] | None:
