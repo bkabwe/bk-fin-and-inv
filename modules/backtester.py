@@ -6,6 +6,14 @@ import numpy as np
 import pandas as pd
 
 from modules.arima_hardening import ARIMA_AVAILABLE, fit_arima_with_hardening
+from modules.feature_engineering import build_feature_table
+from modules.lightgbm_model import (
+    LIGHTGBM_AVAILABLE,
+    RETURN_HORIZONS,
+    build_return_training_examples,
+    predict_forward_return,
+    train_return_models,
+)
 from modules.logger import get_logger
 
 logger = get_logger(__name__)
@@ -92,8 +100,16 @@ def _select_arima_order(series: pd.Series) -> tuple[int, int, int]:
 
 
 @cache_data(ttl=86400)
-def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
-    default = {"arima_rmse": 1.0, "trend_rmse": 1.0, "n_windows": 0}
+def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = False) -> dict:
+    default = {
+        "arima_rmse": 1.0,
+        "trend_rmse": 1.0,
+        "lightgbm_rmse": 1.0,
+        "n_windows": 0,
+        "arima_windows": 0,
+        "trend_windows": 0,
+        "lightgbm_windows": 0,
+    }
     try:
         if data is None or data.empty or "Close" not in data or len(data) < 120:
             return default
@@ -101,6 +117,7 @@ def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
         close = data["Close"].dropna().astype(float).tail(252)
         if len(close) < 120:
             return default
+        price_frame = data.copy().reindex(close.index)
 
         train_len = 60
         test_len = 30
@@ -110,6 +127,8 @@ def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
 
         arima_errors: list[float] = []
         trend_errors: list[float] = []
+        lightgbm_errors: list[float] = []
+        lightgbm_horizon = min(RETURN_HORIZONS, key=lambda horizon: abs(int(horizon) - test_len))
 
         for start in starts:
             train = close.iloc[start : start + train_len]
@@ -138,14 +157,53 @@ def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
                 except Exception:
                     pass
 
-        n_windows = max(len(arima_errors), len(trend_errors))
+            if evaluate_lightgbm and LIGHTGBM_AVAILABLE:
+                try:
+                    train_price = price_frame.iloc[start : start + train_len]
+                    features = build_feature_table(ticker, train_price, lookback_days=train_len)
+                    datasets = build_return_training_examples(
+                        ticker=ticker,
+                        price_data=train_price,
+                        feature_table=features,
+                        lookback_days=train_len,
+                        horizons=(lightgbm_horizon,),
+                    )
+                    if lightgbm_horizon not in datasets:
+                        continue
+                    dynamic_min_rows = min(50, max(10, int(train_len / 3)))
+                    models = train_return_models(datasets, min_rows_per_horizon=dynamic_min_rows)
+                    if not models or lightgbm_horizon not in models:
+                        continue
+                    latest_row = features.dropna(how="all")
+                    if latest_row.empty:
+                        continue
+                    predicted_return = predict_forward_return(models[lightgbm_horizon], latest_row.iloc[-1])
+                    if predicted_return is None:
+                        continue
+                    start_price = float(train.iloc[-1])
+                    if start_price <= 0:
+                        continue
+                    final_price = start_price * (1.0 + float(predicted_return))
+                    if final_price <= 0:
+                        continue
+                    growth = np.exp(np.log(final_price / start_price) / test_len)
+                    pred_path = start_price * np.power(growth, np.arange(1, test_len + 1))
+                    lightgbm_errors.append(_rmse(test_vals, pred_path.astype(float)))
+                except Exception:
+                    pass
+
+        n_windows = max(len(arima_errors), len(trend_errors), len(lightgbm_errors))
         if n_windows == 0:
             return default
 
         result = {
             "arima_rmse": round(float(np.mean(arima_errors)) if arima_errors else 1.0, 6),
             "trend_rmse": round(float(np.mean(trend_errors)) if trend_errors else 1.0, 6),
+            "lightgbm_rmse": round(float(np.mean(lightgbm_errors)) if lightgbm_errors else 1.0, 6),
             "n_windows": int(n_windows),
+            "arima_windows": int(len(arima_errors)),
+            "trend_windows": int(len(trend_errors)),
+            "lightgbm_windows": int(len(lightgbm_errors)),
         }
         logger.info("Walk-forward backtest complete for %s: %s", ticker.upper(), result)
         return result

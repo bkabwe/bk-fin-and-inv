@@ -188,6 +188,22 @@ close prices. Training/inference are intentionally decoupled via save/load helpe
 so scan-time inference does not require retraining. This module is not yet wired
 into live scoring/ensemble weighting pending dedicated backtest validation.
 
+### Walk-forward validation gate for LightGBM (comparison-only)
+`modules/backtester.run_walk_forward()` now supports optional LightGBM RMSE
+evaluation alongside ARIMA and trend over the same rolling windows, for
+validation/decision-gate analysis only. Live ensemble weighting is unchanged:
+`modules/scoring_engine._inverse_rmse_weights()` and `_weighted_ensemble()` still
+use ARIMA/trend only until a future integration workstream explicitly changes that.
+
+To reproduce aggregate comparisons across a representative ticker sample:
+
+```bash
+python scripts/compare_lightgbm_backtest.py --sample-size 30
+```
+
+The script prints mean/median RMSE per model, LightGBM win percentage vs both
+ARIMA and trend, and ticker/window evaluation counts per model.
+
 ### ARIMA convergence hardening
 ARIMA fitting paths in both backtesting and scoring now use stronger convergence
 settings: higher optimizer iteration budget, smarter initialization, and a

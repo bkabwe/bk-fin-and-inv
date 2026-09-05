@@ -188,7 +188,18 @@ class ForecastingEnsembleTests(unittest.TestCase):
     def test_walk_forward_default_shape(self):
         pd_mod = __import__("pandas")
         result = backtester.run_walk_forward("AAPL", pd_mod.DataFrame())
-        self.assertEqual(set(result.keys()), {"arima_rmse", "trend_rmse", "n_windows"})
+        self.assertEqual(
+            set(result.keys()),
+            {
+                "arima_rmse",
+                "trend_rmse",
+                "lightgbm_rmse",
+                "n_windows",
+                "arima_windows",
+                "trend_windows",
+                "lightgbm_windows",
+            },
+        )
 
     def test_confidence_bounds_fallback_without_garch(self):
         low, high = scoring_engine._confidence_bounds(
