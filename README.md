@@ -8,8 +8,6 @@ Comprehensive US stock analysis toolkit inspired by Richard W. Schabacker's tech
 pip install -r requirements.txt
 ```
 
-> Note: Installing `prophet` may take a few minutes on macOS because native dependencies are compiled during `pip install prophet`.
-
 ## Optional environment variables
 
 - `POLYGON_API_KEY` — required for Polygon.io (Massive) market data, ticker
@@ -63,7 +61,8 @@ python analyze_stock.py AAPL
 - Notification bell with unread count + mark-all-read
 - Technical analysis (SMA/EMA, RSI, MACD, Stochastic, Bollinger, ATR, OBV, support/resistance, classic patterns)
 - Unified score + recommendation engine with entry/target/stop-loss suggestions
-- Multi-model projected price targets (Prophet/ARIMA/regression/fair-value/technical ensemble)
+- Multi-model projected price targets (ARIMA + log-linear/log-polynomial trend + fundamental fair value + DCF + technical resistance + analyst target, with GARCH confidence bounds)
+- Prophet was removed from the ensemble after walk-forward backtests consistently showed materially higher RMSE on stock series (which generally lack the strong recurring seasonality Prophet is designed for).
 
 ## Data Sources
 
@@ -135,7 +134,6 @@ Short-Term and Medium-Term scoring logic/weights are unchanged.
 ## Troubleshooting
 
 - **macOS SSL/cert issues**: run Python from an environment with updated certs and retry `pip install -r requirements.txt`.
-- **Prophet install fails**: try `pip install pystan==2.19.1.1` then `pip install prophet`.
 - **POLYGON_API_KEY missing**: either export it in your shell or add it to a project-root `.env` file before launching Streamlit/API workers.
 - **Polygon data unavailable for a ticker**: retry shortly; the app handles missing responses gracefully and skips unavailable symbols.
 - **Fundamental metric timing**: SEC EDGAR fundamentals update on filing cadence
@@ -175,7 +173,7 @@ large universes (S&P 500, NASDAQ, Russell 2000) while keeping results accurate:
 
 1. **Fast tier** — every ticker in the universe is evaluated with a cheap
    technical-subscore pass (data fetch + `analyze_technical` only, no
-   Prophet/ARIMA/GARCH/backtest).  The subscore is normalized to 0–100.
+   ARIMA/trend/GARCH/backtest).  The subscore is normalized to 0–100.
 2. **Full tier** — only tickers whose fast-tier score ≥ `min_score − margin`
    proceed to the expensive full analysis (forecasting + walk-forward backtest).
 
@@ -200,7 +198,7 @@ The Profit Opportunities page now offers a **Scan Mode** selector:
 
 - **Fast (Recommended)** — runs per-ticker analysis in a parallel thread pool
   (`max_workers=8`) and optionally applies a cheap technical-subscore
-  pre-filter before the expensive Prophet/ARIMA/GARCH full analysis.  The
+  pre-filter before the expensive ARIMA/trend/GARCH full analysis.  The
   pre-filter uses the same safeguarded two-tier approach as the Screener
   (conservative threshold + 15-point safety margin) and is toggle-able via
   the "Enable fast-screen pre-filter" checkbox.  Significantly faster on large
@@ -235,7 +233,7 @@ review is needed.
 Every price projection shown to the user is automatically persisted so that,
 once the estimated target date has passed, the app can verify whether the
 prediction actually hit — giving you an empirical track record of the
-Prophet/ARIMA/GARCH/trend ensemble's accuracy.
+ARIMA/trend/GARCH-enhanced ensemble's accuracy.
 
 ### What gets tracked
 Predictions are recorded from three sources:

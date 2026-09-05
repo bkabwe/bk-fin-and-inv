@@ -74,13 +74,6 @@ except Exception:  # pragma: no cover
 
 
 try:  # pragma: no cover
-    from prophet import Prophet
-
-    PROPHET_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    PROPHET_AVAILABLE = False
-
-try:  # pragma: no cover
     from statsmodels.tsa.arima.model import ARIMA
 
     STATSMODELS_AVAILABLE = True
@@ -206,8 +199,6 @@ def _weighted_ensemble(components: list[tuple[str, float | None, float]]) -> tup
 def _confidence_bounds(
     target: float,
     values: list[float],
-    prophet_low: float | None,
-    prophet_high: float | None,
     current_price: float,
     cap_value: float | None,
     garch_low: float | None = None,
@@ -217,12 +208,19 @@ def _confidence_bounds(
     highs = [target, current_price, *values]
     if garch_low is not None:
         lows.append(garch_low)
-    elif prophet_low is not None:
-        lows.append(prophet_low)
     if garch_high is not None:
         highs.append(garch_high)
-    elif prophet_high is not None:
-        highs.append(prophet_high)
+
+    # Fallback widening when one or both GARCH confidence edges are unavailable.
+    if garch_low is None or garch_high is None:
+        spread_values = np.array([target, current_price, *values], dtype=float)
+        spread = float(np.std(spread_values)) if len(spread_values) > 1 else 0.0
+        floor = max(current_price * 0.08, abs(target - current_price))
+        band = max(floor, spread * 1.96)
+        if garch_low is None:
+            lows.append(min(target - band, current_price))
+        if garch_high is None:
+            highs.append(max(target + band, current_price))
 
     low = max(0.0, min(lows))
     high = max(highs)
@@ -242,7 +240,6 @@ def _cap_target(value: float, current_price: float, cap_value: float | None) -> 
 def _inverse_rmse_weights(backtest: dict) -> dict[str, float] | None:
     try:
         rmses = {
-            "prophet": float(backtest.get("prophet_rmse") or 0),
             "arima": float(backtest.get("arima_rmse") or 0),
             "trend": float(backtest.get("trend_rmse") or 0),
         }
@@ -340,52 +337,18 @@ def _get_price_projections_core(
 
     short_model_total, medium_model_total, long_model_total = 0.80, 0.55, 0.50
     if model_weights:
-        short_prophet_w = short_model_total * model_weights.get("prophet", 0)
         short_arima_w = short_model_total * model_weights.get("arima", 0)
         short_trend_w = short_model_total * model_weights.get("trend", 0)
 
-        medium_prophet_w = medium_model_total * model_weights.get("prophet", 0)
         medium_arima_w = medium_model_total * model_weights.get("arima", 0)
         medium_trend_w = medium_model_total * model_weights.get("trend", 0)
 
-        long_prophet_w = long_model_total * model_weights.get("prophet", 0)
         long_arima_w = long_model_total * model_weights.get("arima", 0)
         long_trend_w = long_model_total * model_weights.get("trend", 0)
     else:
-        short_prophet_w, short_arima_w, short_trend_w = 0.35, 0.25, 0.20
-        medium_prophet_w, medium_arima_w, medium_trend_w = 0.30, 0.0, 0.25
-        long_prophet_w, long_arima_w, long_trend_w = 0.25, 0.0, 0.25
-
-    prophet_30 = prophet_180 = prophet_720 = None
-    prophet_low_30 = prophet_low_180 = prophet_low_720 = None
-    prophet_high_30 = prophet_high_180 = prophet_high_720 = None
-    if PROPHET_AVAILABLE:
-        try:
-            if close is None or len(close) < 60:
-                raise ValueError("not enough history")
-            prophet_df = close.reset_index()
-            date_col = prophet_df.columns[0]
-            prophet_df = prophet_df.rename(columns={date_col: "ds", "Close": "y"})[["ds", "y"]]
-            prophet_df["ds"] = prophet_df["ds"].dt.tz_localize(None)
-            model = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True)
-            model.fit(prophet_df)
-            forecast = model.predict(model.make_future_dataframe(periods=720, freq="D"))
-            base_idx = len(prophet_df) - 1
-            p30 = forecast.iloc[min(base_idx + 30, len(forecast) - 1)]
-            p180 = forecast.iloc[min(base_idx + 180, len(forecast) - 1)]
-            p720 = forecast.iloc[min(base_idx + 720, len(forecast) - 1)]
-            prophet_30, prophet_180, prophet_720 = float(p30["yhat"]), float(p180["yhat"]), float(p720["yhat"])
-            prophet_low_30, prophet_low_180, prophet_low_720 = float(p30["yhat_lower"]), float(p180["yhat_lower"]), float(
-                p720["yhat_lower"]
-            )
-            prophet_high_30, prophet_high_180, prophet_high_720 = float(p30["yhat_upper"]), float(p180["yhat_upper"]), float(
-                p720["yhat_upper"]
-            )
-            models_used.append("Prophet")
-        except Exception as exc:
-            models_skipped.append(f"Prophet: {exc}")
-    else:
-        models_skipped.append("Prophet: package not installed")
+        short_arima_w, short_trend_w = 0.44, 0.36
+        medium_arima_w, medium_trend_w = 0.0, 0.55
+        long_arima_w, long_trend_w = 0.0, 0.50
 
     arima_30 = arima_180 = arima_720 = None
     if STATSMODELS_AVAILABLE:
@@ -489,7 +452,6 @@ def _get_price_projections_core(
 
     short_projection, short_basis, short_values = _weighted_ensemble(
         [
-            ("Prophet", prophet_30, short_prophet_w),
             ("ARIMA", arima_30, short_arima_w),
             ("Trend", trend_30, short_trend_w),
             ("Resistance", technical_resistance, 0.20),
@@ -497,7 +459,6 @@ def _get_price_projections_core(
     )
     medium_projection, medium_basis, medium_values = _weighted_ensemble(
         [
-            ("Prophet", prophet_180, medium_prophet_w),
             ("ARIMA", arima_180, medium_arima_w),
             ("Trend", trend_180, medium_trend_w),
             ("Fundamental", fair_value, 0.20),
@@ -507,7 +468,6 @@ def _get_price_projections_core(
     )
     long_projection, long_basis, long_values = _weighted_ensemble(
         [
-            ("Prophet", prophet_720, long_prophet_w),
             ("ARIMA", arima_720, long_arima_w),
             ("Trend", trend_720, long_trend_w),
             ("Fundamental", fair_value, 0.20),
@@ -523,13 +483,10 @@ def _get_price_projections_core(
     directional_models = [
         x
         for x in [
-            prophet_30,
             arima_30,
             trend_30,
-            prophet_180,
             arima_180,
             trend_180,
-            prophet_720,
             arima_720,
             trend_720,
             fair_value,
@@ -552,8 +509,6 @@ def _get_price_projections_core(
     short_low, short_high = _confidence_bounds(
         short_projection,
         short_values,
-        prophet_low_30,
-        prophet_high_30,
         current_price,
         cap_value,
         garch_low=garch_low_30,
@@ -563,8 +518,6 @@ def _get_price_projections_core(
     medium_low, medium_high = _confidence_bounds(
         medium_projection,
         medium_values,
-        prophet_low_180,
-        prophet_high_180,
         current_price,
         cap_value,
         garch_low=garch_low_180,
@@ -574,8 +527,6 @@ def _get_price_projections_core(
     long_low, long_high = _confidence_bounds(
         long_projection,
         long_values,
-        prophet_low_720,
-        prophet_high_720,
         current_price,
         cap_value,
         garch_low=garch_low_720,
@@ -610,7 +561,9 @@ def _get_price_projections_core(
 
     if is_speculative_otc and "Fundamental Fair Value" not in models_used:
         data_quality = "Technical Only"
-    elif {"Prophet", "ARIMA", "Fundamental Fair Value"}.issubset(set(models_used)):
+    elif {"ARIMA", "Fundamental Fair Value"}.issubset(set(models_used)) and (
+        "Log Linear Trend" in models_used or "Log Polynomial Trend" in models_used
+    ):
         data_quality = "Full"
     else:
         data_quality = "Limited"
@@ -904,7 +857,7 @@ def fast_screen_score(ticker: str, period: str = "1y", interval: str = "1d") -> 
     This is a genuine partial computation of the scoring logic in
     ``analyze_stock`` — it uses the same ``analyze_technical`` call and the
     same formula for ``technical_total``.  It intentionally omits the
-    expensive steps (Prophet/ARIMA/GARCH forecasting and walk-forward
+    expensive steps (ARIMA/GARCH forecasting and walk-forward
     backtesting) to serve as a cheap first-pass filter.
     """
     try:

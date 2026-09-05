@@ -10,13 +10,6 @@ from modules.logger import get_logger
 logger = get_logger(__name__)
 
 try:
-    from prophet import Prophet
-
-    PROPHET_AVAILABLE = True
-except Exception:  # pragma: no cover
-    PROPHET_AVAILABLE = False
-
-try:
     from statsmodels.tsa.arima.model import ARIMA
 
     ARIMA_AVAILABLE = True
@@ -106,7 +99,7 @@ def _select_arima_order(series: pd.Series) -> tuple[int, int, int]:
 
 @cache_data(ttl=86400)
 def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
-    default = {"prophet_rmse": 1.0, "arima_rmse": 1.0, "trend_rmse": 1.0, "n_windows": 0}
+    default = {"arima_rmse": 1.0, "trend_rmse": 1.0, "n_windows": 0}
     try:
         if data is None or data.empty or "Close" not in data or len(data) < 120:
             return default
@@ -121,7 +114,6 @@ def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
 
         starts = list(range(0, max(1, len(close) - (train_len + test_len) + 1), stride))[:10]
 
-        prophet_errors: list[float] = []
         arima_errors: list[float] = []
         trend_errors: list[float] = []
 
@@ -132,18 +124,6 @@ def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
                 continue
 
             test_vals = test.values.astype(float)
-
-            if PROPHET_AVAILABLE:
-                try:
-                    p_df = train.reset_index().rename(columns={train.reset_index().columns[0]: "ds", "Close": "y"})[["ds", "y"]]
-                    p_df["ds"] = p_df["ds"].dt.tz_localize(None)
-                    model = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True)
-                    model.fit(p_df)
-                    future = model.make_future_dataframe(periods=test_len, freq="D")
-                    pred = model.predict(future)["yhat"].tail(test_len).values.astype(float)
-                    prophet_errors.append(_rmse(test_vals, pred))
-                except Exception:
-                    pass
 
             if ARIMA_AVAILABLE:
                 try:
@@ -164,12 +144,11 @@ def run_walk_forward(ticker: str, data: pd.DataFrame) -> dict:
                 except Exception:
                     pass
 
-        n_windows = max(len(prophet_errors), len(arima_errors), len(trend_errors))
+        n_windows = max(len(arima_errors), len(trend_errors))
         if n_windows == 0:
             return default
 
         result = {
-            "prophet_rmse": round(float(np.mean(prophet_errors)) if prophet_errors else 1.0, 6),
             "arima_rmse": round(float(np.mean(arima_errors)) if arima_errors else 1.0, 6),
             "trend_rmse": round(float(np.mean(trend_errors)) if trend_errors else 1.0, 6),
             "n_windows": int(n_windows),
