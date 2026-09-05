@@ -129,6 +129,7 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
         trend_errors: list[float] = []
         lightgbm_errors: list[float] = []
         lightgbm_horizon = min(RETURN_HORIZONS, key=lambda horizon: abs(int(horizon) - test_len))
+        lightgbm_horizon_matches_test = int(lightgbm_horizon) == int(test_len)
 
         for start in starts:
             train = close.iloc[start : start + train_len]
@@ -157,7 +158,7 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                 except Exception:
                     pass
 
-            if evaluate_lightgbm and LIGHTGBM_AVAILABLE:
+            if evaluate_lightgbm and LIGHTGBM_AVAILABLE and lightgbm_horizon_matches_test:
                 try:
                     train_price = price_frame.iloc[start : start + train_len]
                     features = build_feature_table(ticker, train_price, lookback_days=train_len)
@@ -174,10 +175,13 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                     models = train_return_models(datasets, min_rows_per_horizon=dynamic_min_rows)
                     if not models or lightgbm_horizon not in models:
                         continue
-                    latest_row = features.dropna(how="all")
-                    if latest_row.empty:
+                    anchor_idx = train.index[-1]
+                    if anchor_idx not in features.index:
                         continue
-                    predicted_return = predict_forward_return(models[lightgbm_horizon], latest_row.iloc[-1])
+                    latest_row = features.loc[anchor_idx]
+                    if latest_row.isna().all():
+                        continue
+                    predicted_return = predict_forward_return(models[lightgbm_horizon], latest_row)
                     if predicted_return is None:
                         continue
                     start_price = float(train.iloc[-1])

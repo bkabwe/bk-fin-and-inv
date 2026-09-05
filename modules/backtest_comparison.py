@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import statistics
-
 from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_sp500_tickers, get_stock_data
 from modules.logger import get_logger
@@ -42,17 +40,35 @@ DEFAULT_SAMPLE_TICKERS = [
 ]
 
 
-def _safe_mean(values: list[float]) -> float | None:
-    return round(float(statistics.mean(values)), 6) if values else None
+def _weighted_mean(weighted_values: list[tuple[float, int]]) -> float | None:
+    if not weighted_values:
+        return None
+    total_weight = sum(weight for _, weight in weighted_values)
+    if total_weight <= 0:
+        return None
+    weighted_sum = sum(value * weight for value, weight in weighted_values)
+    return round(float(weighted_sum / total_weight), 6)
 
 
-def _safe_median(values: list[float]) -> float | None:
-    return round(float(statistics.median(values)), 6) if values else None
+def _weighted_median(weighted_values: list[tuple[float, int]]) -> float | None:
+    if not weighted_values:
+        return None
+    expanded = sorted(weighted_values, key=lambda item: item[0])
+    total_weight = sum(weight for _, weight in expanded)
+    if total_weight <= 0:
+        return None
+    midpoint = total_weight / 2.0
+    cumulative = 0
+    for value, weight in expanded:
+        cumulative += weight
+        if cumulative >= midpoint:
+            return round(float(value), 6)
+    return round(float(expanded[-1][0]), 6)
 
 
 def summarize_backtest_results(per_ticker: list[dict]) -> dict:
     models = ("arima", "trend", "lightgbm")
-    rmse_values: dict[str, list[float]] = {model: [] for model in models}
+    rmse_values: dict[str, list[tuple[float, int]]] = {model: [] for model in models}
     ticker_counts: dict[str, int] = {model: 0 for model in models}
     window_counts: dict[str, int] = {model: 0 for model in models}
     lightgbm_wins = 0
@@ -65,7 +81,7 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
             window_counts[model] += windows
             if windows > 0 and rmse is not None:
                 ticker_counts[model] += 1
-                rmse_values[model].append(float(rmse))
+                rmse_values[model].append((float(rmse), windows))
 
         if (
             int(row.get("lightgbm_windows", 0) or 0) > 0
@@ -78,8 +94,8 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
 
     model_summary = {
         model: {
-            "mean_rmse": _safe_mean(rmse_values[model]),
-            "median_rmse": _safe_median(rmse_values[model]),
+            "mean_rmse": _weighted_mean(rmse_values[model]),
+            "median_rmse": _weighted_median(rmse_values[model]),
             "tickers_evaluated": int(ticker_counts[model]),
             "windows_evaluated": int(window_counts[model]),
         }
@@ -103,15 +119,14 @@ def run_lightgbm_backtest_comparison(
     period: str = "2y",
     interval: str = "1d",
 ) -> dict:
-    sample = tickers
-    if not sample:
+    if tickers is None:
         try:
             sample = get_sp500_tickers()[:sample_size]
         except Exception as exc:
             logger.warning("Falling back to built-in sample tickers: %s", exc)
             sample = DEFAULT_SAMPLE_TICKERS[:sample_size]
     else:
-        sample = sample[:sample_size]
+        sample = tickers[:sample_size]
 
     per_ticker: list[dict] = []
     for ticker in sample:

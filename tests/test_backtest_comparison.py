@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from modules import backtester
-from modules.backtest_comparison import summarize_backtest_results
+from modules.backtest_comparison import run_lightgbm_backtest_comparison, summarize_backtest_results
 
 
 def _constant_price_frame(length: int = 120, value: float = 100.0) -> pd.DataFrame:
@@ -34,7 +34,13 @@ class WalkForwardLightGBMTests(unittest.TestCase):
             patch("modules.backtester.ARIMA_AVAILABLE", False),
             patch("modules.backtester.SKLEARN_AVAILABLE", False),
             patch("modules.backtester.LIGHTGBM_AVAILABLE", True),
-            patch("modules.backtester.build_feature_table", return_value=feature_table),
+            patch(
+                "modules.backtester.build_feature_table",
+                side_effect=lambda _ticker, price_data, lookback_days=0: pd.DataFrame(
+                    {"feature_a": np.arange(len(price_data), dtype=float)},
+                    index=price_data.index,
+                ),
+            ),
             patch("modules.backtester.build_return_training_examples", return_value=training_examples),
             patch("modules.backtester.train_return_models", return_value={30: object()}),
             patch("modules.backtester.predict_forward_return", return_value=0.0),
@@ -97,6 +103,13 @@ class BacktestComparisonSummaryTests(unittest.TestCase):
         self.assertEqual(summary["lightgbm_wins_vs_both"]["wins"], 1)
         self.assertEqual(summary["lightgbm_wins_vs_both"]["comparable_tickers"], 2)
         self.assertEqual(summary["lightgbm_wins_vs_both"]["win_pct"], 50.0)
+
+    def test_run_comparison_respects_explicit_empty_ticker_list(self):
+        with patch("modules.backtest_comparison.get_sp500_tickers") as sp500_mock:
+            result = run_lightgbm_backtest_comparison(tickers=[], sample_size=5)
+        sp500_mock.assert_not_called()
+        self.assertEqual(result["sample_tickers"], [])
+        self.assertEqual(result["summary"]["total_tickers"], 0)
 
 
 if __name__ == "__main__":

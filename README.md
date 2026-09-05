@@ -194,6 +194,10 @@ evaluation alongside ARIMA and trend over the same rolling windows, for
 validation/decision-gate analysis only. Live ensemble weighting is unchanged:
 `modules/scoring_engine._inverse_rmse_weights()` and `_weighted_ensemble()` still
 use ARIMA/trend only until a future integration workstream explicitly changes that.
+Because LightGBM is trained as fixed-horizon return models (`30/180/720` days),
+the walk-forward path maps each test window to the closest available horizon
+(e.g., 30-day test windows use the 30-day model) and converts the predicted
+return into a daily price path ending at that horizon for RMSE comparison.
 
 To reproduce aggregate comparisons across a representative ticker sample:
 
