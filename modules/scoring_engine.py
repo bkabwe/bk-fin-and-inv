@@ -211,14 +211,16 @@ def _confidence_bounds(
     if garch_high is not None:
         highs.append(garch_high)
 
-    # Fallback widening when GARCH confidence is unavailable.
+    # Fallback widening when one or both GARCH confidence edges are unavailable.
     if garch_low is None or garch_high is None:
         spread_values = np.array([target, current_price, *values], dtype=float)
         spread = float(np.std(spread_values)) if len(spread_values) > 1 else 0.0
         floor = max(current_price * 0.08, abs(target - current_price))
         band = max(floor, spread * 1.96)
-        lows.append(target - band)
-        highs.append(target + band)
+        if garch_low is None:
+            lows.append(min(target - band, current_price))
+        if garch_high is None:
+            highs.append(max(target + band, current_price))
 
     low = max(0.0, min(lows))
     high = max(highs)

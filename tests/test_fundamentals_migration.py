@@ -190,6 +190,52 @@ class ForecastingEnsembleTests(unittest.TestCase):
         result = backtester.run_walk_forward("AAPL", pd_mod.DataFrame())
         self.assertEqual(set(result.keys()), {"arima_rmse", "trend_rmse", "n_windows"})
 
+    def test_confidence_bounds_fallback_without_garch(self):
+        low, high = scoring_engine._confidence_bounds(
+            target=110.0,
+            values=[108.0, 112.0],
+            current_price=100.0,
+            cap_value=None,
+            garch_low=None,
+            garch_high=None,
+        )
+        self.assertEqual(low, 100.0)
+        self.assertEqual(high, 120.0)
+
+    def test_confidence_bounds_fallback_for_missing_garch_edge(self):
+        low, high = scoring_engine._confidence_bounds(
+            target=110.0,
+            values=[108.0, 112.0],
+            current_price=100.0,
+            cap_value=None,
+            garch_low=95.0,
+            garch_high=None,
+        )
+        self.assertEqual(low, 95.0)
+        self.assertEqual(high, 120.0)
+
+    def test_confidence_bounds_fallback_low_never_above_current_price(self):
+        low, _ = scoring_engine._confidence_bounds(
+            target=150.0,
+            values=[145.0, 155.0],
+            current_price=100.0,
+            cap_value=None,
+            garch_low=None,
+            garch_high=170.0,
+        )
+        self.assertLessEqual(low, 100.0)
+
+    def test_confidence_bounds_fallback_high_never_below_current_price(self):
+        _, high = scoring_engine._confidence_bounds(
+            target=70.0,
+            values=[72.0, 75.0],
+            current_price=100.0,
+            cap_value=None,
+            garch_low=60.0,
+            garch_high=None,
+        )
+        self.assertGreaterEqual(high, 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()
