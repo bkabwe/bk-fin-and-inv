@@ -154,6 +154,12 @@ def predict_forward_return(model: LGBMRegressor | None, feature_row: pd.Series |
     if x.empty:
         logger.warning("LightGBM inference skipped: empty feature row")
         return None
+    feature_order = list(getattr(model, "feature_name_", []) or [])
+    if feature_order:
+        for column in feature_order:
+            if column not in x.columns:
+                x[column] = np.nan
+        x = x.reindex(columns=feature_order)
     prediction = float(model.predict(x.iloc[[0]])[0])
     logger.info("LightGBM inference complete: predicted_forward_return=%.6f", prediction)
     return prediction

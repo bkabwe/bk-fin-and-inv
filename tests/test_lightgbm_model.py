@@ -24,7 +24,7 @@ def _sample_price_data(length: int = 900) -> pd.DataFrame:
     )
 
 
-def _sample_feature_table(length: int = 900) -> pd.DataFrame:
+def _sample_feature_table(length: int = 900, include_nans: bool = True) -> pd.DataFrame:
     idx = pd.date_range("2020-01-01", periods=length, freq="D")
     table = pd.DataFrame(
         {
@@ -33,9 +33,9 @@ def _sample_feature_table(length: int = 900) -> pd.DataFrame:
         },
         index=idx,
     )
-    if length > 5:
+    if include_nans and length > 5:
         table.iloc[5, 0] = np.nan
-    if length > 7:
+    if include_nans and length > 7:
         table.iloc[7, 1] = np.nan
     return table
 
@@ -43,7 +43,7 @@ def _sample_feature_table(length: int = 900) -> pd.DataFrame:
 class LightGBMModelTests(unittest.TestCase):
     def test_forward_return_training_example_calculation(self):
         price_data = _sample_price_data(length=100)
-        feature_table = _sample_feature_table(length=100)
+        feature_table = _sample_feature_table(length=100, include_nans=False)
         examples = lightgbm_model.build_return_training_examples(
             "AAPL",
             price_data,
@@ -56,6 +56,19 @@ class LightGBMModelTests(unittest.TestCase):
         self.assertEqual(len(x_train), 70)
         expected = (price_data["Close"].iloc[30] - price_data["Close"].iloc[0]) / price_data["Close"].iloc[0]
         self.assertAlmostEqual(float(y_train.iloc[0]), float(expected), places=12)
+
+    def test_training_examples_keep_nan_features_for_lightgbm_native_handling(self):
+        price_data = _sample_price_data(length=100)
+        feature_table = _sample_feature_table(length=100, include_nans=True)
+        examples = lightgbm_model.build_return_training_examples(
+            "AAPL",
+            price_data,
+            feature_table=feature_table,
+            horizons=(30,),
+        )
+        x_train, _ = examples[30]
+        self.assertEqual(len(x_train), 70)
+        self.assertTrue(x_train.isna().any().any())
 
     def test_build_examples_for_ticker_reuses_stock_data_fetch(self):
         price_data = _sample_price_data(length=120)
@@ -85,9 +98,20 @@ class LightGBMModelTests(unittest.TestCase):
             loaded = lightgbm_model.load_return_models(tmpdir, horizons=(30,))
             self.assertIn(30, loaded)
             pred = lightgbm_model.predict_forward_return(loaded[30], feature_table.iloc[-1])
+            reordered_with_extra = pd.Series(
+                {
+                    "macro_feature_b": feature_table.iloc[-1]["macro_feature_b"],
+                    "technical_feature_a": feature_table.iloc[-1]["technical_feature_a"],
+                    "unexpected_feature": 999.0,
+                }
+            )
+            pred_reordered = lightgbm_model.predict_forward_return(loaded[30], reordered_with_extra)
 
         self.assertIsNotNone(pred)
+        self.assertIsNotNone(pred_reordered)
         self.assertTrue(np.isfinite(float(pred)))
+        self.assertTrue(np.isfinite(float(pred_reordered)))
+        self.assertAlmostEqual(float(pred), float(pred_reordered), places=10)
         self.assertLess(abs(float(pred)), 5.0)
 
     def test_graceful_handling_for_missing_lightgbm(self):
