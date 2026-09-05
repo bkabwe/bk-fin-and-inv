@@ -13,8 +13,9 @@ pip install -r requirements.txt
 - `POLYGON_API_KEY` — required for Polygon.io (Massive) market data, ticker
   reference, indicators, splits/dividends, and news endpoints used across the app.
 - `FRED_API_KEY` — optional FRED (Federal Reserve Economic Data) API key used to
-  fetch free daily VIX (`VIXCLS`) data for macro market-regime context, replacing
-  Polygon's separate paid Indices add-on requirement for `I:VIX`. Get a free key at
+  fetch macro series (`VIXCLS`, `DGS10`, `CPIAUCSL`, `FEDFUNDS`) used for regime
+  context and feature engineering, replacing Polygon's separate paid Indices add-on
+  requirement for `I:VIX`. Get a free key at
   https://fred.stlouisfed.org/docs/api/api_key.html
 - `SEC_EDGAR_CONTACT_EMAIL` — optional contact email embedded in SEC EDGAR
   `User-Agent` headers. If unset, the app uses a placeholder and logs a warning;
@@ -71,6 +72,8 @@ python analyze_stock.py AAPL
 - Market OHLCV data: Polygon aggregates `/v2/aggs/...` with `adjusted=true`
 - Current price proxy: Polygon previous-day close `/v2/aggs/ticker/{ticker}/prev`
 - VIX / macro regime volatility context: FRED `VIXCLS` daily observations API
+- Additional macro feature series: FRED `DGS10` (10Y Treasury), `CPIAUCSL` (CPI),
+  and `FEDFUNDS` (Fed Funds Rate), including 5-day/30-day deltas and percent changes
 - Reference/profile fields (name/sector/market-cap): Polygon ticker overview
 - Fundamentals/ratios (P/E, EPS, ROE, debt-to-equity, growth): SEC EDGAR
   Company Facts XBRL API (10-K/10-Q filing data)
@@ -159,6 +162,21 @@ Previously the fallback was a plain `functools.lru_cache` that ignored the
 `ttl` argument, so cached data could go stale indefinitely.  The fallback is
 now a lightweight TTL-aware decorator that actually expires entries after the
 configured TTL (e.g. 1 hour for stock data, 24 hours for backtests).
+
+### Shared feature-engineering pipeline (Phase 2 prep layer)
+The app now includes `modules/feature_engineering.py`, which builds a daily-indexed
+feature table per ticker as a data-preparation layer for a planned future
+feature-based forecasting model (not yet wired into scoring/projections in this
+phase). The table combines:
+- Technical features (rolling volatility, EMA, RSI, daily-bar VWAP approximation,
+  and volume-vs-average)
+- SEC EDGAR fundamentals (`revenueGrowth`, `debtToEquity`, and gross margin),
+  forward-filled from filing dates across daily rows
+- Shared macro features from FRED (`DGS10`, `CPIAUCSL`, `FEDFUNDS`) with level and
+  5-day/30-day delta metrics
+
+Design principle: feature assembly is TTL-cached incrementally and decoupled from
+scan cadence so repeated scans avoid unnecessary recomputation/refetching.
 
 ### Failed-ticker visibility in screener results
 Exceptions during per-ticker analysis are no longer silently swallowed.

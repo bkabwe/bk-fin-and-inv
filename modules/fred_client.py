@@ -19,6 +19,9 @@ logger = get_logger(__name__)
 FRED_API_BASE_URL = "https://api.stlouisfed.org/fred"
 FRED_API_KEY_ENV = "FRED_API_KEY"
 FRED_VIX_SERIES_ID = "VIXCLS"
+FRED_10Y_TREASURY_SERIES_ID = "DGS10"
+FRED_CPI_SERIES_ID = "CPIAUCSL"
+FRED_FED_FUNDS_SERIES_ID = "FEDFUNDS"
 REQUEST_TIMEOUT_SECONDS = 20
 REQUEST_MAX_RETRIES = 3
 REQUEST_BACKOFF_BASE_SECONDS = 1.0
@@ -214,3 +217,76 @@ def get_vix_observations(start_date: date | datetime | str, end_date: date | dat
     if getattr(df.index, "tz", None) is not None:
         df.index = df.index.tz_convert(None)
     return df[["Close"]].dropna(how="all")
+
+
+@cache_data(ttl=21600)
+def get_series_observations(series_id: str, start_date: date | datetime | str, end_date: date | datetime | str) -> pd.DataFrame:
+    payload = _request_json(
+        "/series/observations",
+        {
+            "series_id": str(series_id).strip(),
+            "observation_start": _normalize_date(start_date),
+            "observation_end": _normalize_date(end_date),
+            "sort_order": "asc",
+        },
+    )
+    observations = payload.get("observations") or []
+    if not isinstance(observations, list) or not observations:
+        return pd.DataFrame(columns=["value"])
+
+    rows: list[dict[str, Any]] = []
+    for item in observations:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("value") or "").strip()
+        if not value or value == ".":
+            continue
+        try:
+            numeric_value = float(value)
+        except Exception:
+            continue
+        observed_at = pd.to_datetime(item.get("date"), utc=True, errors="coerce")
+        if pd.isna(observed_at):
+            continue
+        rows.append({"Date": observed_at, "value": numeric_value})
+
+    if not rows:
+        return pd.DataFrame(columns=["value"])
+
+    df = pd.DataFrame(rows).dropna(subset=["Date"]).set_index("Date").sort_index()
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_convert(None)
+    return df[["value"]].dropna(how="all")
+
+
+@cache_data(ttl=21600)
+def get_macro_feature_table(start_date: date | datetime | str, end_date: date | datetime | str) -> pd.DataFrame:
+    series_map = {
+        "dgs10": FRED_10Y_TREASURY_SERIES_ID,
+        "cpiaucsl": FRED_CPI_SERIES_ID,
+        "fedfunds": FRED_FED_FUNDS_SERIES_ID,
+    }
+
+    frames: list[pd.DataFrame] = []
+    for prefix, series_id in series_map.items():
+        try:
+            series_df = get_series_observations(series_id, start_date, end_date).rename(columns={"value": f"{prefix}_level"})
+        except Exception as exc:
+            logger.warning("FRED series %s unavailable: %s", series_id, exc)
+            series_df = pd.DataFrame(columns=[f"{prefix}_level"])
+        frames.append(series_df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    macro = pd.concat(frames, axis=1).sort_index()
+    for prefix in series_map:
+        level_col = f"{prefix}_level"
+        if level_col not in macro.columns:
+            macro[level_col] = pd.NA
+        for window in (5, 30):
+            delta_col = f"{prefix}_delta_{window}d"
+            pct_col = f"{prefix}_pct_change_{window}d"
+            macro[delta_col] = macro[level_col] - macro[level_col].shift(window)
+            macro[pct_col] = macro[level_col].pct_change(periods=window)
+    return macro
