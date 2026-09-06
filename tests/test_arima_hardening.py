@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import CustomBusinessDay
 
 from modules import arima_hardening, backtester, scoring_engine
 
@@ -130,6 +131,7 @@ class ArimaHardeningTests(unittest.TestCase):
 
         self.assertIsInstance(prepared.index, pd.DatetimeIndex)
         self.assertIsNotNone(prepared.index.freq)
+        self.assertIsInstance(prepared.index.freq, CustomBusinessDay)
 
 
 if __name__ == "__main__":

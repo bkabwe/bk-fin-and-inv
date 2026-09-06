@@ -121,6 +121,7 @@ class WalkForwardLightGBMTests(unittest.TestCase):
 
     def test_walk_forward_realistic_history_yields_non_fallback_lightgbm_windows(self):
         data = _realistic_price_frame(length=252)
+        captured_training_row_indexes: list[pd.Index] = []
 
         def _macro_table(start_date, end_date):
             macro_index = pd.date_range(start_date, end_date, freq="B")
@@ -149,7 +150,8 @@ class WalkForwardLightGBMTests(unittest.TestCase):
             dataset = training_examples.get(30)
             if not dataset:
                 return None
-            _, y_train = dataset
+            x_train, y_train = dataset
+            captured_training_row_indexes.append(x_train.index)
             return {30: object()} if len(y_train) >= int(min_rows_per_horizon) else None
 
         with (
@@ -166,6 +168,13 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertGreater(result["lightgbm_windows"], 0)
         self.assertNotEqual(result["lightgbm_rmse"], 1.0)
         self.assertTrue(np.isfinite(float(result["lightgbm_rmse"])))
+        self.assertGreater(len(captured_training_row_indexes), 0)
+        close_index = data["Close"].dropna().astype(float).tail(252).index
+        expected_starts = list(range(0, max(1, len(close_index) - (60 + 30) + 1), 30))[:10]
+        expected_windows = [close_index[start : start + 60] for start in expected_starts]
+        self.assertEqual(len(captured_training_row_indexes), len(expected_windows))
+        for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows):
+            self.assertTrue(captured_index.equals(expected_index))
 
     def test_walk_forward_lightgbm_failure_is_logged(self):
         data = _constant_price_frame()
