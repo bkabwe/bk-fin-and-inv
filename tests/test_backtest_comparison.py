@@ -191,6 +191,30 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertEqual(result["lightgbm_windows"], 0)
         self.assertTrue(any("LightGBM backtest window failed for AAPL-LGBM-FAIL" in message for message in captured.output))
 
+    @unittest.skipUnless(backtester.ARIMA_AVAILABLE, "statsmodels not installed")
+    def test_walk_forward_timezone_aware_history_keeps_all_arima_windows(self):
+        index = pd.bdate_range("2024-01-02", periods=252).tz_localize("America/New_York")
+        close = 100.0 + np.linspace(0.0, 24.0, num=len(index)) + 1.5 * np.sin(np.arange(len(index)) / 6.0)
+        data = pd.DataFrame(
+            {
+                "Close": close,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Volume": np.full(len(index), 1000.0, dtype=float),
+            },
+            index=index,
+        )
+
+        with (
+            patch("modules.backtester._select_arima_order", return_value=(1, 0, 0)),
+            patch("modules.backtester.SKLEARN_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            result = backtester.run_walk_forward("AAPL-ARIMA-TZ", data, evaluate_lightgbm=False)
+
+        self.assertEqual(result["n_windows"], 6)
+        self.assertEqual(result["arima_windows"], 6)
+
 
 class BacktestComparisonSummaryTests(unittest.TestCase):
     def test_summarize_backtest_results(self):

@@ -28,11 +28,12 @@ def _normalize_close_series(price_data: pd.DataFrame) -> pd.Series:
     if price_data is None or price_data.empty or "Close" not in price_data:
         return pd.Series(dtype="float64", name="Close")
     close = pd.to_numeric(price_data["Close"], errors="coerce").astype("float64")
-    index = pd.to_datetime(price_data.index, errors="coerce")
-    frame = pd.DataFrame({"Close": close.values}, index=index)
+    index = pd.DatetimeIndex(pd.to_datetime(price_data.index, errors="coerce"))
+    if getattr(index, "tz", None) is not None:
+        index = index.tz_localize(None)
+    frame = pd.DataFrame({"Close": close.values}, index=index.normalize())
     frame = frame[~frame.index.isna()].sort_index()
-    if getattr(frame.index, "tz", None) is not None:
-        frame.index = frame.index.tz_convert(None)
+    frame = frame[~frame.index.duplicated(keep="last")]
     return frame["Close"]
 
 
@@ -48,6 +49,13 @@ def build_return_training_examples(
     if features is None or features.empty:
         logger.warning("LightGBM training examples skipped for %s: empty feature table", str(ticker).upper())
         return {}
+    features = features.copy()
+    features.index = pd.DatetimeIndex(pd.to_datetime(features.index, errors="coerce"))
+    if getattr(features.index, "tz", None) is not None:
+        features.index = features.index.tz_localize(None)
+    features.index = features.index.normalize()
+    features = features[~features.index.isna()].sort_index()
+    features = features[~features.index.duplicated(keep="last")]
 
     close = _normalize_close_series(price_data)
     if close.empty:

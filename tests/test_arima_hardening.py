@@ -118,6 +118,19 @@ class ArimaHardeningTests(unittest.TestCase):
         self.assertIsInstance(forecast.index, pd.DatetimeIndex)
         self.assertIsNotNone(forecast.index.freq)
 
+    @unittest.skipUnless(arima_hardening.ARIMA_AVAILABLE, "statsmodels not installed")
+    def test_fit_handles_timezone_aware_daily_windows_across_calendar_boundaries(self):
+        full_index = pd.bdate_range("2024-01-02", periods=260).tz_localize("America/New_York")
+        values = np.linspace(100.0, 125.0, num=len(full_index)) + np.sin(np.arange(len(full_index)) / 8.0)
+        series = pd.Series(values, index=full_index)
+        window_starts = [0, 7, 14, 28, 56, 112]
+
+        for start in window_starts:
+            window = series.iloc[start : start + 60]
+            forecast = arima_hardening.fit_arima_with_hardening(window, order=(1, 0, 0), logger=MagicMock()).forecast(steps=5)
+            self.assertIsInstance(forecast.index, pd.DatetimeIndex)
+            self.assertIsNotNone(forecast.index.freq)
+
     def test_supported_datetime_index_handles_non_holiday_gaps(self):
         business_days = pd.bdate_range("2024-01-02", periods=90)
         market_holidays = pd.DatetimeIndex(
