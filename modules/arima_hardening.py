@@ -61,17 +61,20 @@ def _with_supported_datetime_index(series: pd.Series | np.ndarray) -> pd.Series 
     if index.hasnans:
         return prepared
     if getattr(index, "tz", None) is not None:
-        index = index.tz_localize(None)
+        index = index.tz_convert(None)
     if not index.is_monotonic_increasing:
         prepared = prepared.sort_index()
         index = pd.DatetimeIndex(prepared.index)
         if getattr(index, "tz", None) is not None:
-            index = index.tz_localize(None)
+            index = index.tz_convert(None)
 
     normalized = pd.DatetimeIndex(index.normalize())
     if normalized.has_duplicates:
         prepared.index = normalized
-        return prepared
+        prepared = prepared[~prepared.index.duplicated(keep="last")]
+        normalized = pd.DatetimeIndex(prepared.index)
+        if len(normalized) < 2:
+            return prepared
 
     if getattr(normalized, "freq", None) is not None:
         prepared.index = normalized
