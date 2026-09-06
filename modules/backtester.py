@@ -81,6 +81,10 @@ def _rmse(actual: np.ndarray, pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((actual[:n] - pred[:n]) ** 2)))
 
 
+# Keep synchronized with rolling/min_period windows in modules.feature_engineering._technical_features.
+_LIGHTGBM_FEATURE_WARMUP_DAYS = max((10, 30, 12, 26, 14, 20))
+
+
 def _select_arima_order(series: pd.Series) -> tuple[int, int, int]:
     if not ARIMA_AVAILABLE:
         return (5, 1, 0)
@@ -161,12 +165,19 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
             if evaluate_lightgbm and LIGHTGBM_AVAILABLE and lightgbm_horizon_matches_test:
                 try:
                     train_price = price_frame.iloc[start : start + train_len]
-                    features = build_feature_table(ticker, train_price, lookback_days=train_len)
+                    warmup_start = max(0, start - _LIGHTGBM_FEATURE_WARMUP_DAYS)
+                    train_end = start + train_len
+                    lightgbm_history = price_frame.iloc[warmup_start : train_end + int(lightgbm_horizon)]
+                    features = build_feature_table(
+                        ticker,
+                        lightgbm_history,
+                        lookback_days=len(lightgbm_history),
+                    )
                     datasets = build_return_training_examples(
                         ticker=ticker,
-                        price_data=train_price,
+                        price_data=lightgbm_history,
                         feature_table=features,
-                        lookback_days=train_len,
+                        lookback_days=len(lightgbm_history),
                         horizons=(lightgbm_horizon,),
                     )
                     if lightgbm_horizon not in datasets:
@@ -177,8 +188,22 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                             lightgbm_horizon,
                         )
                         continue
+                    x_train_all, y_train_all = datasets[lightgbm_horizon]
+                    x_train = x_train_all.reindex(train_price.index).dropna(how="all")
+                    y_train = y_train_all.reindex(x_train.index).dropna()
+                    x_train = x_train.reindex(y_train.index)
+                    if len(y_train) == 0:
+                        logger.warning(
+                            "LightGBM backtest skipped for %s at start=%d: no usable rows remain after training-window alignment",
+                            ticker.upper(),
+                            start,
+                        )
+                        continue
                     dynamic_min_rows = min(50, max(10, int(train_len / 3)))
-                    models = train_return_models(datasets, min_rows_per_horizon=dynamic_min_rows)
+                    models = train_return_models(
+                        {lightgbm_horizon: (x_train, y_train)},
+                        min_rows_per_horizon=dynamic_min_rows,
+                    )
                     if not models or lightgbm_horizon not in models:
                         logger.warning(
                             "LightGBM backtest skipped for %s at start=%d: no trained model for horizon %sd",
