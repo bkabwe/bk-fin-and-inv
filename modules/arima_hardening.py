@@ -61,23 +61,27 @@ def _with_supported_datetime_index(series: pd.Series | np.ndarray) -> pd.Series 
     if index.hasnans:
         return prepared
     if getattr(index, "tz", None) is not None:
-        index = index.tz_convert(None)
+        index = index.tz_localize(None)
     if not index.is_monotonic_increasing:
         prepared = prepared.sort_index()
         index = pd.DatetimeIndex(prepared.index)
         if getattr(index, "tz", None) is not None:
-            index = index.tz_convert(None)
+            index = index.tz_localize(None)
 
-    if getattr(index, "freq", None) is not None:
-        prepared.index = index
+    normalized = pd.DatetimeIndex(index.normalize())
+    if normalized.has_duplicates:
+        prepared.index = normalized
         return prepared
 
-    inferred = pd.infer_freq(index)
+    if getattr(normalized, "freq", None) is not None:
+        prepared.index = normalized
+        return prepared
+
+    inferred = pd.infer_freq(normalized)
     if inferred:
-        prepared.index = pd.DatetimeIndex(index, freq=inferred)
+        prepared.index = pd.DatetimeIndex(normalized, freq=inferred)
         return prepared
 
-    normalized = index.normalize()
     missing_business_days = pd.bdate_range(normalized.min(), normalized.max()).difference(normalized)
     calendar = _NYSEHolidayCalendar()
     known_market_holidays = pd.DatetimeIndex(
@@ -95,15 +99,15 @@ def _with_supported_datetime_index(series: pd.Series | np.ndarray) -> pd.Series 
     business_day_freq = CustomBusinessDay(holidays=supported_holidays)
     try:
         # Preserve observed trading-day values/timestamps without inserting rows.
-        prepared.index = pd.DatetimeIndex(index, freq=business_day_freq)
+        prepared.index = pd.DatetimeIndex(normalized, freq=business_day_freq)
     except ValueError:
         expected = pd.date_range(start=normalized.min(), end=normalized.max(), freq=business_day_freq)
         if len(expected) == len(normalized) and expected.equals(normalized):
-            idx_with_freq = pd.DatetimeIndex(index)
+            idx_with_freq = pd.DatetimeIndex(normalized)
             idx_with_freq.freq = business_day_freq
             prepared.index = idx_with_freq
         else:
-            prepared.index = index
+            prepared.index = normalized
     return prepared
 
 

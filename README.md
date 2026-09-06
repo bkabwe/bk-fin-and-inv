@@ -8,6 +8,16 @@ Comprehensive US stock analysis toolkit inspired by Richard W. Schabacker's tech
 pip install -r requirements.txt
 ```
 
+### macOS note for LightGBM
+
+On macOS, `lightgbm` also requires the OpenMP runtime (`libomp`) at the
+system level. If `import lightgbm` fails with a missing `libomp.dylib`
+error, install it with Homebrew:
+
+```bash
+brew install libomp
+```
+
 ## Optional environment variables
 
 - `POLYGON_API_KEY` — required for Polygon.io (Massive) market data, ticker

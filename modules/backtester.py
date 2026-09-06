@@ -148,8 +148,14 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                     order = _select_arima_order(train)
                     pred = fit_arima_with_hardening(train, order=order, logger=logger).forecast(steps=test_len)
                     arima_errors.append(_rmse(test_vals, np.array(pred.values, dtype=float)))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "ARIMA backtest window failed for %s at start=%d: %s: %s",
+                        ticker.upper(),
+                        start,
+                        type(exc).__name__,
+                        exc,
+                    )
 
             if SKLEARN_AVAILABLE:
                 try:

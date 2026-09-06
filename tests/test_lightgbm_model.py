@@ -70,6 +70,35 @@ class LightGBMModelTests(unittest.TestCase):
         self.assertEqual(len(x_train), 70)
         self.assertTrue(x_train.isna().any().any())
 
+    def test_training_examples_align_timezone_aware_close_with_daily_feature_index(self):
+        base_index = pd.bdate_range("2024-01-02", periods=120)
+        price_index = base_index.tz_localize("America/New_York")
+        close = np.linspace(100.0, 130.0, num=len(price_index))
+        price_data = pd.DataFrame(
+            {
+                "Close": close,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Volume": np.full(len(price_index), 1000.0),
+            },
+            index=price_index,
+        )
+        feature_table = pd.DataFrame(
+            {"technical_feature_a": np.linspace(0.0, 1.0, num=len(base_index))},
+            index=base_index,
+        )
+
+        examples = lightgbm_model.build_return_training_examples(
+            "AAPL",
+            price_data,
+            feature_table=feature_table,
+            horizons=(30,),
+        )
+
+        self.assertIn(30, examples)
+        _, y_train = examples[30]
+        self.assertGreater(len(y_train), 0)
+
     def test_build_examples_for_ticker_reuses_stock_data_fetch(self):
         price_data = _sample_price_data(length=120)
         with patch("modules.lightgbm_model.get_stock_data", return_value=price_data) as stock_data_mock:
