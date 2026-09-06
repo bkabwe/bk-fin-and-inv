@@ -255,6 +255,7 @@ def _build_feature_table_cached(
     table = _technical_features(price_frame)
     table = table.join(_fundamental_daily_features(ticker, table.index), how="left")
     table = table.join(_macro_daily_features(table.index), how="left")
+    table = table.apply(pd.to_numeric, errors="coerce").astype("float64")
     table.index.name = "Date"
 
     if lookback_days > 0 and len(table) > lookback_days:

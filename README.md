@@ -198,6 +198,11 @@ Because LightGBM is trained as fixed-horizon return models (`30/180/720` days),
 the walk-forward path maps each test window to the closest available horizon
 (e.g., 30-day test windows use the 30-day model) and converts the predicted
 return into a daily price path ending at that horizon for RMSE comparison.
+An earlier validation bug made this path report all-zero LightGBM window counts:
+macro-feature columns could remain object-typed when FRED data was unavailable,
+causing every per-window LightGBM fit to fail under the old silent `except`.
+Feature tables are now coerced back to numeric dtypes before training, and any
+remaining per-window LightGBM failure is logged with ticker/window context.
 
 To reproduce aggregate comparisons across a representative ticker sample:
 
@@ -214,6 +219,10 @@ settings: higher optimizer iteration budget, smarter initialization, and a
 single fallback retry with an alternate optimizer when convergence warnings occur.
 The ARIMA order-grid candidates and AIC selection logic are unchanged, preserving
 comparability with prior walk-forward results while reducing non-convergence risk.
+Those ARIMA paths now also attach an explicit supported business-day frequency to
+trading-day price series before fitting/predicting, so statsmodels keeps using
+calendar-aware forecast indexes instead of warning that the date index will be
+ignored in future releases.
 
 ### Failed-ticker visibility in screener results
 Exceptions during per-ticker analysis are no longer silently swallowed.

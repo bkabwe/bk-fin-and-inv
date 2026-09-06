@@ -96,6 +96,25 @@ class ArimaHardeningTests(unittest.TestCase):
         self.assertEqual(order, (0, 0, 0))
         self.assertTrue(fit_mock.called)
 
+    @unittest.skipUnless(arima_hardening.ARIMA_AVAILABLE, "statsmodels not installed")
+    def test_fit_assigns_supported_frequency_without_missing_index_warning(self):
+        business_days = pd.bdate_range("2024-01-02", periods=120)
+        market_holidays = pd.DatetimeIndex(
+            arima_hardening._NYSEHolidayCalendar().holidays(start=business_days.min(), end=business_days.max())
+        )
+        series_index = business_days.difference(market_holidays)
+        series = pd.Series(np.linspace(100.0, 120.0, num=len(series_index)), index=series_index)
+
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            forecast = arima_hardening.fit_arima_with_hardening(series, order=(1, 0, 0), logger=MagicMock()).forecast(steps=5)
+
+        messages = [str(item.message).lower() for item in captured]
+        self.assertFalse(any("no associated frequency information" in message for message in messages))
+        self.assertFalse(any("no supported index is available" in message for message in messages))
+        self.assertIsInstance(forecast.index, pd.DatetimeIndex)
+        self.assertIsNotNone(forecast.index.freq)
+
 
 if __name__ == "__main__":
     unittest.main()

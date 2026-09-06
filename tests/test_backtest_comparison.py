@@ -25,6 +25,10 @@ def _constant_price_frame(length: int = 120, value: float = 100.0) -> pd.DataFra
 
 
 class WalkForwardLightGBMTests(unittest.TestCase):
+    def setUp(self):
+        if hasattr(backtester.run_walk_forward, "clear"):
+            backtester.run_walk_forward.clear()
+
     def test_walk_forward_includes_lightgbm_rmse(self):
         data = _constant_price_frame()
         feature_table = pd.DataFrame({"feature_a": np.arange(60, dtype=float)}, index=data.index[:60])
@@ -50,7 +54,56 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertEqual(result["lightgbm_windows"], 2)
         self.assertEqual(result["lightgbm_rmse"], 0.0)
 
-    def test_walk_forward_lightgbm_failure_is_graceful(self):
+    @unittest.skipUnless(backtester.LIGHTGBM_AVAILABLE, "lightgbm not installed")
+    def test_walk_forward_trains_lightgbm_with_object_typed_macro_columns(self):
+        index = pd.bdate_range("2024-01-02", periods=180)
+        close = np.linspace(100.0, 130.0, num=len(index)) + np.sin(np.arange(len(index)) / 4.0)
+        data = pd.DataFrame(
+            {
+                "Close": close,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Volume": np.full(len(index), 1000.0, dtype=float),
+            },
+            index=index,
+        )
+
+        def _macro_table(start_date, end_date):
+            macro_index = pd.date_range(start_date, end_date, freq="B")
+            return pd.DataFrame(
+                {
+                    "dgs10_level": pd.Series([None] * len(macro_index), dtype="object"),
+                    "dgs10_delta_5d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "dgs10_pct_change_5d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "dgs10_delta_30d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "dgs10_pct_change_30d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "cpiaucsl_level": pd.Series([None] * len(macro_index), dtype="object"),
+                    "cpiaucsl_delta_5d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "cpiaucsl_pct_change_5d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "cpiaucsl_delta_30d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "cpiaucsl_pct_change_30d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "fedfunds_level": pd.Series([None] * len(macro_index), dtype="object"),
+                    "fedfunds_delta_5d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "fedfunds_pct_change_5d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "fedfunds_delta_30d": pd.Series([None] * len(macro_index), dtype="object"),
+                    "fedfunds_pct_change_30d": pd.Series([None] * len(macro_index), dtype="object"),
+                },
+                index=macro_index,
+            )
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.SKLEARN_AVAILABLE", False),
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", side_effect=_macro_table),
+        ):
+            result = backtester.run_walk_forward("AAPL-LGBM-REAL", data, evaluate_lightgbm=True)
+
+        self.assertGreater(result["lightgbm_windows"], 0)
+        self.assertNotEqual(result["lightgbm_rmse"], 1.0)
+        self.assertTrue(np.isfinite(float(result["lightgbm_rmse"])))
+
+    def test_walk_forward_lightgbm_failure_is_logged(self):
         data = _constant_price_frame()
         with (
             patch("modules.backtester.ARIMA_AVAILABLE", False),
@@ -58,10 +111,12 @@ class WalkForwardLightGBMTests(unittest.TestCase):
             patch("modules.backtester.LIGHTGBM_AVAILABLE", True),
             patch("modules.backtester.build_feature_table", side_effect=RuntimeError("boom")),
         ):
-            result = backtester.run_walk_forward("AAPL-LGBM-FAIL", data, evaluate_lightgbm=True)
+            with self.assertLogs("modules.backtester", level="WARNING") as captured:
+                result = backtester.run_walk_forward("AAPL-LGBM-FAIL", data, evaluate_lightgbm=True)
 
         self.assertEqual(result["lightgbm_rmse"], 1.0)
         self.assertEqual(result["lightgbm_windows"], 0)
+        self.assertTrue(any("LightGBM backtest window failed for AAPL-LGBM-FAIL" in message for message in captured.output))
 
 
 class BacktestComparisonSummaryTests(unittest.TestCase):
