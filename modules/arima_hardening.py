@@ -41,7 +41,7 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
         USPresidentsDay,
         GoodFriday,
         USMemorialDay,
-        Holiday("Juneteenth", month=6, day=19, observance=nearest_workday, start_date="2022-06-19"),
+        Holiday("Juneteenth", month=6, day=19, observance=nearest_workday, start_date="2021-06-19"),
         Holiday("IndependenceDay", month=7, day=4, observance=nearest_workday),
         USLaborDay,
         USThanksgivingDay,
