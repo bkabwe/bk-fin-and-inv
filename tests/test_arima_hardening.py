@@ -98,8 +98,11 @@ class ArimaHardeningTests(unittest.TestCase):
 
     @unittest.skipUnless(arima_hardening.ARIMA_AVAILABLE, "statsmodels not installed")
     def test_fit_assigns_supported_frequency_without_missing_index_warning(self):
-        business_days = pd.bdate_range("2024-01-02", periods=90)
-        series_index = business_days.difference(pd.DatetimeIndex(["2024-01-15", "2024-02-19"]))
+        business_days = pd.bdate_range("2024-01-02", periods=120)
+        market_holidays = pd.DatetimeIndex(
+            arima_hardening._NYSEHolidayCalendar().holidays(start=business_days.min(), end=business_days.max())
+        )
+        series_index = business_days.difference(market_holidays)
         series = pd.Series(np.linspace(100.0, 120.0, num=len(series_index)), index=series_index)
 
         with warnings.catch_warnings(record=True) as captured:
