@@ -170,31 +170,78 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                         horizons=(lightgbm_horizon,),
                     )
                     if lightgbm_horizon not in datasets:
+                        logger.warning(
+                            "LightGBM backtest skipped for %s at start=%d: no labeled rows for horizon %sd",
+                            ticker.upper(),
+                            start,
+                            lightgbm_horizon,
+                        )
                         continue
                     dynamic_min_rows = min(50, max(10, int(train_len / 3)))
                     models = train_return_models(datasets, min_rows_per_horizon=dynamic_min_rows)
                     if not models or lightgbm_horizon not in models:
+                        logger.warning(
+                            "LightGBM backtest skipped for %s at start=%d: no trained model for horizon %sd",
+                            ticker.upper(),
+                            start,
+                            lightgbm_horizon,
+                        )
                         continue
                     anchor_idx = train.index[-1]
                     if anchor_idx not in features.index:
+                        logger.warning(
+                            "LightGBM backtest skipped for %s at start=%d: anchor date %s missing from feature table",
+                            ticker.upper(),
+                            start,
+                            anchor_idx,
+                        )
                         continue
                     latest_row = features.loc[anchor_idx]
                     if latest_row.isna().all():
+                        logger.warning(
+                            "LightGBM backtest skipped for %s at start=%d: latest feature row is entirely NaN",
+                            ticker.upper(),
+                            start,
+                        )
                         continue
                     predicted_return = predict_forward_return(models[lightgbm_horizon], latest_row)
                     if predicted_return is None:
+                        logger.warning(
+                            "LightGBM backtest skipped for %s at start=%d: inference returned no prediction",
+                            ticker.upper(),
+                            start,
+                        )
                         continue
                     start_price = float(train.iloc[-1])
                     if start_price <= 0:
+                        logger.warning(
+                            "LightGBM backtest skipped for %s at start=%d: non-positive start price %.6f",
+                            ticker.upper(),
+                            start,
+                            start_price,
+                        )
                         continue
                     final_price = start_price * (1.0 + float(predicted_return))
                     if final_price <= 0:
+                        logger.warning(
+                            "LightGBM backtest skipped for %s at start=%d: predicted final price %.6f is non-positive",
+                            ticker.upper(),
+                            start,
+                            final_price,
+                        )
                         continue
                     growth = np.exp(np.log(final_price / start_price) / test_len)
                     pred_path = start_price * np.power(growth, np.arange(1, test_len + 1))
                     lightgbm_errors.append(_rmse(test_vals, pred_path.astype(float)))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "LightGBM backtest window failed for %s at start=%d horizon=%sd: %s: %s",
+                        ticker.upper(),
+                        start,
+                        lightgbm_horizon,
+                        type(exc).__name__,
+                        exc,
+                    )
 
         n_windows = max(len(arima_errors), len(trend_errors), len(lightgbm_errors))
         if n_windows == 0:

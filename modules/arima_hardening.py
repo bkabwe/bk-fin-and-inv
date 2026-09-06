@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import CustomBusinessDay
 
 try:  # pragma: no cover
     from statsmodels.tsa.arima.model import ARIMA
@@ -22,6 +23,45 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 ARIMA_MAXITER = 200
 
 
+def _with_supported_datetime_index(series: pd.Series | np.ndarray) -> pd.Series | np.ndarray:
+    if not isinstance(series, pd.Series):
+        return series
+
+    prepared = pd.to_numeric(series, errors="coerce").astype("float64").copy()
+    if not isinstance(prepared.index, pd.DatetimeIndex) or len(prepared.index) < 2:
+        return prepared
+
+    index = pd.DatetimeIndex(pd.to_datetime(prepared.index, errors="coerce"))
+    if index.hasnans:
+        return prepared
+    if getattr(index, "tz", None) is not None:
+        index = index.tz_convert(None)
+    if not index.is_monotonic_increasing:
+        prepared = prepared.sort_index()
+        index = pd.DatetimeIndex(prepared.index)
+        if getattr(index, "tz", None) is not None:
+            index = index.tz_convert(None)
+
+    if getattr(index, "freq", None) is not None:
+        prepared.index = index
+        return prepared
+
+    inferred = pd.infer_freq(index)
+    if inferred:
+        prepared.index = pd.DatetimeIndex(index, freq=inferred)
+        return prepared
+
+    normalized = index.normalize()
+    missing_business_days = pd.bdate_range(normalized.min(), normalized.max()).difference(normalized)
+    try:
+        # Preserve the original observed trading-day values and timestamps while marking
+        # missing business dates between observations as market-closure holidays.
+        prepared.index = pd.DatetimeIndex(index, freq=CustomBusinessDay(holidays=missing_business_days))
+    except ValueError:
+        prepared.index = index
+    return prepared
+
+
 def fit_arima_with_hardening(
     series: pd.Series | np.ndarray,
     order: tuple[int, int, int],
@@ -31,7 +71,7 @@ def fit_arima_with_hardening(
     if not ARIMA_AVAILABLE:
         raise RuntimeError("statsmodels ARIMA is not available")
 
-    model = ARIMA(series, order=order)
+    model = ARIMA(_with_supported_datetime_index(series), order=order)
     start_params = None
     try:
         initial = model.fit(method="innovations_mle")
