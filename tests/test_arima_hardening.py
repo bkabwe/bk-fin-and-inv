@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import CustomBusinessDay
 
 from modules import arima_hardening, backtester, scoring_engine
 
@@ -98,11 +99,13 @@ class ArimaHardeningTests(unittest.TestCase):
 
     @unittest.skipUnless(arima_hardening.ARIMA_AVAILABLE, "statsmodels not installed")
     def test_fit_assigns_supported_frequency_without_missing_index_warning(self):
-        business_days = pd.bdate_range("2024-01-02", periods=120)
+        business_days = pd.bdate_range("2024-01-02", periods=140)
         market_holidays = pd.DatetimeIndex(
             arima_hardening._NYSEHolidayCalendar().holidays(start=business_days.min(), end=business_days.max())
         )
-        series_index = business_days.difference(market_holidays)
+        trading_days = business_days.difference(market_holidays)
+        removed_positions = [9, 27, 54, 88]
+        series_index = trading_days.delete(removed_positions)
         series = pd.Series(np.linspace(100.0, 120.0, num=len(series_index)), index=series_index)
 
         with warnings.catch_warnings(record=True) as captured:
@@ -114,6 +117,21 @@ class ArimaHardeningTests(unittest.TestCase):
         self.assertFalse(any("no supported index is available" in message for message in messages))
         self.assertIsInstance(forecast.index, pd.DatetimeIndex)
         self.assertIsNotNone(forecast.index.freq)
+
+    def test_supported_datetime_index_handles_non_holiday_gaps(self):
+        business_days = pd.bdate_range("2024-01-02", periods=90)
+        market_holidays = pd.DatetimeIndex(
+            arima_hardening._NYSEHolidayCalendar().holidays(start=business_days.min(), end=business_days.max())
+        )
+        trading_days = business_days.difference(market_holidays)
+        series_index = trading_days.delete([4, 12, 33])
+        series = pd.Series(np.linspace(100.0, 105.0, num=len(series_index)), index=series_index)
+
+        prepared = arima_hardening._with_supported_datetime_index(series)
+
+        self.assertIsInstance(prepared.index, pd.DatetimeIndex)
+        self.assertIsNotNone(prepared.index.freq)
+        self.assertIsInstance(prepared.index.freq, CustomBusinessDay)
 
 
 if __name__ == "__main__":

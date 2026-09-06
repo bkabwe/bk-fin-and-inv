@@ -24,6 +24,22 @@ def _constant_price_frame(length: int = 120, value: float = 100.0) -> pd.DataFra
     )
 
 
+def _realistic_price_frame(length: int = 252) -> pd.DataFrame:
+    index = pd.bdate_range("2024-01-02", periods=length)
+    drift = np.linspace(0.0, 24.0, num=length)
+    wave = 2.5 * np.sin(np.arange(length) / 6.0)
+    close = 100.0 + drift + wave
+    return pd.DataFrame(
+        {
+            "Close": close,
+            "High": close + 1.2,
+            "Low": close - 1.2,
+            "Volume": 1_000_000.0 + (np.arange(length) % 15) * 5_000.0,
+        },
+        index=index,
+    )
+
+
 class WalkForwardLightGBMTests(unittest.TestCase):
     def setUp(self):
         if hasattr(backtester.run_walk_forward, "clear"):
@@ -102,6 +118,63 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertGreater(result["lightgbm_windows"], 0)
         self.assertNotEqual(result["lightgbm_rmse"], 1.0)
         self.assertTrue(np.isfinite(float(result["lightgbm_rmse"])))
+
+    def test_walk_forward_realistic_history_yields_non_fallback_lightgbm_windows(self):
+        data = _realistic_price_frame(length=252)
+        captured_training_row_indexes: list[pd.Index] = []
+
+        def _macro_table(start_date, end_date):
+            macro_index = pd.date_range(start_date, end_date, freq="B")
+            return pd.DataFrame(
+                {
+                    "dgs10_level": np.linspace(4.0, 4.4, num=len(macro_index)),
+                    "dgs10_delta_5d": np.zeros(len(macro_index)),
+                    "dgs10_pct_change_5d": np.zeros(len(macro_index)),
+                    "dgs10_delta_30d": np.zeros(len(macro_index)),
+                    "dgs10_pct_change_30d": np.zeros(len(macro_index)),
+                    "cpiaucsl_level": np.linspace(300.0, 302.0, num=len(macro_index)),
+                    "cpiaucsl_delta_5d": np.zeros(len(macro_index)),
+                    "cpiaucsl_pct_change_5d": np.zeros(len(macro_index)),
+                    "cpiaucsl_delta_30d": np.zeros(len(macro_index)),
+                    "cpiaucsl_pct_change_30d": np.zeros(len(macro_index)),
+                    "fedfunds_level": np.linspace(5.0, 5.1, num=len(macro_index)),
+                    "fedfunds_delta_5d": np.zeros(len(macro_index)),
+                    "fedfunds_pct_change_5d": np.zeros(len(macro_index)),
+                    "fedfunds_delta_30d": np.zeros(len(macro_index)),
+                    "fedfunds_pct_change_30d": np.zeros(len(macro_index)),
+                },
+                index=macro_index,
+            )
+
+        def _train_return_models(training_examples, min_rows_per_horizon=50, random_state=42):
+            dataset = training_examples.get(30)
+            if not dataset:
+                return None
+            x_train, y_train = dataset
+            captured_training_row_indexes.append(x_train.index)
+            return {30: object()} if len(y_train) >= int(min_rows_per_horizon) else None
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.SKLEARN_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", True),
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", side_effect=_macro_table),
+            patch("modules.backtester.train_return_models", side_effect=_train_return_models),
+            patch("modules.backtester.predict_forward_return", return_value=0.01),
+        ):
+            result = backtester.run_walk_forward("AAPL-LGBM-WARMUP", data, evaluate_lightgbm=True)
+
+        self.assertGreater(result["lightgbm_windows"], 0)
+        self.assertNotEqual(result["lightgbm_rmse"], 1.0)
+        self.assertTrue(np.isfinite(float(result["lightgbm_rmse"])))
+        self.assertGreater(len(captured_training_row_indexes), 0)
+        close_index = data["Close"].dropna().astype(float).tail(252).index
+        expected_starts = list(range(0, max(1, len(close_index) - (60 + 30) + 1), 30))[:10]
+        expected_windows = [close_index[start : start + 60] for start in expected_starts]
+        self.assertEqual(len(captured_training_row_indexes), len(expected_windows))
+        for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows):
+            self.assertTrue(captured_index.equals(expected_index))
 
     def test_walk_forward_lightgbm_failure_is_logged(self):
         data = _constant_price_frame()

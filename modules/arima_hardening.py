@@ -86,17 +86,24 @@ def _with_supported_datetime_index(series: pd.Series | np.ndarray) -> pd.Series 
     if len(missing_business_days) == 0:
         prepared.index = pd.DatetimeIndex(index, freq="B")
         return prepared
-    if not missing_business_days.isin(known_market_holidays).all():
-        prepared.index = index
-        return prepared
     holiday_start = normalized.min() - pd.DateOffset(years=1)
     holiday_end = normalized.max() + pd.DateOffset(years=5)
     supported_holidays = pd.DatetimeIndex(calendar.holidays(start=holiday_start, end=holiday_end)).normalize()
+    residual_missing_days = missing_business_days.difference(known_market_holidays)
+    if len(residual_missing_days) > 0:
+        supported_holidays = supported_holidays.union(residual_missing_days).normalize().unique().sort_values()
+    business_day_freq = CustomBusinessDay(holidays=supported_holidays)
     try:
         # Preserve observed trading-day values/timestamps without inserting rows.
-        prepared.index = pd.DatetimeIndex(index, freq=CustomBusinessDay(holidays=supported_holidays))
+        prepared.index = pd.DatetimeIndex(index, freq=business_day_freq)
     except ValueError:
-        prepared.index = index
+        expected = pd.date_range(start=normalized.min(), end=normalized.max(), freq=business_day_freq)
+        if len(expected) == len(normalized) and expected.equals(normalized):
+            idx_with_freq = pd.DatetimeIndex(index)
+            idx_with_freq.freq = business_day_freq
+            prepared.index = idx_with_freq
+        else:
+            prepared.index = index
     return prepared
 
 
