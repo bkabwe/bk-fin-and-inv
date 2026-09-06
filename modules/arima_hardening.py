@@ -5,6 +5,17 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar,
+    GoodFriday,
+    Holiday,
+    USLaborDay,
+    USMartinLutherKingJr,
+    USMemorialDay,
+    USPresidentsDay,
+    USThanksgivingDay,
+    nearest_workday,
+)
 from pandas.tseries.offsets import CustomBusinessDay
 
 try:  # pragma: no cover
@@ -21,6 +32,21 @@ except Exception:  # pragma: no cover
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 # Higher than statsmodels defaults to reduce ARIMA optimizer non-convergence on noisier equity series.
 ARIMA_MAXITER = 200
+
+
+class _NYSEHolidayCalendar(AbstractHolidayCalendar):
+    rules = [
+        Holiday("NewYearsDay", month=1, day=1, observance=nearest_workday),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday("Juneteenth", month=6, day=19, observance=nearest_workday, start_date="2022-06-19"),
+        Holiday("IndependenceDay", month=7, day=4, observance=nearest_workday),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday("ChristmasDay", month=12, day=25, observance=nearest_workday),
+    ]
 
 
 def _with_supported_datetime_index(series: pd.Series | np.ndarray) -> pd.Series | np.ndarray:
@@ -53,9 +79,17 @@ def _with_supported_datetime_index(series: pd.Series | np.ndarray) -> pd.Series 
 
     normalized = index.normalize()
     missing_business_days = pd.bdate_range(normalized.min(), normalized.max()).difference(normalized)
+    known_market_holidays = pd.DatetimeIndex(
+        _NYSEHolidayCalendar().holidays(start=normalized.min(), end=normalized.max())
+    ).normalize()
+    if len(missing_business_days) == 0:
+        prepared.index = pd.DatetimeIndex(index, freq="B")
+        return prepared
+    if not missing_business_days.isin(known_market_holidays).all():
+        prepared.index = index
+        return prepared
     try:
-        # Preserve the original observed trading-day values and timestamps while marking
-        # missing business dates between observations as market-closure holidays.
+        # Preserve observed trading-day values/timestamps without inserting rows.
         prepared.index = pd.DatetimeIndex(index, freq=CustomBusinessDay(holidays=missing_business_days))
     except ValueError:
         prepared.index = index
