@@ -339,9 +339,32 @@ class WalkForwardLightGBMTests(unittest.TestCase):
             with self.assertLogs("modules.backtester", level="WARNING") as captured:
                 result = backtester.run_walk_forward("AAPL-LGBM-FAIL", data, evaluate_lightgbm=True)
 
-        self.assertEqual(result["lightgbm_rmse"], 1.0)
+        self.assertIsNone(result["lightgbm_rmse"])
         self.assertEqual(result["lightgbm_windows"], 0)
         self.assertTrue(any("LightGBM backtest window failed for AAPL-LGBM-FAIL" in message for message in captured.output))
+
+    def test_walk_forward_reports_none_lightgbm_rmse_with_zero_lightgbm_windows_and_valid_trend_windows(self):
+        data = _constant_price_frame(length=150, value=100.0)
+
+        class _FakeLinearRegression:
+            def fit(self, x, y):
+                return self
+
+            def predict(self, future):
+                return np.log(np.full(len(future), 100.0))
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.SKLEARN_AVAILABLE", True),
+            patch("modules.backtester.LinearRegression", _FakeLinearRegression),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", True),
+            patch("modules.backtester.build_feature_table", side_effect=RuntimeError("boom")),
+        ):
+            result = backtester.run_walk_forward("AAPL-LGBM-NONE", data, evaluate_lightgbm=True)
+
+        self.assertGreater(result["trend_windows"], 0)
+        self.assertEqual(result["lightgbm_windows"], 0)
+        self.assertIsNone(result["lightgbm_rmse"])
 
     def test_walk_forward_reports_naive_no_change_baseline_rmse(self):
         index = pd.date_range("2024-01-01", periods=120, freq="D")
