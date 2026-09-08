@@ -67,12 +67,16 @@ def _weighted_median(weighted_values: list[tuple[float, int]]) -> float | None:
 
 
 def summarize_backtest_results(per_ticker: list[dict]) -> dict:
-    models = ("arima", "trend", "lightgbm")
+    models = ["arima", "trend", "lightgbm"]
+    if any(("naive_rmse" in row or "naive_windows" in row) for row in per_ticker):
+        models.append("naive")
     rmse_values: dict[str, list[tuple[float, int]]] = {model: [] for model in models}
     ticker_counts: dict[str, int] = {model: 0 for model in models}
     window_counts: dict[str, int] = {model: 0 for model in models}
     lightgbm_wins = 0
     lightgbm_compared = 0
+    lightgbm_vs_naive_wins = 0
+    lightgbm_vs_naive_compared = 0
 
     for row in per_ticker:
         for model in models:
@@ -91,6 +95,10 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
             lightgbm_compared += 1
             if float(row["lightgbm_rmse"]) < float(row["arima_rmse"]) and float(row["lightgbm_rmse"]) < float(row["trend_rmse"]):
                 lightgbm_wins += 1
+        if int(row.get("lightgbm_windows", 0) or 0) > 0 and int(row.get("naive_windows", 0) or 0) > 0:
+            lightgbm_vs_naive_compared += 1
+            if float(row["lightgbm_rmse"]) < float(row["naive_rmse"]):
+                lightgbm_vs_naive_wins += 1
 
     model_summary = {
         model: {
@@ -102,6 +110,11 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
         for model in models
     }
     win_pct = round((lightgbm_wins / lightgbm_compared) * 100.0, 2) if lightgbm_compared > 0 else 0.0
+    naive_win_pct = (
+        round((lightgbm_vs_naive_wins / lightgbm_vs_naive_compared) * 100.0, 2)
+        if lightgbm_vs_naive_compared > 0
+        else 0.0
+    )
     return {
         "total_tickers": int(len(per_ticker)),
         "models": model_summary,
@@ -109,6 +122,11 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
             "wins": int(lightgbm_wins),
             "comparable_tickers": int(lightgbm_compared),
             "win_pct": win_pct,
+        },
+        "lightgbm_wins_vs_naive": {
+            "wins": int(lightgbm_vs_naive_wins),
+            "comparable_tickers": int(lightgbm_vs_naive_compared),
+            "win_pct": naive_win_pct,
         },
     }
 
@@ -118,6 +136,8 @@ def run_lightgbm_backtest_comparison(
     sample_size: int = 30,
     period: str = "2y",
     interval: str = "1d",
+    evaluate_naive_baseline: bool = False,
+    lightgbm_diagnostics: bool = False,
 ) -> dict:
     if tickers is None:
         try:
@@ -131,7 +151,13 @@ def run_lightgbm_backtest_comparison(
     per_ticker: list[dict] = []
     for ticker in sample:
         data = get_stock_data(ticker, period=period, interval=interval)
-        result = run_walk_forward(ticker, data, evaluate_lightgbm=True)
+        result = run_walk_forward(
+            ticker,
+            data,
+            evaluate_lightgbm=True,
+            evaluate_naive_baseline=evaluate_naive_baseline,
+            lightgbm_diagnostics=lightgbm_diagnostics,
+        )
         per_ticker.append({"ticker": ticker, **result})
 
     summary = summarize_backtest_results(per_ticker)
@@ -144,7 +170,10 @@ def format_comparison_summary(summary: dict) -> str:
         "Model      Mean RMSE  Median RMSE  Tickers  Windows",
         "---------  ---------  -----------  -------  -------",
     ]
-    for model in ("arima", "trend", "lightgbm"):
+    ordered_models = ["arima", "trend", "lightgbm"]
+    if "naive" in models:
+        ordered_models.append("naive")
+    for model in ordered_models:
         values = models.get(model, {})
         mean_rmse = values.get("mean_rmse")
         median_rmse = values.get("median_rmse")
@@ -156,6 +185,7 @@ def format_comparison_summary(summary: dict) -> str:
             f"{int(values.get('windows_evaluated', 0)):>7}"
         )
     wins = summary.get("lightgbm_wins_vs_both", {})
+    naive_wins = summary.get("lightgbm_wins_vs_naive", {})
     lines.extend(
         [
             "",
@@ -163,4 +193,9 @@ def format_comparison_summary(summary: dict) -> str:
             f"tickers ({wins.get('win_pct', 0.0):.2f}%)",
         ]
     )
+    if int(naive_wins.get("comparable_tickers", 0)) > 0:
+        lines.append(
+            f"LightGBM better than naive no-change baseline: {naive_wins.get('wins', 0)}/"
+            f"{naive_wins.get('comparable_tickers', 0)} tickers ({naive_wins.get('win_pct', 0.0):.2f}%)"
+        )
     return "\n".join(lines)

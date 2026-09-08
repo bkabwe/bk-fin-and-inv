@@ -324,6 +324,73 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertEqual(result["lightgbm_windows"], 0)
         self.assertTrue(any("LightGBM backtest window failed for AAPL-LGBM-FAIL" in message for message in captured.output))
 
+    def test_walk_forward_reports_naive_no_change_baseline_rmse(self):
+        index = pd.date_range("2024-01-01", periods=120, freq="D")
+        close = 100.0 + np.arange(120, dtype=float)
+        data = pd.DataFrame(
+            {
+                "Close": close,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Volume": np.full(len(index), 1000.0, dtype=float),
+            },
+            index=index,
+        )
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.SKLEARN_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            result = backtester.run_walk_forward(
+                "AAPL-NAIVE",
+                data,
+                evaluate_lightgbm=False,
+                evaluate_naive_baseline=True,
+            )
+
+        expected_rmse = float(np.sqrt(np.mean(np.square(np.arange(1, 31, dtype=float)))))
+        self.assertEqual(result["naive_windows"], 2)
+        self.assertAlmostEqual(result["naive_rmse"], round(expected_rmse, 6), places=6)
+
+    @unittest.skipUnless(backtester.LIGHTGBM_AVAILABLE, "lightgbm not installed")
+    def test_walk_forward_lightgbm_diagnostics_capture_near_constant_predictions(self):
+        data = _realistic_price_frame(length=252)
+
+        def _build_features(_ticker, price_data, lookback_days=0):
+            return pd.DataFrame({"feature_a": np.arange(len(price_data), dtype=float)}, index=price_data.index)
+
+        def _build_examples(**kwargs):
+            feature_table = kwargs["feature_table"]
+            x_train = pd.DataFrame({"feature_a": np.zeros(len(feature_table), dtype=float)}, index=feature_table.index)
+            y_train = pd.Series(np.full(len(feature_table), 0.0025, dtype=float), index=feature_table.index)
+            return {30: (x_train, y_train)}
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.SKLEARN_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", True),
+            patch("modules.backtester.build_feature_table", side_effect=_build_features),
+            patch("modules.backtester.build_return_training_examples", side_effect=_build_examples),
+        ):
+            result = backtester.run_walk_forward(
+                "AAPL-LGBM-DIAG",
+                data,
+                evaluate_lightgbm=True,
+                lightgbm_diagnostics=True,
+            )
+
+        diagnostics = result["lightgbm_diagnostics"]
+        prediction_stats = diagnostics["prediction_stats"]
+        per_window = diagnostics["per_window"]
+        self.assertGreater(result["lightgbm_windows"], 0)
+        self.assertEqual(len(per_window), result["lightgbm_windows"])
+        self.assertIsNotNone(prediction_stats)
+        self.assertEqual(prediction_stats["std"], 0.0)
+        self.assertEqual(prediction_stats["min"], prediction_stats["max"])
+        realized_returns = {round(float(row["realized_return"]), 8) for row in per_window}
+        self.assertGreater(len(realized_returns), 1)
+
     @unittest.skipUnless(backtester.ARIMA_AVAILABLE, "statsmodels not installed")
     def test_walk_forward_timezone_aware_history_keeps_all_arima_windows(self):
         index = pd.bdate_range("2024-01-02", periods=252).tz_localize("America/New_York")
@@ -395,6 +462,38 @@ class BacktestComparisonSummaryTests(unittest.TestCase):
         sp500_mock.assert_not_called()
         self.assertEqual(result["sample_tickers"], [])
         self.assertEqual(result["summary"]["total_tickers"], 0)
+
+    def test_summarize_backtest_results_includes_naive_model_and_comparison(self):
+        rows = [
+            {
+                "ticker": "AAA",
+                "arima_rmse": 2.0,
+                "trend_rmse": 2.5,
+                "lightgbm_rmse": 1.5,
+                "naive_rmse": 1.7,
+                "arima_windows": 3,
+                "trend_windows": 3,
+                "lightgbm_windows": 3,
+                "naive_windows": 3,
+            },
+            {
+                "ticker": "BBB",
+                "arima_rmse": 1.0,
+                "trend_rmse": 0.8,
+                "lightgbm_rmse": 1.2,
+                "naive_rmse": 1.1,
+                "arima_windows": 2,
+                "trend_windows": 2,
+                "lightgbm_windows": 2,
+                "naive_windows": 2,
+            },
+        ]
+        summary = summarize_backtest_results(rows)
+        self.assertIn("naive", summary["models"])
+        self.assertEqual(summary["models"]["naive"]["windows_evaluated"], 5)
+        self.assertEqual(summary["lightgbm_wins_vs_naive"]["wins"], 1)
+        self.assertEqual(summary["lightgbm_wins_vs_naive"]["comparable_tickers"], 2)
+        self.assertEqual(summary["lightgbm_wins_vs_naive"]["win_pct"], 50.0)
 
 
 if __name__ == "__main__":
