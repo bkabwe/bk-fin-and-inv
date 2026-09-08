@@ -252,6 +252,11 @@ def _empty_ohlcv() -> pd.DataFrame:
     return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
 
+def _coerce_aggregate_value(value: Any) -> float:
+    numeric = pd.to_numeric(value, errors="coerce")
+    return float(numeric) if pd.notna(numeric) else float("nan")
+
+
 @cache_data(ttl=3600)
 def get_aggregates_range(
     ticker: str,
@@ -280,11 +285,11 @@ def get_aggregates_range(
         rows.append(
             {
                 "Date": pd.to_datetime(item.get("t"), unit="ms", utc=True, errors="coerce"),
-                "Open": float(item.get("o", 0) or 0),
-                "High": float(item.get("h", 0) or 0),
-                "Low": float(item.get("l", 0) or 0),
-                "Close": float(item.get("c", 0) or 0),
-                "Volume": float(item.get("v", 0) or 0),
+                "Open": _coerce_aggregate_value(item.get("o")),
+                "High": _coerce_aggregate_value(item.get("h")),
+                "Low": _coerce_aggregate_value(item.get("l")),
+                "Close": _coerce_aggregate_value(item.get("c")),
+                "Volume": _coerce_aggregate_value(item.get("v")),
             }
         )
 

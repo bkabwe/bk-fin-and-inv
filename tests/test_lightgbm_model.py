@@ -106,6 +106,29 @@ class LightGBMModelTests(unittest.TestCase):
         stock_data_mock.assert_called_once_with("AAPL", period="5y", interval="1d")
         self.assertIn(30, examples)
 
+    def test_training_examples_exclude_extreme_forward_return_labels_and_keep_surrounding_examples(self):
+        price_data = _sample_price_data(length=100)
+        anomalous_date = price_data.index[20]
+        price_data.loc[anomalous_date, "Close"] = 10.0
+        feature_table = _sample_feature_table(length=100, include_nans=False)
+
+        with self.assertLogs("modules.lightgbm_model", level="WARNING") as logs:
+            examples = lightgbm_model.build_return_training_examples(
+                "AIM",
+                price_data,
+                feature_table=feature_table,
+                horizons=(30,),
+            )
+
+        x_train, y_train = examples[30]
+        self.assertEqual(len(x_train), 69)
+        self.assertEqual(len(y_train), 69)
+        self.assertNotIn(anomalous_date, x_train.index)
+        self.assertIn(price_data.index[19], x_train.index)
+        self.assertIn(price_data.index[21], x_train.index)
+        self.assertLessEqual(float(y_train.max()), lightgbm_model.MAX_FORWARD_RETURN_LABEL_30D)
+        self.assertTrue(any("Excluding LightGBM training label for AIM horizon=30d" in message for message in logs.output))
+
     @unittest.skipUnless(lightgbm_model.LIGHTGBM_AVAILABLE, "lightgbm not installed")
     def test_train_save_load_and_infer(self):
         price_data = _sample_price_data(length=900)

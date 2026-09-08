@@ -14,6 +14,10 @@ logger = get_logger(__name__)
 
 RETURN_HORIZONS = (30, 180, 720)
 MIN_TRAINING_ROWS_PER_HORIZON = 50
+MIN_FORWARD_RETURN_LABEL = -1.0
+MAX_FORWARD_RETURN_LABEL_30D = 5.0
+MAX_FORWARD_RETURN_LABEL_180D = 10.0
+MAX_FORWARD_RETURN_LABEL_LONG = 20.0
 
 try:  # pragma: no cover
     from lightgbm import LGBMRegressor
@@ -32,6 +36,14 @@ def _normalize_close_series(price_data: pd.DataFrame) -> pd.Series:
     frame = frame[~frame.index.isna()].sort_index()
     frame = frame[~frame.index.duplicated(keep="last")]
     return frame["Close"]
+
+
+def _label_sanity_bounds(horizon: int) -> tuple[float, float]:
+    if int(horizon) <= 30:
+        return MIN_FORWARD_RETURN_LABEL, MAX_FORWARD_RETURN_LABEL_30D
+    if int(horizon) <= 180:
+        return MIN_FORWARD_RETURN_LABEL, MAX_FORWARD_RETURN_LABEL_180D
+    return MIN_FORWARD_RETURN_LABEL, MAX_FORWARD_RETURN_LABEL_LONG
 
 
 def build_return_training_examples(
@@ -61,8 +73,36 @@ def build_return_training_examples(
     datasets: dict[int, tuple[pd.DataFrame, pd.Series]] = {}
 
     for horizon in horizons:
-        target = (aligned["Close"].shift(-horizon) - aligned["Close"]) / aligned["Close"]
-        mask = target.notna() & aligned["Close"].notna()
+        future_close = aligned["Close"].shift(-horizon)
+        future_dates = aligned.index.to_series().shift(-horizon)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            target = (future_close - aligned["Close"]) / aligned["Close"]
+        min_label, max_label = _label_sanity_bounds(int(horizon))
+        price_mask = aligned["Close"].gt(0) & future_close.gt(0)
+        finite_mask = pd.Series(np.isfinite(target.to_numpy(dtype="float64", copy=False)), index=target.index)
+        bound_mask = target.between(min_label, max_label, inclusive="both")
+        mask = target.notna() & price_mask & finite_mask & bound_mask
+        excluded = target.loc[target.notna() & ~mask]
+        for current_date, label in excluded.items():
+            future_date = future_dates.get(current_date)
+            current_close = aligned.at[current_date, "Close"]
+            future_close_value = future_close.get(current_date)
+            logger.warning(
+                (
+                    "Excluding LightGBM training label for %s horizon=%sd "
+                    "current_date=%s future_date=%s current_close=%.6f future_close=%.6f forward_return=%.6f "
+                    "allowed_range=[%.2f, %.2f]"
+                ),
+                str(ticker).upper(),
+                int(horizon),
+                pd.Timestamp(current_date).date().isoformat(),
+                pd.Timestamp(future_date).date().isoformat() if pd.notna(future_date) else "n/a",
+                float(current_close) if pd.notna(current_close) else float("nan"),
+                float(future_close_value) if pd.notna(future_close_value) else float("nan"),
+                float(label),
+                float(min_label),
+                float(max_label),
+            )
         if not mask.any():
             continue
         datasets[int(horizon)] = (aligned.loc[mask, feature_columns], target.loc[mask].astype("float64"))
