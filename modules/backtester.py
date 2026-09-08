@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from functools import lru_cache
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -9,7 +9,6 @@ from modules.arima_hardening import ARIMA_AVAILABLE, fit_arima_with_hardening
 from modules.feature_engineering import build_feature_table, normalize_daily_index
 from modules.lightgbm_model import (
     LIGHTGBM_AVAILABLE,
-    RETURN_HORIZONS,
     build_return_training_examples,
     predict_forward_return,
     train_return_models,
@@ -83,6 +82,64 @@ def _rmse(actual: np.ndarray, pred: np.ndarray) -> float:
 
 # Keep synchronized with rolling/min_period windows in modules.feature_engineering._technical_features.
 _LIGHTGBM_FEATURE_WARMUP_DAYS = max((10, 30, 12, 26, 14, 20))
+DEFAULT_WALK_FORWARD_HORIZON = 30
+
+
+@dataclass(frozen=True)
+class WalkForwardWindowConfig:
+    horizon: int
+    train_len: int
+    test_len: int
+    stride: int
+    max_history_rows: int
+    default_period: str
+    max_windows: int = 10
+
+
+_WALK_FORWARD_WINDOW_CONFIGS: dict[int, WalkForwardWindowConfig] = {
+    30: WalkForwardWindowConfig(
+        horizon=30,
+        train_len=60,
+        test_len=30,
+        stride=30,
+        max_history_rows=252,
+        default_period="2y",
+    ),
+    180: WalkForwardWindowConfig(
+        horizon=180,
+        train_len=360,
+        test_len=180,
+        stride=180,
+        max_history_rows=1260,
+        default_period="5y",
+    ),
+    # Polygon Starter history is capped at ~5y (~1260 trading rows), so a clean 720d holdout
+    # can realistically support only a single non-overlapping backtest window per ticker.
+    720: WalkForwardWindowConfig(
+        horizon=720,
+        train_len=540,
+        test_len=720,
+        stride=720,
+        max_history_rows=1260,
+        default_period="5y",
+    ),
+}
+
+
+def get_walk_forward_window_config(horizon: int = DEFAULT_WALK_FORWARD_HORIZON) -> WalkForwardWindowConfig:
+    config = _WALK_FORWARD_WINDOW_CONFIGS.get(int(horizon))
+    if config is None:
+        supported = ", ".join(str(value) for value in sorted(_WALK_FORWARD_WINDOW_CONFIGS))
+        raise ValueError(f"Unsupported walk-forward horizon: {horizon}. Supported horizons: {supported}")
+    return config
+
+
+def _compute_walk_forward_starts(close_len: int, config: WalkForwardWindowConfig) -> list[int]:
+    required_rows = int(config.train_len + config.test_len)
+    if int(close_len) < required_rows:
+        return []
+    last_start = int(close_len) - required_rows + 1
+    return list(range(0, last_start, int(config.stride)))[: int(config.max_windows)]
 
 
 def _normalize_lightgbm_price_frame(price_frame: pd.DataFrame) -> pd.DataFrame:
@@ -115,6 +172,7 @@ def _select_arima_order(series: pd.Series) -> tuple[int, int, int]:
 def run_walk_forward(
     ticker: str,
     data: pd.DataFrame,
+    horizon: int = DEFAULT_WALK_FORWARD_HORIZON,
     evaluate_lightgbm: bool = False,
     evaluate_naive_baseline: bool = False,
     lightgbm_diagnostics: bool = False,
@@ -134,33 +192,29 @@ def run_walk_forward(
     if lightgbm_diagnostics:
         default["lightgbm_diagnostics"] = {"per_window": [], "prediction_stats": None}
     try:
-        if data is None or data.empty or "Close" not in data or len(data) < 120:
+        config = get_walk_forward_window_config(horizon)
+        minimum_required_rows = max(120, int(config.train_len + config.test_len))
+        if data is None or data.empty or "Close" not in data or len(data) < minimum_required_rows:
             return default
 
-        close = data["Close"].dropna().astype(float).tail(252)
-        if len(close) < 120:
+        close = data["Close"].dropna().astype(float).tail(int(config.max_history_rows))
+        if len(close) < minimum_required_rows:
             return default
         price_frame = data.copy().reindex(close.index)
         lightgbm_price_frame = _normalize_lightgbm_price_frame(price_frame)
-
-        train_len = 60
-        test_len = 30
-        stride = 30
-
-        starts = list(range(0, max(1, len(close) - (train_len + test_len) + 1), stride))[:10]
+        starts = _compute_walk_forward_starts(len(close), config)
 
         arima_errors: list[float] = []
         trend_errors: list[float] = []
         lightgbm_errors: list[float] = []
         naive_errors: list[float] = []
         lightgbm_diagnostic_rows: list[dict[str, float | int]] = []
-        lightgbm_horizon = min(RETURN_HORIZONS, key=lambda horizon: abs(int(horizon) - test_len))
-        lightgbm_horizon_matches_test = int(lightgbm_horizon) == int(test_len)
+        lightgbm_horizon = int(config.horizon)
 
         for start in starts:
-            train = close.iloc[start : start + train_len]
-            test = close.iloc[start + train_len : start + train_len + test_len]
-            if len(train) < train_len or len(test) < test_len:
+            train = close.iloc[start : start + int(config.train_len)]
+            test = close.iloc[start + int(config.train_len) : start + int(config.train_len) + int(config.test_len)]
+            if len(train) < int(config.train_len) or len(test) < int(config.test_len):
                 continue
 
             test_vals = test.values.astype(float)
@@ -168,7 +222,7 @@ def run_walk_forward(
             if ARIMA_AVAILABLE:
                 try:
                     order = _select_arima_order(train)
-                    pred = fit_arima_with_hardening(train, order=order, logger=logger).forecast(steps=test_len)
+                    pred = fit_arima_with_hardening(train, order=order, logger=logger).forecast(steps=int(config.test_len))
                     arima_errors.append(_rmse(test_vals, np.array(pred.values, dtype=float)))
                 except Exception as exc:
                     logger.warning(
@@ -184,7 +238,7 @@ def run_walk_forward(
                     y = np.log(np.maximum(train.values.astype(float), 1e-9))
                     x = np.arange(len(y)).reshape(-1, 1)
                     model = LinearRegression().fit(x, y)
-                    x_future = np.arange(len(y), len(y) + test_len).reshape(-1, 1)
+                    x_future = np.arange(len(y), len(y) + int(config.test_len)).reshape(-1, 1)
                     pred = np.exp(model.predict(x_future))
                     trend_errors.append(_rmse(test_vals, pred))
                 except Exception:
@@ -192,14 +246,14 @@ def run_walk_forward(
 
             if evaluate_naive_baseline:
                 start_price = float(train.iloc[-1])
-                naive_pred = np.full(test_len, start_price, dtype=float)
+                naive_pred = np.full(int(config.test_len), start_price, dtype=float)
                 naive_errors.append(_rmse(test_vals, naive_pred))
 
-            if evaluate_lightgbm and LIGHTGBM_AVAILABLE and lightgbm_horizon_matches_test:
+            if evaluate_lightgbm and LIGHTGBM_AVAILABLE:
                 try:
-                    train_price = lightgbm_price_frame.iloc[start : start + train_len]
+                    train_price = lightgbm_price_frame.iloc[start : start + int(config.train_len)]
                     warmup_start = max(0, start - _LIGHTGBM_FEATURE_WARMUP_DAYS)
-                    train_end = start + train_len
+                    train_end = start + int(config.train_len)
                     lightgbm_history = lightgbm_price_frame.iloc[warmup_start : train_end + int(lightgbm_horizon)]
                     features = build_feature_table(
                         ticker,
@@ -232,7 +286,7 @@ def run_walk_forward(
                             start,
                         )
                         continue
-                    dynamic_min_rows = min(50, max(10, int(train_len / 3)))
+                    dynamic_min_rows = min(50, max(10, int(config.train_len / 3)))
                     models = train_return_models(
                         {lightgbm_horizon: (x_train, y_train)},
                         min_rows_per_horizon=dynamic_min_rows,
@@ -303,8 +357,8 @@ def run_walk_forward(
                             final_price,
                         )
                         continue
-                    growth = np.exp(np.log(final_price / start_price) / test_len)
-                    pred_path = start_price * np.power(growth, np.arange(1, test_len + 1))
+                    growth = np.exp(np.log(final_price / start_price) / int(config.test_len))
+                    pred_path = start_price * np.power(growth, np.arange(1, int(config.test_len) + 1))
                     lightgbm_errors.append(_rmse(test_vals, pred_path.astype(float)))
                 except Exception as exc:
                     logger.warning(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 
-from modules.backtester import run_walk_forward
+from modules.backtester import DEFAULT_WALK_FORWARD_HORIZON, get_walk_forward_window_config, run_walk_forward
 from modules.data_fetcher import get_sp500_tickers, get_stock_data
 from modules.logger import get_logger
 
@@ -150,13 +150,16 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
 def run_lightgbm_backtest_comparison(
     tickers: list[str] | None = None,
     sample_size: int = 30,
-    period: str = "2y",
+    period: str | None = None,
     interval: str = "1d",
+    horizon: int = DEFAULT_WALK_FORWARD_HORIZON,
     random_seed: int | None = None,
     ticker_offset: int = 0,
     evaluate_naive_baseline: bool = False,
     lightgbm_diagnostics: bool = False,
 ) -> dict:
+    config = get_walk_forward_window_config(horizon)
+    resolved_period = str(period or config.default_period)
     if tickers is None:
         try:
             universe = get_sp500_tickers()
@@ -175,10 +178,11 @@ def run_lightgbm_backtest_comparison(
 
     per_ticker: list[dict] = []
     for ticker in sample:
-        data = get_stock_data(ticker, period=period, interval=interval)
+        data = get_stock_data(ticker, period=resolved_period, interval=interval)
         result = run_walk_forward(
             ticker,
             data,
+            horizon=int(config.horizon),
             evaluate_lightgbm=True,
             evaluate_naive_baseline=evaluate_naive_baseline,
             lightgbm_diagnostics=lightgbm_diagnostics,
@@ -186,7 +190,19 @@ def run_lightgbm_backtest_comparison(
         per_ticker.append({"ticker": ticker, **result})
 
     summary = summarize_backtest_results(per_ticker)
-    return {"sample_tickers": sample, "per_ticker": per_ticker, "summary": summary}
+    return {
+        "horizon": int(config.horizon),
+        "period": resolved_period,
+        "window_config": {
+            "train_len": int(config.train_len),
+            "test_len": int(config.test_len),
+            "stride": int(config.stride),
+            "max_history_rows": int(config.max_history_rows),
+        },
+        "sample_tickers": sample,
+        "per_ticker": per_ticker,
+        "summary": summary,
+    }
 
 
 def format_comparison_summary(summary: dict) -> str:

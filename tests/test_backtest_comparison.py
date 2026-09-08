@@ -24,6 +24,20 @@ def _constant_price_frame(length: int = 120, value: float = 100.0) -> pd.DataFra
     )
 
 
+def _constant_business_price_frame(length: int = 120, value: float = 100.0) -> pd.DataFrame:
+    index = pd.bdate_range("2020-01-02", periods=length)
+    close = np.full(length, value, dtype=float)
+    return pd.DataFrame(
+        {
+            "Close": close,
+            "High": close + 1.0,
+            "Low": close - 1.0,
+            "Volume": np.full(length, 1000.0, dtype=float),
+        },
+        index=index,
+    )
+
+
 def _realistic_price_frame(length: int = 252) -> pd.DataFrame:
     index = pd.bdate_range("2024-01-02", periods=length)
     drift = np.linspace(0.0, 24.0, num=length)
@@ -353,6 +367,59 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertEqual(result["naive_windows"], 2)
         self.assertAlmostEqual(result["naive_rmse"], round(expected_rmse, 6), places=6)
 
+    def test_walk_forward_default_horizon_matches_explicit_30d_behavior(self):
+        data = _constant_price_frame()
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.SKLEARN_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            default_result = backtester.run_walk_forward(
+                "AAPL-DEFAULT-HORIZON",
+                data,
+                evaluate_lightgbm=False,
+                evaluate_naive_baseline=True,
+            )
+            explicit_result = backtester.run_walk_forward(
+                "AAPL-EXPLICIT-30D",
+                data,
+                horizon=30,
+                evaluate_lightgbm=False,
+                evaluate_naive_baseline=True,
+            )
+
+        self.assertEqual(default_result, explicit_result)
+
+    def test_walk_forward_horizon_specific_window_counts_document_thin_720d_evidence(self):
+        data = _constant_business_price_frame(length=1260)
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.SKLEARN_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            result_180 = backtester.run_walk_forward(
+                "AAPL-H180",
+                data,
+                horizon=180,
+                evaluate_lightgbm=False,
+                evaluate_naive_baseline=True,
+            )
+            result_720 = backtester.run_walk_forward(
+                "AAPL-H720",
+                data,
+                horizon=720,
+                evaluate_lightgbm=False,
+                evaluate_naive_baseline=True,
+            )
+
+        self.assertEqual(result_180["naive_windows"], 5)
+        self.assertEqual(result_180["n_windows"], 5)
+        self.assertEqual(result_720["naive_windows"], 1)
+        self.assertEqual(result_720["n_windows"], 1)
+        self.assertLess(result_720["naive_windows"], result_180["naive_windows"])
+
     @unittest.skipUnless(backtester.LIGHTGBM_AVAILABLE, "lightgbm not installed")
     def test_walk_forward_lightgbm_diagnostics_capture_near_constant_predictions(self):
         data = _realistic_price_frame(length=252)
@@ -510,6 +577,25 @@ class BacktestComparisonSummaryTests(unittest.TestCase):
             result = run_lightgbm_backtest_comparison(sample_size=3, ticker_offset=4)
 
         self.assertEqual(result["sample_tickers"], tickers[4:7])
+
+    def test_run_comparison_uses_horizon_specific_defaults_and_forwards_horizon(self):
+        tickers = ["TICKER001"]
+        stub_result = {"arima_rmse": 1.0, "trend_rmse": 1.0, "lightgbm_rmse": 1.0, "n_windows": 0}
+
+        with (
+            patch("modules.backtest_comparison.get_sp500_tickers", return_value=tickers),
+            patch("modules.backtest_comparison.get_stock_data", return_value=_constant_price_frame()) as stock_data_mock,
+            patch("modules.backtest_comparison.run_walk_forward", return_value=stub_result) as walk_forward_mock,
+        ):
+            result = run_lightgbm_backtest_comparison(sample_size=1, horizon=720)
+
+        stock_data_mock.assert_called_once_with("TICKER001", period="5y", interval="1d")
+        walk_forward_mock.assert_called_once()
+        self.assertEqual(walk_forward_mock.call_args.kwargs["horizon"], 720)
+        self.assertEqual(result["period"], "5y")
+        self.assertEqual(result["window_config"]["train_len"], 540)
+        self.assertEqual(result["window_config"]["test_len"], 720)
+        self.assertEqual(result["window_config"]["stride"], 720)
 
     def test_summarize_backtest_results_includes_naive_model_and_comparison(self):
         rows = [
