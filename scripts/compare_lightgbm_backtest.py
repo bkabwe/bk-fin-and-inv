@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from modules.backtest_comparison import format_comparison_summary, run_lightgbm_backtest_comparison
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compare walk-forward RMSE for ARIMA, trend, LightGBM, and validation diagnostics."
     )
@@ -19,6 +19,23 @@ def main() -> None:
     parser.add_argument("--period", type=str, default="2y", help="History period to fetch per ticker (default: 2y)")
     parser.add_argument("--interval", type=str, default="1d", help="Bar interval (default: 1d)")
     parser.add_argument("--tickers", nargs="*", default=None, help="Optional explicit ticker list")
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Optional seed used to shuffle the available ticker universe before sampling",
+    )
+    parser.add_argument(
+        "--ticker-offset",
+        type=int,
+        default=0,
+        help="Optional offset applied after any shuffle and before taking the sample (default: 0)",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     output = run_lightgbm_backtest_comparison(
@@ -26,6 +43,8 @@ def main() -> None:
         sample_size=max(1, int(args.sample_size)),
         period=args.period,
         interval=args.interval,
+        random_seed=args.random_seed,
+        ticker_offset=max(0, int(args.ticker_offset)),
         evaluate_naive_baseline=True,
         lightgbm_diagnostics=True,
     )

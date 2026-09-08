@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from modules import backtester
-from modules.backtest_comparison import run_lightgbm_backtest_comparison, summarize_backtest_results
+from modules.backtest_comparison import run_lightgbm_backtest_comparison, select_sample_tickers, summarize_backtest_results
 
 
 def _constant_price_frame(length: int = 120, value: float = 100.0) -> pd.DataFrame:
@@ -462,6 +462,54 @@ class BacktestComparisonSummaryTests(unittest.TestCase):
         sp500_mock.assert_not_called()
         self.assertEqual(result["sample_tickers"], [])
         self.assertEqual(result["summary"]["total_tickers"], 0)
+
+    def test_select_sample_tickers_preserves_default_order_without_seed(self):
+        tickers = [f"TICKER{i:03d}" for i in range(10)]
+        self.assertEqual(select_sample_tickers(tickers, sample_size=4), tickers[:4])
+
+    def test_run_comparison_reuses_same_seeded_sample(self):
+        tickers = [f"TICKER{i:03d}" for i in range(100)]
+        stub_result = {"arima_rmse": 1.0, "trend_rmse": 1.0, "lightgbm_rmse": 1.0, "n_windows": 0}
+
+        with (
+            patch("modules.backtest_comparison.get_sp500_tickers", return_value=tickers),
+            patch("modules.backtest_comparison.get_stock_data", return_value=_constant_price_frame()),
+            patch("modules.backtest_comparison.run_walk_forward", return_value=stub_result),
+        ):
+            first = run_lightgbm_backtest_comparison(sample_size=8, random_seed=42)
+            second = run_lightgbm_backtest_comparison(sample_size=8, random_seed=42)
+
+        self.assertEqual(first["sample_tickers"], second["sample_tickers"])
+        self.assertEqual([row["ticker"] for row in first["per_ticker"]], first["sample_tickers"])
+        self.assertEqual([row["ticker"] for row in second["per_ticker"]], second["sample_tickers"])
+
+    def test_run_comparison_changes_sample_with_different_seed(self):
+        tickers = [f"TICKER{i:03d}" for i in range(100)]
+        stub_result = {"arima_rmse": 1.0, "trend_rmse": 1.0, "lightgbm_rmse": 1.0, "n_windows": 0}
+
+        with (
+            patch("modules.backtest_comparison.get_sp500_tickers", return_value=tickers),
+            patch("modules.backtest_comparison.get_stock_data", return_value=_constant_price_frame()),
+            patch("modules.backtest_comparison.run_walk_forward", return_value=stub_result),
+        ):
+            first = run_lightgbm_backtest_comparison(sample_size=8, random_seed=7)
+            second = run_lightgbm_backtest_comparison(sample_size=8, random_seed=13)
+
+        self.assertNotEqual(first["sample_tickers"], second["sample_tickers"])
+        self.assertNotEqual(set(first["sample_tickers"]), set(second["sample_tickers"]))
+
+    def test_run_comparison_applies_ticker_offset_after_default_ordering(self):
+        tickers = [f"TICKER{i:03d}" for i in range(10)]
+        stub_result = {"arima_rmse": 1.0, "trend_rmse": 1.0, "lightgbm_rmse": 1.0, "n_windows": 0}
+
+        with (
+            patch("modules.backtest_comparison.get_sp500_tickers", return_value=tickers),
+            patch("modules.backtest_comparison.get_stock_data", return_value=_constant_price_frame()),
+            patch("modules.backtest_comparison.run_walk_forward", return_value=stub_result),
+        ):
+            result = run_lightgbm_backtest_comparison(sample_size=3, ticker_offset=4)
+
+        self.assertEqual(result["sample_tickers"], tickers[4:7])
 
     def test_summarize_backtest_results_includes_naive_model_and_comparison(self):
         rows = [

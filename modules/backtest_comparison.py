@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_sp500_tickers, get_stock_data
 from modules.logger import get_logger
@@ -38,6 +40,20 @@ DEFAULT_SAMPLE_TICKERS = [
     "NKE",
     "MCD",
 ]
+
+
+def select_sample_tickers(
+    tickers: list[str],
+    sample_size: int,
+    random_seed: int | None = None,
+    ticker_offset: int = 0,
+) -> list[str]:
+    sample = list(tickers)
+    if random_seed is not None:
+        random.Random(random_seed).shuffle(sample)
+    if ticker_offset > 0:
+        sample = sample[ticker_offset:]
+    return sample[:sample_size]
 
 
 def _weighted_mean(weighted_values: list[tuple[float, int]]) -> float | None:
@@ -136,17 +152,26 @@ def run_lightgbm_backtest_comparison(
     sample_size: int = 30,
     period: str = "2y",
     interval: str = "1d",
+    random_seed: int | None = None,
+    ticker_offset: int = 0,
     evaluate_naive_baseline: bool = False,
     lightgbm_diagnostics: bool = False,
 ) -> dict:
     if tickers is None:
         try:
-            sample = get_sp500_tickers()[:sample_size]
+            universe = get_sp500_tickers()
         except Exception as exc:
             logger.warning("Falling back to built-in sample tickers: %s", exc)
-            sample = DEFAULT_SAMPLE_TICKERS[:sample_size]
+            universe = DEFAULT_SAMPLE_TICKERS
     else:
-        sample = tickers[:sample_size]
+        universe = tickers
+
+    sample = select_sample_tickers(
+        universe,
+        sample_size=sample_size,
+        random_seed=random_seed,
+        ticker_offset=ticker_offset,
+    )
 
     per_ticker: list[dict] = []
     for ticker in sample:
