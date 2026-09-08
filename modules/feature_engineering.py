@@ -89,6 +89,13 @@ def _safe_float_series(values: tuple[float | int | None, ...]) -> pd.Series:
     return pd.Series(pd.to_numeric(list(values), errors="coerce"), dtype="float64")
 
 
+def normalize_daily_index(index_like) -> pd.DatetimeIndex:
+    index = pd.DatetimeIndex(pd.to_datetime(index_like, errors="coerce"))
+    if getattr(index, "tz", None) is not None:
+        index = index.tz_localize(None)
+    return index.normalize()
+
+
 def _normalize_price_frame(price_data: pd.DataFrame) -> pd.DataFrame:
     if price_data is None or price_data.empty:
         return pd.DataFrame(columns=["Close", "High", "Low", "Volume"])
@@ -97,10 +104,8 @@ def _normalize_price_frame(price_data: pd.DataFrame) -> pd.DataFrame:
         if col not in frame.columns:
             frame[col] = np.nan
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame.index = normalize_daily_index(frame.index)
     frame = frame[~frame.index.isna()].sort_index()
-    if getattr(frame.index, "tz", None) is not None:
-        frame.index = frame.index.tz_convert(None)
     return frame[["Close", "High", "Low", "Volume"]]
 
 

@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from modules.arima_hardening import ARIMA_AVAILABLE, fit_arima_with_hardening
-from modules.feature_engineering import build_feature_table
+from modules.feature_engineering import build_feature_table, normalize_daily_index
 from modules.lightgbm_model import (
     LIGHTGBM_AVAILABLE,
     RETURN_HORIZONS,
@@ -85,6 +85,14 @@ def _rmse(actual: np.ndarray, pred: np.ndarray) -> float:
 _LIGHTGBM_FEATURE_WARMUP_DAYS = max((10, 30, 12, 26, 14, 20))
 
 
+def _normalize_lightgbm_price_frame(price_frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = price_frame.copy()
+    normalized.index = normalize_daily_index(normalized.index)
+    normalized = normalized[~normalized.index.isna()].sort_index()
+    normalized = normalized[~normalized.index.duplicated(keep="last")]
+    return normalized
+
+
 def _select_arima_order(series: pd.Series) -> tuple[int, int, int]:
     if not ARIMA_AVAILABLE:
         return (5, 1, 0)
@@ -122,6 +130,7 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
         if len(close) < 120:
             return default
         price_frame = data.copy().reindex(close.index)
+        lightgbm_price_frame = _normalize_lightgbm_price_frame(price_frame)
 
         train_len = 60
         test_len = 30
@@ -170,10 +179,10 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
 
             if evaluate_lightgbm and LIGHTGBM_AVAILABLE and lightgbm_horizon_matches_test:
                 try:
-                    train_price = price_frame.iloc[start : start + train_len]
+                    train_price = lightgbm_price_frame.iloc[start : start + train_len]
                     warmup_start = max(0, start - _LIGHTGBM_FEATURE_WARMUP_DAYS)
                     train_end = start + train_len
-                    lightgbm_history = price_frame.iloc[warmup_start : train_end + int(lightgbm_horizon)]
+                    lightgbm_history = lightgbm_price_frame.iloc[warmup_start : train_end + int(lightgbm_horizon)]
                     features = build_feature_table(
                         ticker,
                         lightgbm_history,
@@ -218,7 +227,7 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                             lightgbm_horizon,
                         )
                         continue
-                    anchor_idx = train.index[-1]
+                    anchor_idx = train_price.index[-1]
                     if anchor_idx not in features.index:
                         logger.warning(
                             "LightGBM backtest skipped for %s at start=%d: anchor date %s missing from feature table",
