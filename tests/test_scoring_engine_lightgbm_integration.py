@@ -107,6 +107,35 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(projection), expected, places=6)
 
+    def test_short_and_medium_basis_preserve_configured_lightgbm_percent_when_other_models_missing(self):
+        backtest = {
+            "arima_rmse": 2.0,
+            "trend_rmse": 1.0,
+            "lightgbm_rmse": 0.9,
+            "n_windows": 4,
+            "lightgbm_windows": 4,
+        }
+
+        short_weights = scoring_engine._projection_model_weights(30, backtest, include_lightgbm=True)
+        medium_weights = scoring_engine._projection_model_weights(180, backtest, include_lightgbm=True)
+        _, short_basis, _ = scoring_engine._weighted_ensemble(
+            [
+                ("ARIMA", 100.0, short_weights["arima"]),
+                ("Trend", 110.0, short_weights["trend"]),
+                ("LightGBM", 120.0, short_weights["lightgbm"]),
+            ]
+        )
+        _, medium_basis, _ = scoring_engine._weighted_ensemble(
+            [
+                ("ARIMA", 150.0, medium_weights["arima"]),
+                ("Trend", 180.0, medium_weights["trend"]),
+                ("LightGBM", 210.0, medium_weights["lightgbm"]),
+            ]
+        )
+
+        self.assertIn("LightGBM(15%)", short_basis)
+        self.assertIn("LightGBM(8%)", medium_basis)
+
     def test_long_horizon_weights_explicitly_exclude_lightgbm(self):
         weights = scoring_engine._projection_model_weights(
             720,
@@ -130,7 +159,18 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
             patch("modules.scoring_engine.load_return_models", return_value={}) as load_mock,
             patch("modules.scoring_engine.predict_forward_return") as predict_mock,
             patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),
-            patch("modules.scoring_engine.run_walk_forward", return_value={"arima_rmse": 2.0, "trend_rmse": 1.0, "n_windows": 4}),
+            patch(
+                "modules.scoring_engine.run_walk_forward",
+                return_value={
+                    "arima_rmse": 2.0,
+                    "trend_rmse": 1.0,
+                    "lightgbm_rmse": 0.9,
+                    "n_windows": 4,
+                    "arima_windows": 4,
+                    "trend_windows": 4,
+                    "lightgbm_windows": 4,
+                },
+            ),
             patch("modules.scoring_engine._select_arima_order", return_value=(1, 1, 0)),
             patch("modules.scoring_engine.fit_arima_with_hardening", return_value=_FakeArimaFit()),
             patch("modules.scoring_engine.LinearRegression", _FakeLinearRegression),
@@ -176,7 +216,18 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
             patch("modules.scoring_engine.load_return_models", return_value={30: model_30, 180: model_180, 720: model_720}) as load_mock,
             patch("modules.scoring_engine.predict_forward_return", side_effect=_predict) as predict_mock,
             patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),
-            patch("modules.scoring_engine.run_walk_forward", return_value={"arima_rmse": 2.0, "trend_rmse": 1.0, "n_windows": 4}),
+            patch(
+                "modules.scoring_engine.run_walk_forward",
+                return_value={
+                    "arima_rmse": 2.0,
+                    "trend_rmse": 1.0,
+                    "lightgbm_rmse": 0.9,
+                    "n_windows": 4,
+                    "arima_windows": 4,
+                    "trend_windows": 4,
+                    "lightgbm_windows": 4,
+                },
+            ),
             patch("modules.scoring_engine._select_arima_order", return_value=(1, 1, 0)),
             patch("modules.scoring_engine.fit_arima_with_hardening", return_value=_FakeArimaFit()),
             patch("modules.scoring_engine.LinearRegression", _FakeLinearRegression),
@@ -195,6 +246,52 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         self.assertIn("LightGBM", result["short_term_basis"])
         self.assertIn("LightGBM", result["medium_term_basis"])
         self.assertNotIn("LightGBM", result["long_term_basis"])
+
+    def test_live_projection_excludes_30d_lightgbm_when_no_lightgbm_backtest_windows(self):
+        data = _sample_projection_data()
+        info = {"exchange": "NASDAQ", "marketCap": 5_000_000_000, "currentPrice": float(data["Close"].iloc[-1])}
+        technical = {
+            "resistance_levels": [135.0],
+            "indicators": {"bb_high": 134.0},
+        }
+        model_30 = object()
+        model_180 = object()
+
+        def _predict(model, _row):
+            return 0.10 if model is model_30 else 0.20
+
+        with (
+            patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine.load_return_models", return_value={30: model_30, 180: model_180}),
+            patch("modules.scoring_engine.predict_forward_return", side_effect=_predict),
+            patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),
+            patch(
+                "modules.scoring_engine.run_walk_forward",
+                return_value={
+                    "arima_rmse": 2.0,
+                    "trend_rmse": 1.0,
+                    "lightgbm_rmse": None,
+                    "n_windows": 4,
+                    "arima_windows": 4,
+                    "trend_windows": 4,
+                    "lightgbm_windows": 0,
+                },
+            ),
+            patch("modules.scoring_engine._select_arima_order", return_value=(1, 1, 0)),
+            patch("modules.scoring_engine.fit_arima_with_hardening", return_value=_FakeArimaFit()),
+            patch("modules.scoring_engine.LinearRegression", _FakeLinearRegression),
+            patch("modules.scoring_engine._garch_confidence_from_returns", return_value=(None, None)),
+            patch("modules.scoring_engine.analyze_technical", return_value=technical),
+            patch(
+                "modules.scoring_engine.get_macro_regime",
+                return_value={"risk_free_rate": 0.045, "bullish_sectors": [], "bearish_sectors": [], "market_regime": "neutral"},
+            ),
+            patch("modules.scoring_engine.analyze_fundamentals", return_value={"metrics": {}, "fundamental_score": 50}),
+        ):
+            result = scoring_engine._get_price_projections_core("AAPL", info=info, data=data)
+
+        self.assertNotIn("LightGBM", result["short_term_basis"])
+        self.assertIn("LightGBM", result["medium_term_basis"])
 
 
 if __name__ == "__main__":

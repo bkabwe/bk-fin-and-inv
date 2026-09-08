@@ -202,9 +202,21 @@ def _weighted_ensemble(components: list[tuple[str, float | None, float]]) -> tup
     available = [(name, float(value), weight) for name, value, weight in components if value is not None and float(weight) > 0.0]
     if not available:
         return None, "No projection models available", []
-    total_weight = sum(weight for _, _, weight in available)
-    projection = sum(value * (weight / total_weight) for _, value, weight in available)
-    basis = "Ensemble: " + " + ".join([f"{name}({weight / total_weight * 100:.0f}%)" for name, _, weight in available])
+    lightgbm_weight = next((float(weight) for name, _, weight in available if name == "LightGBM"), None)
+    other_total = sum(float(weight) for name, _, weight in available if name != "LightGBM")
+    normalized_weights: dict[str, float] = {}
+    if lightgbm_weight is not None and other_total > 0 and lightgbm_weight < 1.0:
+        remaining = max(1.0 - lightgbm_weight, 0.0)
+        for name, _, weight in available:
+            if name == "LightGBM":
+                normalized_weights[name] = lightgbm_weight
+            else:
+                normalized_weights[name] = remaining * (float(weight) / other_total)
+    else:
+        total_weight = sum(float(weight) for _, _, weight in available)
+        normalized_weights = {name: (float(weight) / total_weight) for name, _, weight in available}
+    projection = sum(value * normalized_weights[name] for name, value, _ in available)
+    basis = "Ensemble: " + " + ".join([f"{name}({normalized_weights[name] * 100:.0f}%)" for name, _, _ in available])
     return projection, basis, [value for _, value, _ in available]
 
 
@@ -320,6 +332,12 @@ def _projection_model_weights(
                 "trend": 0.50 * float(base_weights.get("trend", 0.0)),
             }
     return {"arima": 0.0, "trend": 0.50}
+
+
+def _has_lightgbm_backtest_support(backtest: dict | None) -> bool:
+    if not backtest:
+        return False
+    return int(backtest.get("lightgbm_windows") or 0) > 0 and backtest.get("lightgbm_rmse") is not None
 
 
 @cache_data(ttl=3600)
@@ -477,7 +495,12 @@ def _get_price_projections_core(
     except Exception as exc:
         models_skipped.append(f"Adaptive Weights: {exc}")
 
-    short_model_weights = _projection_model_weights(30, backtest if model_weights else None, include_lightgbm=30 in lightgbm_projections)
+    short_backtest = backtest if model_weights else None
+    short_model_weights = _projection_model_weights(
+        30,
+        short_backtest,
+        include_lightgbm=30 in lightgbm_projections and _has_lightgbm_backtest_support(short_backtest),
+    )
     medium_model_weights = _projection_model_weights(
         180,
         backtest if model_weights else None,

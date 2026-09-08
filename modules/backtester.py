@@ -181,7 +181,7 @@ def run_walk_forward(
     default = {
         "arima_rmse": 1.0,
         "trend_rmse": 1.0,
-        "lightgbm_rmse": 1.0,
+        "lightgbm_rmse": None,
         "n_windows": 0,
         "arima_windows": 0,
         "trend_windows": 0,
@@ -378,7 +378,7 @@ def run_walk_forward(
         result = {
             "arima_rmse": round(float(np.mean(arima_errors)) if arima_errors else 1.0, 6),
             "trend_rmse": round(float(np.mean(trend_errors)) if trend_errors else 1.0, 6),
-            "lightgbm_rmse": round(float(np.mean(lightgbm_errors)) if lightgbm_errors else 1.0, 6),
+            "lightgbm_rmse": round(float(np.mean(lightgbm_errors)), 6) if lightgbm_errors else None,
             "n_windows": int(n_windows),
             "arima_windows": int(len(arima_errors)),
             "trend_windows": int(len(trend_errors)),
