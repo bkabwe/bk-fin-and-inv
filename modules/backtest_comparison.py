@@ -147,6 +147,46 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
     }
 
 
+def _format_per_ticker_rmse(row: dict, model: str, width: int) -> str:
+    windows = int(row.get(f"{model}_windows", 0) or 0)
+    rmse = row.get(f"{model}_rmse")
+    if windows <= 0 or rmse is None:
+        return f"{'n/a':>{width}}"
+    return f"{float(rmse):>{width}.6f}"
+
+
+def format_per_ticker_diagnostics_table(per_ticker: list[dict]) -> str:
+    lines = [
+        "Per-ticker RMSE and LightGBM prediction variance diagnostics",
+        (
+            "Ticker  ARIMA RMSE  Trend RMSE  LightGBM RMSE  Naive RMSE  "
+            "LightGBM Pred Return Std  LightGBM Pred Return Min  LightGBM Pred Return Max"
+        ),
+        (
+            "------  ----------  ----------  -------------  ----------  "
+            "----------------------  -----------------------  -----------------------"
+        ),
+    ]
+    for row in per_ticker:
+        diagnostics = row.get("lightgbm_diagnostics") or {}
+        stats = diagnostics.get("prediction_stats") if isinstance(diagnostics, dict) else None
+        pred_std = stats.get("std") if isinstance(stats, dict) else None
+        pred_min = stats.get("min") if isinstance(stats, dict) else None
+        pred_max = stats.get("max") if isinstance(stats, dict) else None
+        std_text = f"{pred_std:.8f}" if pred_std is not None else "n/a"
+        min_text = f"{pred_min:.8f}" if pred_min is not None else "n/a"
+        max_text = f"{pred_max:.8f}" if pred_max is not None else "n/a"
+        lines.append(
+            f"{row.get('ticker', ''):<6}  "
+            f"{_format_per_ticker_rmse(row, 'arima', 10)}  "
+            f"{_format_per_ticker_rmse(row, 'trend', 10)}  "
+            f"{_format_per_ticker_rmse(row, 'lightgbm', 13)}  "
+            f"{_format_per_ticker_rmse(row, 'naive', 10)}  "
+            f"{std_text:>22}  {min_text:>23}  {max_text:>23}"
+        )
+    return "\n".join(lines)
+
+
 def run_lightgbm_backtest_comparison(
     tickers: list[str] | None = None,
     sample_size: int = 30,

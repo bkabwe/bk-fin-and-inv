@@ -7,7 +7,12 @@ import numpy as np
 import pandas as pd
 
 from modules import backtester
-from modules.backtest_comparison import run_lightgbm_backtest_comparison, select_sample_tickers, summarize_backtest_results
+from modules.backtest_comparison import (
+    format_per_ticker_diagnostics_table,
+    run_lightgbm_backtest_comparison,
+    select_sample_tickers,
+    summarize_backtest_results,
+)
 
 
 def _constant_price_frame(length: int = 120, value: float = 100.0) -> pd.DataFrame:
@@ -391,8 +396,8 @@ class WalkForwardLightGBMTests(unittest.TestCase):
 
         self.assertEqual(default_result, explicit_result)
 
-    def test_walk_forward_horizon_specific_window_counts_document_thin_720d_evidence(self):
-        data = _constant_business_price_frame(length=1260)
+    def test_walk_forward_horizon_specific_window_counts_fit_realistic_five_year_history(self):
+        data = _constant_business_price_frame(length=1258)
 
         with (
             patch("modules.backtester.ARIMA_AVAILABLE", False),
@@ -414,11 +419,20 @@ class WalkForwardLightGBMTests(unittest.TestCase):
                 evaluate_naive_baseline=True,
             )
 
-        self.assertEqual(result_180["naive_windows"], 5)
-        self.assertEqual(result_180["n_windows"], 5)
+        self.assertEqual(result_180["naive_windows"], 4)
+        self.assertEqual(result_180["n_windows"], 4)
         self.assertEqual(result_720["naive_windows"], 1)
         self.assertEqual(result_720["n_windows"], 1)
         self.assertLess(result_720["naive_windows"], result_180["naive_windows"])
+
+    def test_walk_forward_window_configs_keep_30d_and_180d_unchanged(self):
+        config_30 = backtester.get_walk_forward_window_config(30)
+        config_180 = backtester.get_walk_forward_window_config(180)
+        config_720 = backtester.get_walk_forward_window_config(720)
+
+        self.assertEqual((config_30.train_len, config_30.test_len, config_30.stride, config_30.max_history_rows), (60, 30, 30, 252))
+        self.assertEqual((config_180.train_len, config_180.test_len, config_180.stride, config_180.max_history_rows), (360, 180, 180, 1260))
+        self.assertEqual((config_720.train_len, config_720.test_len, config_720.stride, config_720.max_history_rows), (450, 720, 720, 1260))
 
     @unittest.skipUnless(backtester.LIGHTGBM_AVAILABLE, "lightgbm not installed")
     def test_walk_forward_lightgbm_diagnostics_capture_near_constant_predictions(self):
@@ -593,9 +607,31 @@ class BacktestComparisonSummaryTests(unittest.TestCase):
         walk_forward_mock.assert_called_once()
         self.assertEqual(walk_forward_mock.call_args.kwargs["horizon"], 720)
         self.assertEqual(result["period"], "5y")
-        self.assertEqual(result["window_config"]["train_len"], 540)
+        self.assertEqual(result["window_config"]["train_len"], 450)
         self.assertEqual(result["window_config"]["test_len"], 720)
         self.assertEqual(result["window_config"]["stride"], 720)
+
+    def test_format_per_ticker_diagnostics_table_renders_na_for_zero_window_rmse(self):
+        table = format_per_ticker_diagnostics_table(
+            [
+                {
+                    "ticker": "ZERO",
+                    "arima_rmse": 1.0,
+                    "trend_rmse": 1.0,
+                    "lightgbm_rmse": 1.0,
+                    "naive_rmse": 1.0,
+                    "arima_windows": 0,
+                    "trend_windows": 0,
+                    "lightgbm_windows": 0,
+                    "naive_windows": 0,
+                    "lightgbm_diagnostics": {"prediction_stats": None},
+                }
+            ]
+        )
+
+        self.assertIn("ZERO", table)
+        self.assertIn("n/a", table)
+        self.assertNotIn("1.000000", table)
 
     def test_summarize_backtest_results_includes_naive_model_and_comparison(self):
         rows = [
