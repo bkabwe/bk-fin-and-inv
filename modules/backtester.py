@@ -112,7 +112,13 @@ def _select_arima_order(series: pd.Series) -> tuple[int, int, int]:
 
 
 @cache_data(ttl=86400)
-def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = False) -> dict:
+def run_walk_forward(
+    ticker: str,
+    data: pd.DataFrame,
+    evaluate_lightgbm: bool = False,
+    evaluate_naive_baseline: bool = False,
+    lightgbm_diagnostics: bool = False,
+) -> dict:
     default = {
         "arima_rmse": 1.0,
         "trend_rmse": 1.0,
@@ -122,6 +128,11 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
         "trend_windows": 0,
         "lightgbm_windows": 0,
     }
+    if evaluate_naive_baseline:
+        default["naive_rmse"] = 1.0
+        default["naive_windows"] = 0
+    if lightgbm_diagnostics:
+        default["lightgbm_diagnostics"] = {"per_window": [], "prediction_stats": None}
     try:
         if data is None or data.empty or "Close" not in data or len(data) < 120:
             return default
@@ -141,6 +152,8 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
         arima_errors: list[float] = []
         trend_errors: list[float] = []
         lightgbm_errors: list[float] = []
+        naive_errors: list[float] = []
+        lightgbm_diagnostic_rows: list[dict[str, float | int]] = []
         lightgbm_horizon = min(RETURN_HORIZONS, key=lambda horizon: abs(int(horizon) - test_len))
         lightgbm_horizon_matches_test = int(lightgbm_horizon) == int(test_len)
 
@@ -176,6 +189,11 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                     trend_errors.append(_rmse(test_vals, pred))
                 except Exception:
                     pass
+
+            if evaluate_naive_baseline:
+                start_price = float(train.iloc[-1])
+                naive_pred = np.full(test_len, start_price, dtype=float)
+                naive_errors.append(_rmse(test_vals, naive_pred))
 
             if evaluate_lightgbm and LIGHTGBM_AVAILABLE and lightgbm_horizon_matches_test:
                 try:
@@ -261,6 +279,21 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                             start_price,
                         )
                         continue
+                    realized_return = (float(test_vals[-1]) - start_price) / start_price
+                    if lightgbm_diagnostics:
+                        diagnostic_row = {
+                            "start": int(start),
+                            "predicted_return": float(predicted_return),
+                            "realized_return": float(realized_return),
+                        }
+                        lightgbm_diagnostic_rows.append(diagnostic_row)
+                        logger.info(
+                            "LightGBM diagnostic for %s start=%d predicted_return=%.8f realized_return=%.8f",
+                            ticker.upper(),
+                            start,
+                            float(predicted_return),
+                            float(realized_return),
+                        )
                     final_price = start_price * (1.0 + float(predicted_return))
                     if final_price <= 0:
                         logger.warning(
@@ -283,7 +316,7 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
                         exc,
                     )
 
-        n_windows = max(len(arima_errors), len(trend_errors), len(lightgbm_errors))
+        n_windows = max(len(arima_errors), len(trend_errors), len(lightgbm_errors), len(naive_errors))
         if n_windows == 0:
             return default
 
@@ -296,6 +329,24 @@ def run_walk_forward(ticker: str, data: pd.DataFrame, evaluate_lightgbm: bool = 
             "trend_windows": int(len(trend_errors)),
             "lightgbm_windows": int(len(lightgbm_errors)),
         }
+        if evaluate_naive_baseline:
+            result["naive_rmse"] = round(float(np.mean(naive_errors)) if naive_errors else 1.0, 6)
+            result["naive_windows"] = int(len(naive_errors))
+        if lightgbm_diagnostics:
+            prediction_stats = None
+            if lightgbm_diagnostic_rows:
+                predicted = np.array([float(row["predicted_return"]) for row in lightgbm_diagnostic_rows], dtype=float)
+                prediction_stats = {
+                    "count": int(len(predicted)),
+                    "min": round(float(np.min(predicted)), 8),
+                    "max": round(float(np.max(predicted)), 8),
+                    "mean": round(float(np.mean(predicted)), 8),
+                    "std": round(float(np.std(predicted)), 8),
+                }
+            result["lightgbm_diagnostics"] = {
+                "per_window": lightgbm_diagnostic_rows,
+                "prediction_stats": prediction_stats,
+            }
         logger.info("Walk-forward backtest complete for %s: %s", ticker.upper(), result)
         return result
     except Exception as exc:
