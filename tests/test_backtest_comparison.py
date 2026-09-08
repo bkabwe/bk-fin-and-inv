@@ -353,6 +353,7 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertEqual(result["naive_windows"], 2)
         self.assertAlmostEqual(result["naive_rmse"], round(expected_rmse, 6), places=6)
 
+    @unittest.skipUnless(backtester.LIGHTGBM_AVAILABLE, "lightgbm not installed")
     def test_walk_forward_lightgbm_diagnostics_capture_near_constant_predictions(self):
         data = _realistic_price_frame(length=252)
 
@@ -361,8 +362,8 @@ class WalkForwardLightGBMTests(unittest.TestCase):
 
         def _build_examples(**kwargs):
             feature_table = kwargs["feature_table"]
-            x_train = pd.DataFrame({"feature_a": np.arange(len(feature_table), dtype=float)}, index=feature_table.index)
-            y_train = pd.Series(np.linspace(0.0, 0.001, num=len(feature_table)), index=feature_table.index)
+            x_train = pd.DataFrame({"feature_a": np.zeros(len(feature_table), dtype=float)}, index=feature_table.index)
+            y_train = pd.Series(np.full(len(feature_table), 0.0025, dtype=float), index=feature_table.index)
             return {30: (x_train, y_train)}
 
         with (
@@ -371,8 +372,6 @@ class WalkForwardLightGBMTests(unittest.TestCase):
             patch("modules.backtester.LIGHTGBM_AVAILABLE", True),
             patch("modules.backtester.build_feature_table", side_effect=_build_features),
             patch("modules.backtester.build_return_training_examples", side_effect=_build_examples),
-            patch("modules.backtester.train_return_models", return_value={30: object()}),
-            patch("modules.backtester.predict_forward_return", return_value=0.005),
         ):
             result = backtester.run_walk_forward(
                 "AAPL-LGBM-DIAG",
@@ -388,8 +387,7 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertEqual(len(per_window), result["lightgbm_windows"])
         self.assertIsNotNone(prediction_stats)
         self.assertEqual(prediction_stats["std"], 0.0)
-        self.assertEqual(prediction_stats["min"], 0.005)
-        self.assertEqual(prediction_stats["max"], 0.005)
+        self.assertEqual(prediction_stats["min"], prediction_stats["max"])
         realized_returns = {round(float(row["realized_return"]), 8) for row in per_window}
         self.assertGreater(len(realized_returns), 1)
 
