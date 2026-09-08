@@ -72,7 +72,7 @@ python analyze_stock.py AAPL
 - Notification bell with unread count + mark-all-read
 - Technical analysis (SMA/EMA, RSI, MACD, Stochastic, Bollinger, ATR, OBV, support/resistance, classic patterns)
 - Unified score + recommendation engine with entry/target/stop-loss suggestions
-- Multi-model projected price targets (ARIMA + log-linear/log-polynomial trend + fundamental fair value + DCF + technical resistance + analyst target, with GARCH confidence bounds)
+- Multi-model projected price targets (ARIMA + log-linear/log-polynomial trend + LightGBM return models for 30d/180d when saved models exist + fundamental fair value + DCF + technical resistance + analyst target, with GARCH confidence bounds)
 - Prophet was removed from the ensemble after walk-forward backtests consistently showed materially higher RMSE on stock series (which generally lack the strong recurring seasonality Prophet is designed for).
 
 ## Data Sources
@@ -190,20 +190,41 @@ phase). The table combines:
 Design principle: feature assembly is TTL-cached incrementally and decoupled from
 scan cadence so repeated scans avoid unnecessary recomputation/refetching.
 
-### LightGBM return model candidate (standalone, not yet in live ensemble)
+### LightGBM return models (live for 30d/180d, gated off for 720d)
 The app now includes `modules/lightgbm_model.py` as an explicit Phase 2 candidate
 model module. It predicts **forward return** (not raw price) for the existing
 30/180/720-day horizons using the shared engineered feature table and historical
 close prices. Training/inference are intentionally decoupled via save/load helpers
-so scan-time inference does not require retraining. This module is not yet wired
-into live scoring/ensemble weighting pending dedicated backtest validation.
+so scan-time inference does not require retraining.
 
-### Walk-forward validation gate for LightGBM (comparison-only)
+Live scoring now uses saved per-ticker LightGBM models in the ensemble for:
+- **30d** with `LIGHTGBM_WEIGHT_30D = 0.15`
+- **180d** with `LIGHTGBM_WEIGHT_180D = 0.08`
+
+Both weights are intentionally below ARIMA/trend parity as a conservative rollout:
+30d has the strongest validation evidence (89 tickers across two disjoint random
+samples, 6 windows/ticker, 100% LightGBM win rate vs ARIMA/trend/naive), while
+180d also won 100% of tickers but on only 30 tickers with 4 windows/ticker and
+higher observed prediction variance. **720d remains intentionally excluded from the
+live ensemble for now** because current validation has only one non-overlapping
+window per ticker, which is promising but not yet actionable.
+
+To train and persist the live 30d/180d models for a ticker before scoring:
+
+```bash
+python scripts/train_lightgbm_return_models.py AAPL
+```
+
+This writes per-ticker joblib artifacts under `data/lightgbm_return_models/<TICKER>/`.
+If no saved model is available, live scoring falls back to the existing ARIMA/trend
+ensemble behavior for that ticker/horizon.
+
+### Walk-forward validation gate for LightGBM
 `modules/backtester.run_walk_forward()` now supports optional LightGBM RMSE
 evaluation alongside ARIMA and trend over the same rolling windows, for
-validation/decision-gate analysis only. Live ensemble weighting is unchanged:
-`modules/scoring_engine._inverse_rmse_weights()` and `_weighted_ensemble()` still
-use ARIMA/trend only until a future integration workstream explicitly changes that.
+validation/decision-gate analysis. The live ensemble now consumes that evidence
+conservatively at 30d/180d only; 720d remains gated off until more natural history
+accrues and yields more than one non-overlapping validation window per ticker.
 Because LightGBM is trained as fixed-horizon return models (`30/180/720` days),
 the walk-forward path maps each test window to the closest available horizon
 (e.g., 30-day test windows use the 30-day model) and converts the predicted

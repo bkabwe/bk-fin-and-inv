@@ -3,6 +3,7 @@ data/portfolio.json
 data/watchlist.json
 data/notifications.json
 data/*.json
+data/lightgbm_return_models/
 
 # Environment files
 .env

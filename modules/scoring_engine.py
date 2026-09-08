@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 from modules.arima_hardening import ARIMA_AVAILABLE, fit_arima_with_hardening
 from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
+from modules.feature_engineering import build_feature_table, normalize_daily_index
 from modules.fundamental_analysis import analyze_fundamentals, classify_market_cap_tier, normalize_sector_name
+from modules.lightgbm_model import LIGHTGBM_AVAILABLE, load_return_models, predict_forward_return
 from modules.logger import get_logger
 from modules.longterm_analysis import analyze_longterm_technical_score
 from modules.macro_regime import get_macro_regime
@@ -24,6 +28,18 @@ _MARKET_CAP_CONFIDENCE_PADDING = {
     "Micro Cap": 0.10,
     "Small Cap": 0.05,
 }
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+LIGHTGBM_LIVE_MODEL_DIR = _REPO_ROOT / "data" / "lightgbm_return_models"
+
+# Conservative live rollout based on honestly-reported walk-forward evidence:
+# - 30d: 89 tickers across two disjoint random samples, 6 windows/ticker, LightGBM beat
+#   ARIMA, trend, and naive on 100% of tickers. Give it a real weight, but still below
+#   ARIMA/trend parity while the model's production track record remains newer.
+# - 180d: 30 tickers, 4 windows/ticker, LightGBM again beat ARIMA, trend, and naive on
+#   100% of tickers, but with thinner replication and higher prediction variance for some
+#   tickers. Keep the live weight real but smaller than 30d.
+LIGHTGBM_WEIGHT_30D = 0.15
+LIGHTGBM_WEIGHT_180D = 0.08
 
 try:
     import streamlit as st
@@ -250,6 +266,127 @@ def _inverse_rmse_weights(backtest: dict) -> dict[str, float] | None:
         return None
 
 
+def _blend_lightgbm_weight(base_weights: dict[str, float], lightgbm_weight: float = 0.0) -> dict[str, float]:
+    available = {name: float(weight) for name, weight in base_weights.items() if float(weight) > 0.0}
+    if lightgbm_weight <= 0.0 or not available:
+        return available
+    total = sum(available.values())
+    if total <= 0.0:
+        return available
+    reserved = min(float(lightgbm_weight), total)
+    remaining_total = max(total - reserved, 0.0)
+    blended = {name: remaining_total * (weight / total) for name, weight in available.items()}
+    blended["lightgbm"] = reserved
+    return blended
+
+
+def _projection_model_weights(
+    horizon_days: int,
+    backtest: dict | None,
+    *,
+    include_lightgbm: bool,
+) -> dict[str, float]:
+    if int(horizon_days) == 30:
+        base_weights = _inverse_rmse_weights(backtest or {}) if backtest else {"arima": 0.55, "trend": 0.45}
+        scaled = {
+            "arima": 0.80 * float((base_weights or {}).get("arima", 0.55)),
+            "trend": 0.80 * float((base_weights or {}).get("trend", 0.45)),
+        }
+        return _blend_lightgbm_weight(scaled, LIGHTGBM_WEIGHT_30D if include_lightgbm else 0.0)
+
+    if int(horizon_days) == 180:
+        if backtest:
+            base_weights = _inverse_rmse_weights(backtest)
+            if base_weights:
+                scaled = {
+                    "arima": 0.55 * float(base_weights.get("arima", 0.0)),
+                    "trend": 0.55 * float(base_weights.get("trend", 0.0)),
+                }
+            else:
+                scaled = {"arima": 0.0, "trend": 0.55}
+        else:
+            scaled = {"arima": 0.0, "trend": 0.55}
+        return _blend_lightgbm_weight(scaled, LIGHTGBM_WEIGHT_180D if include_lightgbm else 0.0)
+
+    # Keep 720d LightGBM weight at zero for now. The current validation has only one
+    # non-overlapping backtest window per ticker at this horizon, so the 20/30 vs.
+    # ARIMA/trend and 22/30 vs. naive win rates are promising but not yet actionable.
+    # Revisit once more historical data accrues naturally and yields additional 720d windows.
+    if backtest:
+        base_weights = _inverse_rmse_weights(backtest)
+        if base_weights:
+            return {
+                "arima": 0.50 * float(base_weights.get("arima", 0.0)),
+                "trend": 0.50 * float(base_weights.get("trend", 0.0)),
+            }
+    return {"arima": 0.0, "trend": 0.50}
+
+
+@cache_data(ttl=3600)
+def _load_live_lightgbm_models(ticker: str) -> dict[int, object]:
+    if not LIGHTGBM_AVAILABLE:
+        return {}
+    return load_return_models(LIGHTGBM_LIVE_MODEL_DIR / str(ticker).upper(), horizons=(30, 180))
+
+
+def _live_lightgbm_price_projections(
+    ticker: str,
+    data: pd.DataFrame | None,
+    current_price: float,
+) -> tuple[dict[int, float], list[str], list[str]]:
+    if not LIGHTGBM_AVAILABLE:
+        return {}, [], ["LightGBM: package not installed"]
+    if data is None or data.empty or current_price <= 0:
+        return {}, [], ["LightGBM: insufficient price history"]
+
+    models = _load_live_lightgbm_models(ticker)
+    if not models:
+        return {}, [], [f"LightGBM: no saved return models under {LIGHTGBM_LIVE_MODEL_DIR / str(ticker).upper()}"]
+
+    try:
+        feature_table = build_feature_table(ticker, data, lookback_days=len(data))
+    except Exception as exc:
+        return {}, [], [f"LightGBM: feature table unavailable ({exc})"]
+    if feature_table is None or feature_table.empty:
+        return {}, [], ["LightGBM: feature table unavailable"]
+
+    features = feature_table.copy()
+    features.index = normalize_daily_index(features.index)
+    features = features[~features.index.isna()].sort_index()
+    features = features[~features.index.duplicated(keep="last")]
+    if features.empty:
+        return {}, [], ["LightGBM: feature table unavailable"]
+
+    latest_feature_rows = features.dropna(how="all")
+    if latest_feature_rows.empty:
+        return {}, [], ["LightGBM: latest feature row unavailable"]
+    latest_feature_row = latest_feature_rows.iloc[-1]
+
+    projections: dict[int, float] = {}
+    used_models: list[str] = []
+    skipped_models: list[str] = []
+    for horizon in (30, 180):
+        model = models.get(horizon)
+        if model is None:
+            skipped_models.append(f"LightGBM {horizon}d: saved model unavailable")
+            continue
+        try:
+            predicted_return = predict_forward_return(model, latest_feature_row)
+        except Exception as exc:
+            skipped_models.append(f"LightGBM {horizon}d: inference failed ({exc})")
+            continue
+        if predicted_return is None:
+            skipped_models.append(f"LightGBM {horizon}d: inference returned no prediction")
+            continue
+        projected_price = current_price * (1.0 + float(predicted_return))
+        if projected_price <= 0:
+            skipped_models.append(f"LightGBM {horizon}d: projected price was non-positive")
+            continue
+        projections[horizon] = float(projected_price)
+        used_models.append(f"LightGBM Return {horizon}d")
+    return projections, used_models, skipped_models
+
+
 def _garch_confidence_from_returns(current_price: float, log_returns: np.ndarray, horizon_days: int) -> tuple[float | None, float | None]:
     if not ARCH_AVAILABLE or len(log_returns) < 60 or current_price <= 0:
         return None, None
@@ -319,7 +456,16 @@ def _get_price_projections_core(
     market_cap_tier = _resolved_market_cap_tier(info.get("marketCap"))
     cap_value = None if is_speculative_otc else (3 * current_price)
 
+    lightgbm_projections, lightgbm_models_used, lightgbm_models_skipped = _live_lightgbm_price_projections(
+        ticker,
+        data,
+        current_price,
+    )
+    models_used.extend(lightgbm_models_used)
+    models_skipped.extend(lightgbm_models_skipped)
+
     # adaptive model weights from walk-forward
+    backtest = None
     model_weights = None
     try:
         backtest = run_walk_forward(ticker, data)
@@ -331,20 +477,13 @@ def _get_price_projections_core(
     except Exception as exc:
         models_skipped.append(f"Adaptive Weights: {exc}")
 
-    short_model_total, medium_model_total, long_model_total = 0.80, 0.55, 0.50
-    if model_weights:
-        short_arima_w = short_model_total * model_weights.get("arima", 0)
-        short_trend_w = short_model_total * model_weights.get("trend", 0)
-
-        medium_arima_w = medium_model_total * model_weights.get("arima", 0)
-        medium_trend_w = medium_model_total * model_weights.get("trend", 0)
-
-        long_arima_w = long_model_total * model_weights.get("arima", 0)
-        long_trend_w = long_model_total * model_weights.get("trend", 0)
-    else:
-        short_arima_w, short_trend_w = 0.44, 0.36
-        medium_arima_w, medium_trend_w = 0.0, 0.55
-        long_arima_w, long_trend_w = 0.0, 0.50
+    short_model_weights = _projection_model_weights(30, backtest if model_weights else None, include_lightgbm=30 in lightgbm_projections)
+    medium_model_weights = _projection_model_weights(
+        180,
+        backtest if model_weights else None,
+        include_lightgbm=180 in lightgbm_projections,
+    )
+    long_model_weights = _projection_model_weights(720, backtest if model_weights else None, include_lightgbm=False)
 
     arima_30 = arima_180 = arima_720 = None
     if STATSMODELS_AVAILABLE:
@@ -448,15 +587,17 @@ def _get_price_projections_core(
 
     short_projection, short_basis, short_values = _weighted_ensemble(
         [
-            ("ARIMA", arima_30, short_arima_w),
-            ("Trend", trend_30, short_trend_w),
+            ("ARIMA", arima_30, short_model_weights.get("arima", 0.0)),
+            ("Trend", trend_30, short_model_weights.get("trend", 0.0)),
+            ("LightGBM", lightgbm_projections.get(30), short_model_weights.get("lightgbm", 0.0)),
             ("Resistance", technical_resistance, 0.20),
         ]
     )
     medium_projection, medium_basis, medium_values = _weighted_ensemble(
         [
-            ("ARIMA", arima_180, medium_arima_w),
-            ("Trend", trend_180, medium_trend_w),
+            ("ARIMA", arima_180, medium_model_weights.get("arima", 0.0)),
+            ("Trend", trend_180, medium_model_weights.get("trend", 0.0)),
+            ("LightGBM", lightgbm_projections.get(180), medium_model_weights.get("lightgbm", 0.0)),
             ("Fundamental", fair_value, 0.20),
             ("DCF", dcf_estimate, 0.10),
             ("Analyst x0.65", analyst_medium, 0.15),
@@ -464,8 +605,8 @@ def _get_price_projections_core(
     )
     long_projection, long_basis, long_values = _weighted_ensemble(
         [
-            ("ARIMA", arima_720, long_arima_w),
-            ("Trend", trend_720, long_trend_w),
+            ("ARIMA", arima_720, long_model_weights.get("arima", 0.0)),
+            ("Trend", trend_720, long_model_weights.get("trend", 0.0)),
             ("Fundamental", fair_value, 0.20),
             ("DCF", dcf_estimate, 0.10),
             ("Analyst", analyst_long, 0.20),
@@ -485,6 +626,8 @@ def _get_price_projections_core(
             trend_180,
             arima_720,
             trend_720,
+            lightgbm_projections.get(30),
+            lightgbm_projections.get(180),
             fair_value,
             dcf_estimate,
         ]
