@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from modules.data_fetcher import get_stock_data
-from modules.feature_engineering import build_feature_table
+from modules.feature_engineering import build_feature_table, normalize_daily_index
 from modules.logger import get_logger
 
 logger = get_logger(__name__)
@@ -28,10 +28,7 @@ def _normalize_close_series(price_data: pd.DataFrame) -> pd.Series:
     if price_data is None or price_data.empty or "Close" not in price_data:
         return pd.Series(dtype="float64", name="Close")
     close = pd.to_numeric(price_data["Close"], errors="coerce").astype("float64")
-    index = pd.DatetimeIndex(pd.to_datetime(price_data.index, errors="coerce"))
-    if getattr(index, "tz", None) is not None:
-        index = index.tz_localize(None)
-    frame = pd.DataFrame({"Close": close.values}, index=index.normalize())
+    frame = pd.DataFrame({"Close": close.values}, index=normalize_daily_index(price_data.index))
     frame = frame[~frame.index.isna()].sort_index()
     frame = frame[~frame.index.duplicated(keep="last")]
     return frame["Close"]
@@ -50,10 +47,7 @@ def build_return_training_examples(
         logger.warning("LightGBM training examples skipped for %s: empty feature table", str(ticker).upper())
         return {}
     features = features.copy()
-    features.index = pd.DatetimeIndex(pd.to_datetime(features.index, errors="coerce"))
-    if getattr(features.index, "tz", None) is not None:
-        features.index = features.index.tz_localize(None)
-    features.index = features.index.normalize()
+    features.index = normalize_daily_index(features.index)
     features = features[~features.index.isna()].sort_index()
     features = features[~features.index.duplicated(keep="last")]
 

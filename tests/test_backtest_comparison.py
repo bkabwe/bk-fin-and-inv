@@ -176,6 +176,139 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows):
             self.assertTrue(captured_index.equals(expected_index))
 
+    def test_walk_forward_normalizes_timezone_aware_lightgbm_training_window_indexes(self):
+        index = pd.bdate_range("2024-01-02", periods=252).tz_localize("America/New_York")
+        close = 100.0 + np.linspace(0.0, 24.0, num=len(index)) + 1.5 * np.sin(np.arange(len(index)) / 6.0)
+        data = pd.DataFrame(
+            {
+                "Close": close,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Volume": np.full(len(index), 1000.0, dtype=float),
+            },
+            index=index,
+        )
+        captured_training_row_indexes: list[pd.Index] = []
+
+        def _macro_table(start_date, end_date):
+            macro_index = pd.date_range(start_date, end_date, freq="B")
+            return pd.DataFrame(
+                {
+                    "dgs10_level": np.linspace(4.0, 4.4, num=len(macro_index)),
+                    "dgs10_delta_5d": np.zeros(len(macro_index)),
+                    "dgs10_pct_change_5d": np.zeros(len(macro_index)),
+                    "dgs10_delta_30d": np.zeros(len(macro_index)),
+                    "dgs10_pct_change_30d": np.zeros(len(macro_index)),
+                    "cpiaucsl_level": np.linspace(300.0, 302.0, num=len(macro_index)),
+                    "cpiaucsl_delta_5d": np.zeros(len(macro_index)),
+                    "cpiaucsl_pct_change_5d": np.zeros(len(macro_index)),
+                    "cpiaucsl_delta_30d": np.zeros(len(macro_index)),
+                    "cpiaucsl_pct_change_30d": np.zeros(len(macro_index)),
+                    "fedfunds_level": np.linspace(5.0, 5.1, num=len(macro_index)),
+                    "fedfunds_delta_5d": np.zeros(len(macro_index)),
+                    "fedfunds_pct_change_5d": np.zeros(len(macro_index)),
+                    "fedfunds_delta_30d": np.zeros(len(macro_index)),
+                    "fedfunds_pct_change_30d": np.zeros(len(macro_index)),
+                },
+                index=macro_index,
+            )
+
+        def _train_return_models(training_examples, min_rows_per_horizon=50, random_state=42):
+            dataset = training_examples.get(30)
+            if not dataset:
+                return None
+            x_train, y_train = dataset
+            captured_training_row_indexes.append(x_train.index)
+            return {30: object()} if len(y_train) >= int(min_rows_per_horizon) else None
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.SKLEARN_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", True),
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", side_effect=_macro_table),
+            patch("modules.backtester.train_return_models", side_effect=_train_return_models),
+            patch("modules.backtester.predict_forward_return", return_value=0.01),
+        ):
+            result = backtester.run_walk_forward("AAPL-LGBM-TZ", data, evaluate_lightgbm=True)
+
+        self.assertGreater(result["lightgbm_windows"], 0)
+        self.assertNotEqual(result["lightgbm_rmse"], 1.0)
+        self.assertGreater(len(captured_training_row_indexes), 0)
+
+        close_index = data["Close"].dropna().astype(float).tail(252).index
+        normalized_index = backtester._normalize_lightgbm_price_frame(data.copy().reindex(close_index)).index
+        expected_starts = list(range(0, max(1, len(normalized_index) - (60 + 30) + 1), 30))[:10]
+        expected_windows = [normalized_index[start : start + 60] for start in expected_starts]
+
+        self.assertEqual(len(captured_training_row_indexes), len(expected_windows))
+        for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows):
+            self.assertIsNone(getattr(captured_index, "tz", None))
+            self.assertEqual(len(captured_index), 60)
+            self.assertTrue(captured_index.equals(expected_index))
+
+    def test_lightgbm_training_examples_reindex_against_normalized_timezone_aware_train_window(self):
+        index = pd.bdate_range("2024-01-02", periods=120).tz_localize("America/New_York")
+        close = 100.0 + np.linspace(0.0, 12.0, num=len(index))
+        data = pd.DataFrame(
+            {
+                "Close": close,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Volume": np.full(len(index), 1000.0, dtype=float),
+            },
+            index=index,
+        )
+
+        def _macro_table(start_date, end_date):
+            macro_index = pd.date_range(start_date, end_date, freq="B")
+            return pd.DataFrame(
+                {
+                    "dgs10_level": np.linspace(4.0, 4.2, num=len(macro_index)),
+                    "dgs10_delta_5d": np.zeros(len(macro_index)),
+                    "dgs10_pct_change_5d": np.zeros(len(macro_index)),
+                    "dgs10_delta_30d": np.zeros(len(macro_index)),
+                    "dgs10_pct_change_30d": np.zeros(len(macro_index)),
+                    "cpiaucsl_level": np.linspace(300.0, 301.0, num=len(macro_index)),
+                    "cpiaucsl_delta_5d": np.zeros(len(macro_index)),
+                    "cpiaucsl_pct_change_5d": np.zeros(len(macro_index)),
+                    "cpiaucsl_delta_30d": np.zeros(len(macro_index)),
+                    "cpiaucsl_pct_change_30d": np.zeros(len(macro_index)),
+                    "fedfunds_level": np.linspace(5.0, 5.1, num=len(macro_index)),
+                    "fedfunds_delta_5d": np.zeros(len(macro_index)),
+                    "fedfunds_pct_change_5d": np.zeros(len(macro_index)),
+                    "fedfunds_delta_30d": np.zeros(len(macro_index)),
+                    "fedfunds_pct_change_30d": np.zeros(len(macro_index)),
+                },
+                index=macro_index,
+            )
+
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", side_effect=_macro_table),
+        ):
+            train_price = backtester._normalize_lightgbm_price_frame(data.iloc[:60])
+            history = backtester._normalize_lightgbm_price_frame(data.iloc[:90])
+            features = backtester.build_feature_table("AAPL", history, lookback_days=len(history))
+            datasets = backtester.build_return_training_examples(
+                ticker="AAPL",
+                price_data=history,
+                feature_table=features,
+                lookback_days=len(history),
+                horizons=(30,),
+            )
+
+        x_train_all, y_train_all = datasets[30]
+        x_train = x_train_all.reindex(train_price.index).dropna(how="all")
+        y_train = y_train_all.reindex(x_train.index).dropna()
+        x_train = x_train.reindex(y_train.index)
+
+        self.assertEqual(len(train_price), 60)
+        self.assertEqual(len(x_train), 60)
+        self.assertEqual(len(y_train), 60)
+        self.assertTrue(x_train.index.equals(train_price.index))
+        self.assertIsNone(getattr(x_train.index, "tz", None))
+
     def test_walk_forward_lightgbm_failure_is_logged(self):
         data = _constant_price_frame()
         with (
