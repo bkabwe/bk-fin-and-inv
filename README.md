@@ -158,10 +158,12 @@ This project is for educational/research use only and is **not financial advice*
 
 ## Recent improvements
 
-### Split/dividend-adjusted price data
+### Split-adjusted price data
 All historical OHLCV data is now sourced from Polygon aggregates with
 `adjusted=true`, so indicator, backtest, and forecast inputs remain continuous
-across splits/reverse-splits.
+across splits/reverse-splits. Polygon's aggregate-bar adjustment flag is
+split-focused; dividend and other corporate-action reference data are fetched
+from separate Polygon endpoints when needed.
 
 Current-price display uses Polygon previous-day close (`/v2/aggs/.../prev`),
 which matches Starter-plan availability (no live snapshot feed).
