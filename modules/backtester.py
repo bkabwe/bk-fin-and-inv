@@ -113,11 +113,12 @@ _WALK_FORWARD_WINDOW_CONFIGS: dict[int, WalkForwardWindowConfig] = {
         max_history_rows=1260,
         default_period="5y",
     ),
-    # Polygon Starter history is capped at ~5y (~1260 trading rows), so a clean 720d holdout
-    # can realistically support only a single non-overlapping backtest window per ticker.
+    # Polygon Starter history is capped at ~5y, and real daily histories usually land a bit
+    # under 1260 rows once exchange holidays are excluded. Keep enough slack to guarantee one
+    # clean non-overlapping 720d holdout window without changing the 5y fetch default.
     720: WalkForwardWindowConfig(
         horizon=720,
-        train_len=540,
+        train_len=450,
         test_len=720,
         stride=720,
         max_history_rows=1260,
