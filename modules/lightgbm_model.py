@@ -46,6 +46,93 @@ def _label_sanity_bounds(horizon: int) -> tuple[float, float]:
     return MIN_FORWARD_RETURN_LABEL, MAX_FORWARD_RETURN_LABEL_LONG
 
 
+def prepare_lightgbm_feature_frame(feature_table: pd.DataFrame | None) -> pd.DataFrame:
+    if feature_table is None or feature_table.empty:
+        return pd.DataFrame()
+    features = feature_table.copy()
+    features.index = normalize_daily_index(features.index)
+    features = features[~features.index.isna()].sort_index()
+    features = features[~features.index.duplicated(keep="last")]
+    return features
+
+
+def latest_lightgbm_feature_row(feature_table: pd.DataFrame | None) -> pd.Series | None:
+    features = prepare_lightgbm_feature_frame(feature_table)
+    if features.empty:
+        return None
+    latest_feature_rows = features.dropna(how="all")
+    if latest_feature_rows.empty:
+        return None
+    return latest_feature_rows.iloc[-1]
+
+
+def summarize_training_feature_ranges(x_train: pd.DataFrame) -> pd.DataFrame:
+    if x_train is None or x_train.empty:
+        return pd.DataFrame(columns=["train_min", "train_max", "train_mean", "train_std", "train_non_null_count"])
+    numeric = x_train.apply(pd.to_numeric, errors="coerce")
+    summary = pd.DataFrame(index=numeric.columns)
+    summary["train_min"] = numeric.min()
+    summary["train_max"] = numeric.max()
+    summary["train_mean"] = numeric.mean()
+    summary["train_std"] = numeric.std(ddof=0)
+    summary["train_non_null_count"] = numeric.count().astype("int64")
+    summary.index.name = "feature"
+    return summary
+
+
+def compare_feature_row_to_training_ranges(
+    feature_row: pd.Series | pd.DataFrame | None,
+    training_feature_ranges: pd.DataFrame,
+    *,
+    std_threshold: float = 5.0,
+) -> pd.DataFrame:
+    if feature_row is None:
+        return pd.DataFrame(
+            columns=[
+                "live_value",
+                "train_min",
+                "train_max",
+                "train_mean",
+                "train_std",
+                "train_non_null_count",
+                "outside_training_range",
+                "std_threshold",
+                "abs_zscore",
+                "beyond_std_threshold",
+            ]
+        )
+    live_series = feature_row if isinstance(feature_row, pd.Series) else feature_row.iloc[0]
+    live_series = pd.to_numeric(live_series, errors="coerce")
+    comparison = training_feature_ranges.copy()
+    comparison["live_value"] = live_series.reindex(comparison.index)
+    comparison["outside_training_range"] = (
+        comparison["live_value"].notna()
+        & (
+            comparison["live_value"].lt(comparison["train_min"])
+            | comparison["live_value"].gt(comparison["train_max"])
+        )
+    )
+    comparison["std_threshold"] = float(std_threshold)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        comparison["abs_zscore"] = (
+            (comparison["live_value"] - comparison["train_mean"]).abs() / comparison["train_std"].replace(0.0, np.nan)
+        )
+    comparison["beyond_std_threshold"] = comparison["abs_zscore"].gt(float(std_threshold)).fillna(False)
+    ordered = [
+        "live_value",
+        "train_min",
+        "train_max",
+        "train_mean",
+        "train_std",
+        "train_non_null_count",
+        "outside_training_range",
+        "std_threshold",
+        "abs_zscore",
+        "beyond_std_threshold",
+    ]
+    return comparison.reindex(columns=ordered)
+
+
 def build_return_training_examples(
     ticker: str,
     price_data: pd.DataFrame,
@@ -54,14 +141,11 @@ def build_return_training_examples(
     horizons: tuple[int, ...] = RETURN_HORIZONS,
 ) -> dict[int, tuple[pd.DataFrame, pd.Series]]:
     """Build per-horizon (X, y) datasets where y is forward return."""
-    features = feature_table if feature_table is not None else build_feature_table(ticker, price_data, lookback_days=lookback_days)
-    if features is None or features.empty:
+    raw_features = feature_table if feature_table is not None else build_feature_table(ticker, price_data, lookback_days=lookback_days)
+    features = prepare_lightgbm_feature_frame(raw_features)
+    if features.empty:
         logger.warning("LightGBM training examples skipped for %s: empty feature table", str(ticker).upper())
         return {}
-    features = features.copy()
-    features.index = normalize_daily_index(features.index)
-    features = features[~features.index.isna()].sort_index()
-    features = features[~features.index.duplicated(keep="last")]
 
     close = _normalize_close_series(price_data)
     if close.empty:

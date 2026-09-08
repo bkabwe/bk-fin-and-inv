@@ -99,6 +99,38 @@ class LightGBMModelTests(unittest.TestCase):
         _, y_train = examples[30]
         self.assertGreater(len(y_train), 0)
 
+    def test_prepare_feature_frame_normalizes_and_deduplicates_index(self):
+        feature_table = pd.DataFrame(
+            {"technical_feature_a": [1.0, 2.0, 3.0]},
+            index=pd.DatetimeIndex(
+                [
+                    pd.Timestamp("2024-01-02 16:00:00", tz="America/New_York"),
+                    pd.Timestamp("2024-01-02 18:00:00", tz="America/New_York"),
+                    pd.Timestamp("2024-01-03 16:00:00", tz="America/New_York"),
+                ]
+            ),
+        )
+
+        prepared = lightgbm_model.prepare_lightgbm_feature_frame(feature_table)
+
+        self.assertEqual(list(prepared.index), [pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03")])
+        self.assertEqual(float(prepared.loc[pd.Timestamp("2024-01-02"), "technical_feature_a"]), 2.0)
+
+    def test_latest_lightgbm_feature_row_skips_all_nan_tail_rows(self):
+        feature_table = pd.DataFrame(
+            {
+                "technical_feature_a": [1.0, np.nan, np.nan],
+                "macro_feature_b": [2.0, np.nan, np.nan],
+            },
+            index=pd.date_range("2024-01-01", periods=3, freq="D"),
+        )
+
+        latest_row = lightgbm_model.latest_lightgbm_feature_row(feature_table)
+
+        self.assertIsNotNone(latest_row)
+        self.assertEqual(latest_row.name, pd.Timestamp("2024-01-01"))
+        self.assertEqual(float(latest_row["technical_feature_a"]), 1.0)
+
     def test_build_examples_for_ticker_reuses_stock_data_fetch(self):
         price_data = _sample_price_data(length=120)
         with patch("modules.lightgbm_model.get_stock_data", return_value=price_data) as stock_data_mock:
@@ -128,6 +160,25 @@ class LightGBMModelTests(unittest.TestCase):
         self.assertIn(price_data.index[21], x_train.index)
         self.assertLessEqual(float(y_train.max()), lightgbm_model.MAX_FORWARD_RETURN_LABEL_30D)
         self.assertTrue(any("Excluding LightGBM training label for AIM horizon=30d" in message for message in logs.output))
+
+    def test_compare_feature_row_to_training_ranges_flags_out_of_range_values(self):
+        x_train = pd.DataFrame(
+            {
+                "feature_a": np.linspace(0.0, 1.0, num=20),
+                "feature_b": np.linspace(10.0, 20.0, num=20),
+            }
+        )
+        summary = lightgbm_model.summarize_training_feature_ranges(x_train)
+        comparison = lightgbm_model.compare_feature_row_to_training_ranges(
+            pd.Series({"feature_a": 9.0, "feature_b": 15.0}),
+            summary,
+            std_threshold=3.0,
+        )
+
+        self.assertTrue(bool(comparison.loc["feature_a", "outside_training_range"]))
+        self.assertTrue(bool(comparison.loc["feature_a", "beyond_std_threshold"]))
+        self.assertFalse(bool(comparison.loc["feature_b", "outside_training_range"]))
+        self.assertFalse(bool(comparison.loc["feature_b", "beyond_std_threshold"]))
 
     @unittest.skipUnless(lightgbm_model.LIGHTGBM_AVAILABLE, "lightgbm not installed")
     def test_train_save_load_and_infer(self):

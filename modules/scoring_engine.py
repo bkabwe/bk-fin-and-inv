@@ -8,9 +8,14 @@ import pandas as pd
 from modules.arima_hardening import ARIMA_AVAILABLE, fit_arima_with_hardening
 from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
-from modules.feature_engineering import build_feature_table, normalize_daily_index
+from modules.feature_engineering import build_feature_table
 from modules.fundamental_analysis import analyze_fundamentals, classify_market_cap_tier, normalize_sector_name
-from modules.lightgbm_model import LIGHTGBM_AVAILABLE, load_return_models, predict_forward_return
+from modules.lightgbm_model import (
+    LIGHTGBM_AVAILABLE,
+    latest_lightgbm_feature_row,
+    load_return_models,
+    predict_forward_return,
+)
 from modules.logger import get_logger
 from modules.longterm_analysis import analyze_longterm_technical_score
 from modules.macro_regime import get_macro_regime
@@ -368,17 +373,9 @@ def _live_lightgbm_price_projections(
     if feature_table is None or feature_table.empty:
         return {}, [], ["LightGBM: feature table unavailable"]
 
-    features = feature_table.copy()
-    features.index = normalize_daily_index(features.index)
-    features = features[~features.index.isna()].sort_index()
-    features = features[~features.index.duplicated(keep="last")]
-    if features.empty:
-        return {}, [], ["LightGBM: feature table unavailable"]
-
-    latest_feature_rows = features.dropna(how="all")
-    if latest_feature_rows.empty:
+    latest_feature_row = latest_lightgbm_feature_row(feature_table)
+    if latest_feature_row is None:
         return {}, [], ["LightGBM: latest feature row unavailable"]
-    latest_feature_row = latest_feature_rows.iloc[-1]
 
     projections: dict[int, float] = {}
     used_models: list[str] = []
