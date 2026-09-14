@@ -206,16 +206,24 @@ def build_return_training_examples_for_ticker(
     interval: str = "1d",
     lookback_days: int = 1260,
     horizons: tuple[int, ...] = RETURN_HORIZONS,
+    *,
+    shared_macro_table: pd.DataFrame | None = None,
 ) -> dict[int, tuple[pd.DataFrame, pd.Series]]:
     """Build examples by reusing the existing Polygon-backed get_stock_data flow."""
     price_data = get_stock_data(ticker, period=period, interval=interval)
     if price_data is None or price_data.empty:
         logger.warning("LightGBM training examples skipped for %s: no historical price data", str(ticker).upper())
         return {}
+    feature_table = build_feature_table(
+        ticker,
+        price_data,
+        lookback_days=lookback_days,
+        shared_macro_table=shared_macro_table,
+    )
     return build_return_training_examples(
         ticker=ticker,
         price_data=price_data,
-        feature_table=None,
+        feature_table=feature_table,
         lookback_days=lookback_days,
         horizons=horizons,
     )
@@ -289,6 +297,13 @@ def predict_forward_return(model: LGBMRegressor | None, feature_row: pd.Series |
     prediction = float(model.predict(x.iloc[[0]])[0])
     logger.info("LightGBM inference complete: predicted_forward_return=%.6f", prediction)
     return prediction
+
+
+def training_row_counts(training_examples: dict[int, tuple[pd.DataFrame, pd.Series]] | None) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for horizon, (_x_train, y_train) in sorted((training_examples or {}).items()):
+        counts[int(horizon)] = int(len(y_train))
+    return counts
 
 
 def save_return_models(models: dict[int, LGBMRegressor], directory: str | Path) -> list[Path]:

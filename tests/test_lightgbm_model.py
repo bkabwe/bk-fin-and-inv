@@ -133,10 +133,30 @@ class LightGBMModelTests(unittest.TestCase):
 
     def test_build_examples_for_ticker_reuses_stock_data_fetch(self):
         price_data = _sample_price_data(length=120)
-        with patch("modules.lightgbm_model.get_stock_data", return_value=price_data) as stock_data_mock:
+        with (
+            patch("modules.lightgbm_model.get_stock_data", return_value=price_data) as stock_data_mock,
+            patch("modules.lightgbm_model.build_feature_table", return_value=_sample_feature_table(length=120)) as feature_mock,
+        ):
             examples = lightgbm_model.build_return_training_examples_for_ticker("AAPL", horizons=(30,))
         stock_data_mock.assert_called_once_with("AAPL", period="5y", interval="1d")
+        feature_mock.assert_called_once()
         self.assertIn(30, examples)
+
+    def test_build_examples_for_ticker_passes_shared_macro_table_to_feature_builder(self):
+        price_data = _sample_price_data(length=120)
+        shared_macro = pd.DataFrame({"dgs10_level": np.linspace(4.0, 4.1, num=120)}, index=price_data.index)
+        with (
+            patch("modules.lightgbm_model.get_stock_data", return_value=price_data),
+            patch("modules.lightgbm_model.build_feature_table", return_value=_sample_feature_table(length=120)) as feature_mock,
+        ):
+            examples = lightgbm_model.build_return_training_examples_for_ticker(
+                "AAPL",
+                horizons=(30,),
+                shared_macro_table=shared_macro,
+            )
+
+        self.assertIn(30, examples)
+        self.assertIs(feature_mock.call_args.kwargs["shared_macro_table"], shared_macro)
 
     def test_training_examples_exclude_extreme_forward_return_labels_and_keep_surrounding_examples(self):
         price_data = _sample_price_data(length=100)

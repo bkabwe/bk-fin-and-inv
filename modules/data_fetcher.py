@@ -13,6 +13,7 @@ from modules.polygon_client import (
     get_news_polygon,
     get_stock_data_polygon,
     is_polygon_configured,
+    list_active_ticker_details,
     list_active_tickers,
 )
 from modules.validators import sanitize_ticker
@@ -144,6 +145,21 @@ def _normalize_tickers(values: list[Any], limit: int | None = None) -> list[str]
             cleaned.append(ticker)
     unique = sorted(set(cleaned))
     return unique[:limit] if limit is not None else unique
+
+
+@cache_data(ttl=86400)
+def get_all_active_ticker_details() -> list[dict[str, Any]]:
+    if not is_polygon_configured():
+        raise RuntimeError("POLYGON_API_KEY is not configured. Set it to fetch active tickers.")
+    try:
+        tickers = list_active_ticker_details()
+    except PolygonNotConfiguredError as exc:
+        raise RuntimeError(str(exc)) from exc
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch active tickers from Polygon: {exc}") from exc
+    if not tickers:
+        raise RuntimeError("Polygon returned no active tickers")
+    return tickers
 
 
 @cache_data(ttl=86400)

@@ -219,11 +219,27 @@ def _macro_columns() -> list[str]:
     return columns
 
 
-def _macro_daily_features(daily_index: pd.DatetimeIndex) -> pd.DataFrame:
+def prepare_shared_macro_feature_table(macro_table: pd.DataFrame | None) -> pd.DataFrame:
+    if macro_table is None or macro_table.empty:
+        return pd.DataFrame(columns=_macro_columns())
+    prepared = macro_table.copy()
+    prepared.index = normalize_daily_index(prepared.index)
+    prepared = prepared[~prepared.index.isna()].sort_index()
+    prepared = prepared[~prepared.index.duplicated(keep="last")]
+    prepared = prepared.rename(columns={col: f"macro_{col}" for col in prepared.columns if not str(col).startswith("macro_")})
+    return prepared
+
+
+def _macro_daily_features(daily_index: pd.DatetimeIndex, shared_macro_table: pd.DataFrame | None = None) -> pd.DataFrame:
     feature_columns = _macro_columns()
     features = pd.DataFrame(index=daily_index, columns=feature_columns, dtype="float64")
     if len(daily_index) == 0:
         return features
+    if shared_macro_table is not None:
+        prepared = prepare_shared_macro_feature_table(shared_macro_table)
+        if prepared.empty:
+            return features
+        return prepared.reindex(daily_index).ffill().reindex(columns=feature_columns)
     start_date = daily_index.min().date()
     end_date = daily_index.max().date()
     try:
@@ -231,10 +247,10 @@ def _macro_daily_features(daily_index: pd.DatetimeIndex) -> pd.DataFrame:
     except Exception as exc:
         logger.warning("Macro features unavailable: %s", exc)
         return features
-    if macro is None or macro.empty:
+    prepared = prepare_shared_macro_feature_table(macro)
+    if prepared.empty:
         return features
-    renamed = macro.rename(columns={col: f"macro_{col}" for col in macro.columns})
-    return renamed.reindex(daily_index).ffill().reindex(columns=feature_columns)
+    return prepared.reindex(daily_index).ffill().reindex(columns=feature_columns)
 
 
 @cache_data(ttl=_FEATURE_CACHE_TTL_SECONDS)
@@ -268,7 +284,34 @@ def _build_feature_table_cached(
     return table
 
 
-def build_feature_table(ticker: str, price_data: pd.DataFrame, lookback_days: int = 252) -> pd.DataFrame:
+def _build_feature_table_uncached(
+    ticker: str,
+    price_data: pd.DataFrame,
+    *,
+    lookback_days: int,
+    shared_macro_table: pd.DataFrame | None,
+) -> pd.DataFrame:
+    normalized = _normalize_price_frame(price_data)
+    if normalized.empty:
+        logger.warning("Feature engineering skipped for %s: empty price data", ticker)
+        return pd.DataFrame()
+    table = _technical_features(normalized)
+    table = table.join(_fundamental_daily_features(ticker, table.index), how="left")
+    table = table.join(_macro_daily_features(table.index, shared_macro_table=shared_macro_table), how="left")
+    table = table.apply(pd.to_numeric, errors="coerce").astype("float64")
+    table.index.name = "Date"
+    if lookback_days > 0 and len(table) > lookback_days:
+        table = table.tail(int(lookback_days))
+    return table
+
+
+def build_feature_table(
+    ticker: str,
+    price_data: pd.DataFrame,
+    lookback_days: int = 252,
+    *,
+    shared_macro_table: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     try:
         clean_ticker = sanitize_ticker(ticker)
     except Exception:
@@ -279,6 +322,14 @@ def build_feature_table(ticker: str, price_data: pd.DataFrame, lookback_days: in
     if normalized.empty:
         logger.warning("Feature engineering skipped for %s: empty price data", clean_ticker or ticker)
         return pd.DataFrame()
+
+    if shared_macro_table is not None:
+        return _build_feature_table_uncached(
+            clean_ticker,
+            normalized,
+            lookback_days=int(lookback_days),
+            shared_macro_table=shared_macro_table,
+        )
 
     dates = tuple(pd.DatetimeIndex(normalized.index).strftime("%Y-%m-%d").tolist())
     return _build_feature_table_cached(
