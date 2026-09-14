@@ -434,13 +434,13 @@ def get_indicator_series(
 
 
 @cache_data(ttl=86400)
-def list_active_tickers(
+def list_active_ticker_details(
     *,
     primary_exchange: str | None = None,
     market: str = "stocks",
     otc: bool | None = None,
     limit: int | None = None,
-) -> list[str]:
+) -> list[dict[str, Any]]:
     params: dict[str, Any] = {
         "market": market,
         "active": "true",
@@ -453,7 +453,7 @@ def list_active_tickers(
     if otc is not None:
         params["otc"] = str(bool(otc)).lower()
 
-    tickers: list[str] = []
+    tickers: list[dict[str, Any]] = []
     seen: set[str] = set()
     cursor: str | None = None
 
@@ -477,7 +477,18 @@ def list_active_tickers(
             if symbol in seen:
                 continue
             seen.add(symbol)
-            tickers.append(symbol)
+            tickers.append(
+                {
+                    "ticker": symbol,
+                    "primary_exchange": row.get("primary_exchange"),
+                    "type": row.get("type"),
+                    "market": row.get("market"),
+                    "locale": row.get("locale"),
+                    "name": row.get("name"),
+                    "active": row.get("active"),
+                    "currency_name": row.get("currency_name"),
+                }
+            )
             if limit and len(tickers) >= limit:
                 return tickers[:limit]
 
@@ -491,6 +502,23 @@ def list_active_tickers(
             break
 
     return tickers[:limit] if limit else tickers
+
+
+@cache_data(ttl=86400)
+def list_active_tickers(
+    *,
+    primary_exchange: str | None = None,
+    market: str = "stocks",
+    otc: bool | None = None,
+    limit: int | None = None,
+) -> list[str]:
+    rows = list_active_ticker_details(
+        primary_exchange=primary_exchange,
+        market=market,
+        otc=otc,
+        limit=limit,
+    )
+    return [str(row.get("ticker") or "").strip().upper() for row in rows if str(row.get("ticker") or "").strip()]
 
 
 def _safe_float(value: Any) -> float | None:

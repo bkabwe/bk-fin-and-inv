@@ -20,11 +20,11 @@ SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 SEC_EDGAR_CONTACT_EMAIL_ENV = "SEC_EDGAR_CONTACT_EMAIL"
 SEC_EDGAR_DEFAULT_CONTACT_EMAIL = "set-this-to-your-email@example.com"
+SEC_EDGAR_MAX_REQUESTS_PER_SECOND_ENV = "SEC_EDGAR_MAX_REQUESTS_PER_SECOND"
 REQUEST_TIMEOUT_SECONDS = 20
 REQUEST_MAX_RETRIES = 3
 REQUEST_BACKOFF_BASE_SECONDS = 1.0
 SEC_MAX_REQUESTS_PER_SECOND = 10.0
-SEC_MIN_REQUEST_INTERVAL_SECONDS = 1.0 / SEC_MAX_REQUESTS_PER_SECOND
 
 _RATE_LIMIT_LOCK = threading.Lock()
 _LAST_REQUEST_TS = 0.0
@@ -194,13 +194,23 @@ def _sec_headers() -> dict[str, str]:
     }
 
 
+def _sec_max_requests_per_second() -> float:
+    raw = str(os.getenv(SEC_EDGAR_MAX_REQUESTS_PER_SECOND_ENV, "")).strip()
+    try:
+        value = float(raw) if raw else SEC_MAX_REQUESTS_PER_SECOND
+    except Exception:
+        value = SEC_MAX_REQUESTS_PER_SECOND
+    return max(min(value, SEC_MAX_REQUESTS_PER_SECOND), 0.1)
+
+
 def _throttle_request_rate() -> None:
     global _LAST_REQUEST_TS
     with _RATE_LIMIT_LOCK:
         now = time.monotonic()
         elapsed = now - _LAST_REQUEST_TS
-        if elapsed < SEC_MIN_REQUEST_INTERVAL_SECONDS:
-            time.sleep(SEC_MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+        min_interval = 1.0 / _sec_max_requests_per_second()
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
         _LAST_REQUEST_TS = time.monotonic()
 
 

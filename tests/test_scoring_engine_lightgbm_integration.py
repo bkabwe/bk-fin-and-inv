@@ -50,6 +50,10 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
     def setUp(self):
         if hasattr(scoring_engine._load_live_lightgbm_models, "clear"):
             scoring_engine._load_live_lightgbm_models.clear()
+        if hasattr(scoring_engine._load_live_lightgbm_manifest, "clear"):
+            scoring_engine._load_live_lightgbm_manifest.clear()
+        if hasattr(scoring_engine._load_live_lightgbm_batch, "clear"):
+            scoring_engine._load_live_lightgbm_batch.clear()
 
     def test_short_horizon_weights_include_lightgbm_component(self):
         backtest = {"arima_rmse": 2.0, "trend_rmse": 1.0, "n_windows": 4}
@@ -189,7 +193,22 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         self.assertNotIn("LightGBM", result["short_term_basis"])
         self.assertNotIn("LightGBM", result["medium_term_basis"])
         self.assertIn("ARIMA", result["short_term_basis"])
-        self.assertTrue(any(msg.startswith("LightGBM: no saved return models under") for msg in result["models_skipped"]))
+        self.assertTrue(any(msg.startswith("LightGBM: no saved return models available from live manifest/batch") for msg in result["models_skipped"]))
+
+    def test_live_model_loader_prefers_release_batch_manifest(self):
+        model_30 = object()
+        model_180 = object()
+        with (
+            patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value={"latest_batch": {"asset_url": "https://example/batch.joblib"}}),
+            patch("modules.scoring_engine._load_live_lightgbm_batch", return_value={"models": {"AAPL": {30: model_30, 180: model_180}}}) as batch_mock,
+            patch("modules.scoring_engine.load_return_models") as legacy_mock,
+        ):
+            models = scoring_engine._load_live_lightgbm_models("AAPL")
+
+        batch_mock.assert_called_once_with("https://example/batch.joblib")
+        legacy_mock.assert_not_called()
+        self.assertEqual(models, {30: model_30, 180: model_180})
 
     def test_live_projection_uses_only_30d_and_180d_lightgbm_models(self):
         data = _sample_projection_data()

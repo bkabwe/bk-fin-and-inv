@@ -156,6 +156,41 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
         self.assertEqual(macro_mock.call_count, 1)
         self.assertEqual(len(first), len(second))
 
+    def test_feature_table_uses_shared_macro_table_without_refetching_fred(self):
+        price_data = _sample_price_frame(40)
+        shared_macro = pd.DataFrame(
+            {
+                "dgs10_level": np.linspace(4.0, 4.2, num=60),
+                "dgs10_delta_5d": np.linspace(0.0, 0.1, num=60),
+                "dgs10_pct_change_5d": np.linspace(0.0, 0.01, num=60),
+                "dgs10_delta_30d": np.linspace(0.0, 0.2, num=60),
+                "dgs10_pct_change_30d": np.linspace(0.0, 0.02, num=60),
+                "cpiaucsl_level": np.linspace(300.0, 302.0, num=60),
+                "cpiaucsl_delta_5d": np.linspace(0.0, 0.3, num=60),
+                "cpiaucsl_pct_change_5d": np.linspace(0.0, 0.01, num=60),
+                "cpiaucsl_delta_30d": np.linspace(0.0, 1.0, num=60),
+                "cpiaucsl_pct_change_30d": np.linspace(0.0, 0.03, num=60),
+                "fedfunds_level": np.linspace(5.0, 5.1, num=60),
+                "fedfunds_delta_5d": np.linspace(0.0, 0.05, num=60),
+                "fedfunds_pct_change_5d": np.linspace(0.0, 0.01, num=60),
+                "fedfunds_delta_30d": np.linspace(0.0, 0.1, num=60),
+                "fedfunds_pct_change_30d": np.linspace(0.0, 0.02, num=60),
+            },
+            index=pd.date_range("2023-12-15", periods=60, freq="D"),
+        )
+        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}):
+            with patch("modules.feature_engineering.fred_client.get_macro_feature_table") as macro_mock:
+                table = feature_engineering.build_feature_table(
+                    "AAPL",
+                    price_data,
+                    lookback_days=40,
+                    shared_macro_table=shared_macro,
+                )
+
+        macro_mock.assert_not_called()
+        self.assertFalse(table.empty)
+        self.assertFalse(table["macro_dgs10_level"].isna().all())
+
 
 if __name__ == "__main__":
     unittest.main()

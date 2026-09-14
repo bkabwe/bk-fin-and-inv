@@ -16,6 +16,12 @@ from modules.lightgbm_model import (
     load_return_models,
     predict_forward_return,
 )
+from modules.lightgbm_batch import (
+    DEFAULT_BATCH_ASSET_NAME,
+    fetch_live_manifest,
+    get_batch_models_for_ticker,
+    load_return_model_batch_from_url,
+)
 from modules.logger import get_logger
 from modules.longterm_analysis import analyze_longterm_technical_score
 from modules.macro_regime import get_macro_regime
@@ -35,6 +41,7 @@ _MARKET_CAP_CONFIDENCE_PADDING = {
 }
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 LIGHTGBM_LIVE_MODEL_DIR = _REPO_ROOT / "data" / "lightgbm_return_models"
+LIGHTGBM_BATCH_LOCAL_PATH = _REPO_ROOT / "data" / DEFAULT_BATCH_ASSET_NAME
 
 # Conservative live rollout based on honestly-reported walk-forward evidence:
 # - 30d: 89 tickers across two disjoint random samples, 6 windows/ticker, LightGBM beat
@@ -346,9 +353,46 @@ def _has_lightgbm_backtest_support(backtest: dict | None) -> bool:
 
 
 @cache_data(ttl=3600)
+def _load_live_lightgbm_manifest() -> dict:
+    try:
+        manifest = fetch_live_manifest()
+    except Exception as exc:
+        logger.warning("Live LightGBM manifest unavailable: %s", exc)
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
+@cache_data(ttl=3600)
+def _load_live_lightgbm_batch(asset_url: str) -> dict:
+    try:
+        batch = load_return_model_batch_from_url(asset_url)
+    except Exception as exc:
+        logger.warning("Live LightGBM batch unavailable from %s: %s", asset_url, exc)
+        return {}
+    return batch if isinstance(batch, dict) else {}
+
+
+@cache_data(ttl=3600)
 def _load_live_lightgbm_models(ticker: str) -> dict[int, object]:
     if not LIGHTGBM_AVAILABLE:
         return {}
+    manifest = _load_live_lightgbm_manifest()
+    batch_asset_url = (((manifest or {}).get("latest_batch") or {}).get("asset_url") or "").strip()
+    if batch_asset_url:
+        batch = _load_live_lightgbm_batch(batch_asset_url)
+        models = get_batch_models_for_ticker(batch, ticker, horizons=(30, 180))
+        if models:
+            return models
+    if LIGHTGBM_BATCH_LOCAL_PATH.exists():
+        try:
+            from modules.lightgbm_batch import load_return_model_batch
+
+            batch = load_return_model_batch(LIGHTGBM_BATCH_LOCAL_PATH)
+            models = get_batch_models_for_ticker(batch, ticker, horizons=(30, 180))
+            if models:
+                return models
+        except Exception as exc:
+            logger.warning("Local LightGBM batch load failed: %s", exc)
     return load_return_models(LIGHTGBM_LIVE_MODEL_DIR / str(ticker).upper(), horizons=(30, 180))
 
 
@@ -364,7 +408,14 @@ def _live_lightgbm_price_projections(
 
     models = _load_live_lightgbm_models(ticker)
     if not models:
-        return {}, [], [f"LightGBM: no saved return models under {LIGHTGBM_LIVE_MODEL_DIR / str(ticker).upper()}"]
+        return (
+            {},
+            [],
+            [
+                "LightGBM: no saved return models available from live manifest/batch "
+                f"or local fallback under {LIGHTGBM_LIVE_MODEL_DIR / str(ticker).upper()}"
+            ],
+        )
 
     try:
         feature_table = build_feature_table(ticker, data, lookback_days=len(data))
@@ -1005,7 +1056,13 @@ def analyze_stock(
 _MAX_NON_TECHNICAL_SCORE = 56
 
 
-def fast_screen_score(ticker: str, period: str = "1y", interval: str = "1d") -> tuple[int, str | None]:
+def fast_screen_score(
+    ticker: str,
+    period: str = "1y",
+    interval: str = "1d",
+    *,
+    data: pd.DataFrame | None = None,
+) -> tuple[int, str | None]:
     """Compute only the technical subscore for a ticker (fast, cheap).
 
     Returns ``(technical_score_out_of_100, error_reason)`` where ``error_reason``
@@ -1020,7 +1077,7 @@ def fast_screen_score(ticker: str, period: str = "1y", interval: str = "1d") -> 
     backtesting) to serve as a cheap first-pass filter.
     """
     try:
-        data = get_stock_data(ticker, period=period, interval=interval)
+        data = data if data is not None else get_stock_data(ticker, period=period, interval=interval)
         if data is None or data.empty:
             return 0, "no data"
         technical = analyze_technical(data)
