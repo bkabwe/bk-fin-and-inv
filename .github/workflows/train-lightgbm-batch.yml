@@ -12,6 +12,9 @@ env:
   PYTHON_VERSION: '3.11'
   MATRIX_JOBS: '4'
   LIGHTGBM_RELEASE_REPOSITORY: ${{ github.repository }}
+  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+  FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+  SEC_EDGAR_CONTACT_EMAIL: ${{ secrets.SEC_EDGAR_CONTACT_EMAIL }}
 
 jobs:
   discover:
