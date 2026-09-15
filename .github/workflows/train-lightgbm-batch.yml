@@ -11,6 +11,7 @@ permissions:
 env:
   PYTHON_VERSION: '3.11'
   MATRIX_JOBS: '4'
+  MAX_DISCOVERY_TICKERS: '1200'
   LIGHTGBM_RELEASE_REPOSITORY: ${{ github.repository }}
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
   FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -36,7 +37,8 @@ jobs:
           python scripts/lightgbm_batch_pipeline.py discover \
             --output /tmp/lightgbm/discovery.json \
             --macro-output /tmp/lightgbm/shared_macro.joblib \
-            --matrix-jobs "$MATRIX_JOBS"
+            --matrix-jobs "$MATRIX_JOBS" \
+            --max-tickers "$MAX_DISCOVERY_TICKERS"
       - name: Upload training inputs
         uses: actions/upload-artifact@v4
         with:
