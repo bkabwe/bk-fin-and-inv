@@ -30,6 +30,12 @@ brew install libomp
 - `SEC_EDGAR_CONTACT_EMAIL` — optional contact email embedded in SEC EDGAR
   `User-Agent` headers. If unset, the app uses a placeholder and logs a warning;
   setting a real contact is recommended by SEC API guidance.
+- `BREVO_API_KEY` — required for the scheduled scan/grading workflows that send
+  transactional HTML email reports through Brevo's HTTPS API.
+- `SCAN_EMAIL_RECIPIENTS` — comma-separated email recipients for scheduled scan
+  and grading reports. Whitespace around addresses is ignored.
+- `SCAN_EMAIL_FROM` — verified Brevo sender email address used with the fixed
+  sender display name `BK Self`.
 
 You can provide it either as a normal shell environment variable:
 
@@ -44,6 +50,9 @@ Or by creating a `.env` file in the project root (automatically loaded at startu
 POLYGON_API_KEY=your_polygon_api_key
 FRED_API_KEY=your_fred_api_key
 SEC_EDGAR_CONTACT_EMAIL=you@example.com
+BREVO_API_KEY=your_brevo_api_key
+SCAN_EMAIL_RECIPIENTS=you@example.com,second@example.com
+SCAN_EMAIL_FROM=you@example.com
 ```
 
 > Starter-plan behavior used by this app: unlimited API calls, up to 5 years of
@@ -157,6 +166,31 @@ Short-Term and Medium-Term scoring logic/weights are unchanged.
 This project is for educational/research use only and is **not financial advice**.
 
 ## Recent improvements
+
+### Scheduled scan and grading email workflows
+
+The repository now includes four scheduled GitHub Actions workflows that reuse
+the promoted LightGBM `latest.json` manifest universe and email finance-themed
+HTML reports via Brevo:
+
+- `.github/workflows/scan-email-short-term.yml`
+- `.github/workflows/scan-email-medium-term.yml`
+- `.github/workflows/grading-report-short-term.yml`
+- `.github/workflows/grading-report-medium-term.yml`
+
+The scan workflows run `scripts/scan_email_report.py` for short-term or
+medium-term profit-opportunity horizons, attach screener/profit-opportunity top
+75 CSVs, and record the profit-opportunity picks into `data/predictions.json`
+for later grading. The grading workflows run `scripts/grading_report.py` to
+evaluate the exact prior recorded scan batch using both point-in-time resolution
+and max-price-since-scan excursion checks.
+
+### Track-record bugfix: Stock Analysis no longer auto-records predictions
+
+Viewing a ticker on the Stock Analysis page no longer writes passive
+`stock_analysis` predictions into `data/predictions.json`. Track-record entries
+are now created only from deliberate profit-opportunity scans (interactive or
+scheduled), which keeps Track Record totals free of browse-noise.
 
 ### Split-adjusted price data
 All historical OHLCV data is now sourced from Polygon aggregates with

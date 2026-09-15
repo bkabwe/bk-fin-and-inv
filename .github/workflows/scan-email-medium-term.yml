@@ -1,0 +1,32 @@
+name: Scan Email Medium-Term
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 1 */2 *'
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+  LIGHTGBM_RELEASE_REPOSITORY: ${{ github.repository }}
+  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+  FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+  SEC_EDGAR_CONTACT_EMAIL: ${{ secrets.SEC_EDGAR_CONTACT_EMAIL }}
+  BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+  SCAN_EMAIL_RECIPIENTS: ${{ secrets.SCAN_EMAIL_RECIPIENTS }}
+  SCAN_EMAIL_FROM: ${{ secrets.SCAN_EMAIL_FROM }}
+
+jobs:
+  scan-email-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Send medium-term scan email report
+        run: python scripts/scan_email_report.py --horizon medium_term
