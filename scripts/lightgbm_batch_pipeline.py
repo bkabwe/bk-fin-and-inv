@@ -199,12 +199,29 @@ def discover(args: argparse.Namespace) -> int:
     end_date = _utc_now().date()
     start_date = end_date - timedelta(days=int(args.macro_lookback_days))
     macro_table = get_macro_feature_table(start_date, end_date)
+    max_tickers = int(getattr(args, "max_tickers", 0) or 0)
+    if max_tickers > 0 and len(filtered) > max_tickers:
+        ranked = sorted(enumerate(filtered), key=lambda pair: -float(pair[1].get("fast_score") or 0.0))
+        retained_indices = sorted(idx for idx, _ in ranked[:max_tickers])
+        for cap_offset, (original_index, item) in enumerate(ranked[max_tickers:], start=1):
+            ticker = str(item.get("ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            skipped_key = f"{ticker}__cap{cap_offset}_{original_index}"
+            skipped[skipped_key] = {
+                "reason": "max_tickers_cap",
+                "ticker": ticker,
+                "fast_score": float(item.get("fast_score") or 0.0),
+            }
+        filtered = [filtered[idx] for idx in retained_indices]
+
     output_payload = {
         "discovered_at": discovered_at,
         "price_floor": float(args.price_floor),
         "fast_screen_min_score": int(args.fast_screen_min_score),
         "fast_screen_margin": int(args.fast_screen_margin),
         "fast_screen_threshold": int(fast_screen_threshold),
+        "max_tickers": max_tickers if max_tickers > 0 else None,
         "tickers": filtered,
         "skipped": skipped,
         "matrix_jobs": int(args.matrix_jobs),
@@ -490,6 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument("--fast-screen-interval", default="1d")
     discover_parser.add_argument("--matrix-jobs", type=int, default=4)
     discover_parser.add_argument("--macro-lookback-days", type=int, default=365 * 5)
+    discover_parser.add_argument("--max-tickers", type=int, default=0)
     discover_parser.set_defaults(func=discover)
 
     train_parser = subparsers.add_parser("train-shard")
