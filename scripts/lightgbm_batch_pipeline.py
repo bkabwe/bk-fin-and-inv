@@ -145,8 +145,12 @@ class GitHubReleaseClient:
                 payload = response.json()
             except ValueError as exc:
                 raise RuntimeError(f"GitHub asset upload succeeded but returned invalid JSON for {asset_name}") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f"GitHub asset upload succeeded but returned unexpected JSON payload type for {asset_name}"
+                )
             logger.info("Uploaded asset %s successfully", asset_name)
-            return payload if isinstance(payload, dict) else {}
+            return payload
         if last_error is not None:
             raise RuntimeError(f"GitHub asset upload failed for {asset_name}: {last_error}") from last_error
         raise RuntimeError(f"GitHub asset upload failed for {asset_name}: exhausted retries")

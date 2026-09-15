@@ -13,7 +13,7 @@ from scripts.lightgbm_batch_pipeline import GitHubReleaseClient
 class _FakeResponse:
     def __init__(self, status_code: int, payload: dict | Exception | None = None, text: str = ""):
         self.status_code = status_code
-        self._payload = payload or {}
+        self._payload = {} if payload is None else payload
         self.text = text
 
     def json(self):
@@ -171,6 +171,18 @@ class GitHubReleaseClientUploadTests(unittest.TestCase):
             asset_path = Path(tmpdir) / "asset.bin"
             asset_path.write_bytes(b"hello world")
             with self.assertRaisesRegex(RuntimeError, "returned invalid JSON"):
+                client.upload_asset(release, asset_path, "asset.bin")
+
+    def test_upload_asset_raises_when_response_json_is_not_object(self):
+        client = GitHubReleaseClient("bkabwe/bk-fin-and-inv", "test-token")
+        client.delete_asset_if_exists = MagicMock()
+        client.session.post = MagicMock(return_value=_FakeResponse(201, payload=[]))
+        release = {"upload_url": "https://uploads.github.test/upload{?name}"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            asset_path = Path(tmpdir) / "asset.bin"
+            asset_path.write_bytes(b"hello world")
+            with self.assertRaisesRegex(RuntimeError, "unexpected JSON payload type"):
                 client.upload_asset(release, asset_path, "asset.bin")
 
 
