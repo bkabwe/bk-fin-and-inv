@@ -107,9 +107,9 @@ class LightGBMBatchPipelineTests(unittest.TestCase):
             payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual([item["ticker"] for item in payload["tickers"]], ["AAA", "BBB"])
             self.assertEqual(payload["tickers"][0]["exchange"], "XNAS")
-            capped = [entry for entry in payload["skipped"].values() if entry.get("reason") == "max_tickers_cap"]
-            self.assertEqual(len(capped), 1)
-            self.assertEqual(capped[0]["ticker"], "AAA")
+            duplicate = [entry for entry in payload["skipped"].values() if entry.get("reason") == "duplicate_ticker"]
+            self.assertEqual(len(duplicate), 1)
+            self.assertEqual(duplicate[0]["ticker"], "AAA")
 
     def test_discover_cap_keeps_unique_tickers_when_duplicate_scores_are_higher(self):
         rows = [
@@ -147,6 +147,9 @@ class LightGBMBatchPipelineTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual([item["ticker"] for item in payload["tickers"]], ["AAA", "BBB"])
+            skipped_reasons = [(entry.get("ticker"), entry.get("reason")) for entry in payload["skipped"].values()]
+            self.assertIn(("AAA", "duplicate_ticker"), skipped_reasons)
+            self.assertIn(("CCC", "max_tickers_cap"), skipped_reasons)
 
 
 class _FakeResponse:

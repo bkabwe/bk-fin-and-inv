@@ -255,9 +255,13 @@ def discover(args: argparse.Namespace) -> int:
             seen_tickers.add(ticker)
             unique_ranked.append((original_index, item))
 
-        retained_indices = sorted(idx for idx, _ in unique_ranked[:max_tickers])
-        capped_rows = [*duplicate_rows, *unique_ranked[max_tickers:]]
-        retained_indices.sort()
+        if len(unique_ranked) > max_tickers:
+            retained_indices = sorted(idx for idx, _ in unique_ranked[:max_tickers])
+            capped_rows = unique_ranked[max_tickers:]
+        else:
+            retained_indices = sorted(idx for idx, _ in unique_ranked)
+            capped_rows = []
+
         for cap_offset, (original_index, item) in enumerate(capped_rows, start=1):
             ticker = str(item.get("ticker") or "").strip().upper()
             if not ticker:
@@ -265,6 +269,16 @@ def discover(args: argparse.Namespace) -> int:
             skipped_key = f"{ticker}__cap{cap_offset}_{original_index}"
             skipped[skipped_key] = {
                 "reason": "max_tickers_cap",
+                "ticker": ticker,
+                "fast_score": float(item.get("fast_score") or 0.0),
+            }
+        for dup_offset, (original_index, item) in enumerate(duplicate_rows, start=1):
+            ticker = str(item.get("ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            skipped_key = f"{ticker}__dup{dup_offset}_{original_index}"
+            skipped[skipped_key] = {
+                "reason": "duplicate_ticker",
                 "ticker": ticker,
                 "fast_score": float(item.get("fast_score") or 0.0),
             }
