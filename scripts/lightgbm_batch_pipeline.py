@@ -201,7 +201,7 @@ def discover(args: argparse.Namespace) -> int:
     macro_table = get_macro_feature_table(start_date, end_date)
     max_tickers = int(getattr(args, "max_tickers", 0) or 0)
     if max_tickers > 0 and len(filtered) > max_tickers:
-        ranked = sorted(filtered, key=lambda item: (-int(item.get("fast_score", 0)), str(item.get("ticker") or "")))
+        ranked = sorted(filtered, key=lambda item: -int(item.get("fast_score", 0)))
         retained_tickers = {
             str(item.get("ticker") or "").strip().upper()
             for item in ranked[:max_tickers]
