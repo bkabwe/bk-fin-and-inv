@@ -202,13 +202,19 @@ def discover(args: argparse.Namespace) -> int:
     max_tickers = int(getattr(args, "max_tickers", 0) or 0)
     if max_tickers > 0 and len(filtered) > max_tickers:
         ranked = sorted(filtered, key=lambda item: (-int(item.get("fast_score", 0)), str(item.get("ticker") or "")))
-        retained = ranked[:max_tickers]
+        retained_tickers = {
+            str(item.get("ticker") or "").strip().upper()
+            for item in ranked[:max_tickers]
+            if str(item.get("ticker") or "").strip()
+        }
         for item in ranked[max_tickers:]:
             ticker = str(item.get("ticker") or "").strip().upper()
             if not ticker:
                 continue
             skipped[ticker] = {"reason": "max_tickers_cap", "fast_score": int(item.get("fast_score") or 0)}
-        filtered = retained
+        filtered = [
+            item for item in filtered if str(item.get("ticker") or "").strip().upper() in retained_tickers
+        ]
 
     output_payload = {
         "discovered_at": discovered_at,
