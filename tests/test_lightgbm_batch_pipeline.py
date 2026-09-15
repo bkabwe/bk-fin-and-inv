@@ -56,6 +56,25 @@ class GitHubReleaseClientUploadTests(unittest.TestCase):
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(client.session.post.call_count, 2)
 
+    def test_upload_asset_retries_http_429(self):
+        client = GitHubReleaseClient("bkabwe/bk-fin-and-inv", "test-token")
+        client.delete_asset_if_exists = MagicMock()
+        client.session.post = MagicMock(
+            side_effect=[
+                _FakeResponse(429, text="rate limited"),
+                _FakeResponse(201, {"ok": True}),
+            ]
+        )
+        release = {"upload_url": "https://uploads.github.test/upload{?name}"}
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch("scripts.lightgbm_batch_pipeline.time.sleep"):
+            asset_path = Path(tmpdir) / "asset.bin"
+            asset_path.write_bytes(b"hello world")
+            payload = client.upload_asset(release, asset_path, "asset.bin")
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(client.session.post.call_count, 2)
+
     def test_upload_asset_retries_request_exception(self):
         client = GitHubReleaseClient("bkabwe/bk-fin-and-inv", "test-token")
         client.delete_asset_if_exists = MagicMock()
