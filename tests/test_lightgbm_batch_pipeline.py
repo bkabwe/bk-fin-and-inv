@@ -111,6 +111,43 @@ class LightGBMBatchPipelineTests(unittest.TestCase):
             self.assertEqual(len(capped), 1)
             self.assertEqual(capped[0]["ticker"], "AAA")
 
+    def test_discover_cap_keeps_unique_tickers_when_duplicate_scores_are_higher(self):
+        rows = [
+            {"ticker": "AAA", "type": "CS", "primary_exchange": "XNAS"},
+            {"ticker": "AAA", "type": "CS", "primary_exchange": "XNYS"},
+            {"ticker": "BBB", "type": "CS", "primary_exchange": "XNAS"},
+            {"ticker": "CCC", "type": "CS", "primary_exchange": "XNAS"},
+        ]
+        scores = {"AAA": 95, "BBB": 90, "CCC": 80}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "discovery.json"
+            macro_output = Path(tmpdir) / "macro.joblib"
+            args = argparse.Namespace(
+                output=str(output),
+                macro_output=str(macro_output),
+                price_floor=0.1,
+                fast_screen_min_score=50,
+                fast_screen_margin=15,
+                fast_screen_period="1y",
+                fast_screen_interval="1d",
+                matrix_jobs=4,
+                macro_lookback_days=365,
+                max_tickers=2,
+            )
+
+            with (
+                patch.object(pipeline, "get_all_active_ticker_details", return_value=rows),
+                patch.object(pipeline, "get_stock_data", return_value=pd.DataFrame({"Close": [10.0, 11.0]})),
+                patch.object(pipeline, "fast_screen_score", side_effect=lambda ticker, **kwargs: (scores[ticker], None)),
+                patch.object(pipeline, "get_macro_feature_table", return_value=pd.DataFrame()),
+            ):
+                rc = pipeline.discover(args)
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([item["ticker"] for item in payload["tickers"]], ["AAA", "BBB"])
+
 
 class _FakeResponse:
     def __init__(self, status_code: int, payload: dict | Exception | None = None, text: str = ""):

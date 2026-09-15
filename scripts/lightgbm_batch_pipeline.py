@@ -242,18 +242,21 @@ def discover(args: argparse.Namespace) -> int:
     max_tickers = int(getattr(args, "max_tickers", 0) or 0)
     if max_tickers > 0 and len(filtered) > max_tickers:
         ranked = sorted(enumerate(filtered), key=lambda pair: -float(pair[1].get("fast_score") or 0.0))
-        retained_indices: list[int] = []
-        retained_tickers: set[str] = set()
-        capped_rows: list[tuple[int, dict[str, Any]]] = []
+        unique_ranked: list[tuple[int, dict[str, Any]]] = []
+        duplicate_rows: list[tuple[int, dict[str, Any]]] = []
+        seen_tickers: set[str] = set()
         for original_index, item in ranked:
             ticker = str(item.get("ticker") or "").strip().upper()
             if not ticker:
                 continue
-            if len(retained_tickers) < max_tickers and ticker not in retained_tickers:
-                retained_indices.append(original_index)
-                retained_tickers.add(ticker)
+            if ticker in seen_tickers:
+                duplicate_rows.append((original_index, item))
                 continue
-            capped_rows.append((original_index, item))
+            seen_tickers.add(ticker)
+            unique_ranked.append((original_index, item))
+
+        retained_indices = sorted(idx for idx, _ in unique_ranked[:max_tickers])
+        capped_rows = [*duplicate_rows, *unique_ranked[max_tickers:]]
         retained_indices.sort()
         for cap_offset, (original_index, item) in enumerate(capped_rows, start=1):
             ticker = str(item.get("ticker") or "").strip().upper()
