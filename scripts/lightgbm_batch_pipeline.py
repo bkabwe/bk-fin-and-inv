@@ -201,7 +201,7 @@ def discover(args: argparse.Namespace) -> int:
     macro_table = get_macro_feature_table(start_date, end_date)
     max_tickers = int(getattr(args, "max_tickers", 0) or 0)
     if max_tickers > 0 and len(filtered) > max_tickers:
-        ranked = sorted(enumerate(filtered), key=lambda pair: -int(pair[1].get("fast_score", 0)))
+        ranked = sorted(enumerate(filtered), key=lambda pair: -float(pair[1].get("fast_score") or 0.0))
         retained_indices = sorted(idx for idx, _ in ranked[:max_tickers])
         duplicate_counts: dict[str, int] = {}
         for _, item in ranked[max_tickers:]:
@@ -215,7 +215,7 @@ def discover(args: argparse.Namespace) -> int:
             skipped[skipped_key] = {
                 "reason": "max_tickers_cap",
                 "ticker": ticker,
-                "fast_score": int(item.get("fast_score") or 0),
+                "fast_score": float(item.get("fast_score") or 0.0),
             }
         filtered = [filtered[idx] for idx in retained_indices]
 
