@@ -63,7 +63,7 @@ class LightGBMBatchPipelineTests(unittest.TestCase):
                 {(entry.get("ticker"), entry.get("reason")) for entry in payload["skipped"].values()},
             )
 
-    def test_discover_cap_respects_max_with_duplicate_tickers(self):
+    def test_discover_cap_counts_unique_tickers_with_duplicate_rows(self):
         rows = [
             {"ticker": "AAA", "type": "CS", "primary_exchange": "XNAS"},
             {"ticker": "AAA", "type": "CS", "primary_exchange": "XNYS"},
@@ -84,7 +84,7 @@ class LightGBMBatchPipelineTests(unittest.TestCase):
                 fast_screen_interval="1d",
                 matrix_jobs=4,
                 macro_lookback_days=365,
-                max_tickers=1,
+                max_tickers=2,
             )
 
             with (
@@ -105,12 +105,11 @@ class LightGBMBatchPipelineTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(len(payload["tickers"]), 1)
-            self.assertEqual(payload["tickers"][0]["ticker"], "AAA")
+            self.assertEqual([item["ticker"] for item in payload["tickers"]], ["AAA", "BBB"])
             self.assertEqual(payload["tickers"][0]["exchange"], "XNAS")
             capped = [entry for entry in payload["skipped"].values() if entry.get("reason") == "max_tickers_cap"]
-            self.assertEqual(len(capped), 2)
-            self.assertEqual(sorted(entry["ticker"] for entry in capped), ["AAA", "BBB"])
+            self.assertEqual(len(capped), 1)
+            self.assertEqual(capped[0]["ticker"], "AAA")
 
 
 class _FakeResponse:
