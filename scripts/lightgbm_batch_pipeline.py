@@ -50,6 +50,7 @@ DEFAULT_FAST_SCREEN_MIN_SCORE = 50
 DEFAULT_FAST_SCREEN_MARGIN = 15
 DEFAULT_SANITY_TICKERS = ("AAPL", "MSFT")
 DEFAULT_BATCH_RETENTION = 4
+DEFAULT_MAX_TRAINABLE_TICKERS = 1200
 COMMON_STOCK_TYPES = {"CS", "COMMON STOCK", "COMMON_STOCK"}
 
 
@@ -196,6 +197,13 @@ def discover(args: argparse.Namespace) -> int:
             }
         )
 
+    max_tickers = int(args.max_tickers) if args.max_tickers else 0
+    if max_tickers > 0 and len(filtered) > max_tickers:
+        filtered.sort(key=lambda row: (-int(row["fast_score"]), row["ticker"]))
+        for row in filtered[max_tickers:]:
+            skipped[row["ticker"]] = {"reason": "max_tickers_cap", "fast_score": int(row["fast_score"])}
+        filtered = filtered[:max_tickers]
+
     end_date = _utc_now().date()
     start_date = end_date - timedelta(days=int(args.macro_lookback_days))
     macro_table = get_macro_feature_table(start_date, end_date)
@@ -205,6 +213,7 @@ def discover(args: argparse.Namespace) -> int:
         "fast_screen_min_score": int(args.fast_screen_min_score),
         "fast_screen_margin": int(args.fast_screen_margin),
         "fast_screen_threshold": int(fast_screen_threshold),
+        "max_tickers": max_tickers,
         "tickers": filtered,
         "skipped": skipped,
         "matrix_jobs": int(args.matrix_jobs),
@@ -490,6 +499,12 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument("--fast-screen-interval", default="1d")
     discover_parser.add_argument("--matrix-jobs", type=int, default=4)
     discover_parser.add_argument("--macro-lookback-days", type=int, default=365 * 5)
+    discover_parser.add_argument(
+        "--max-tickers",
+        type=int,
+        default=DEFAULT_MAX_TRAINABLE_TICKERS,
+        help="Cap the number of trainable tickers (highest fast-score first) to bound reduce-promote memory/artifact size. 0 disables the cap.",
+    )
     discover_parser.set_defaults(func=discover)
 
     train_parser = subparsers.add_parser("train-shard")
