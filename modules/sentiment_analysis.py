@@ -3,8 +3,6 @@ from __future__ import annotations
 from functools import lru_cache
 from statistics import mean
 
-from textblob import TextBlob
-
 from modules.data_fetcher import get_news, get_stock_info
 from modules.logger import get_logger
 
@@ -14,6 +12,7 @@ try:
     import streamlit as st
 
     cache_data = st.cache_data
+    cache_resource = st.cache_resource
 except Exception:  # pragma: no cover
 
     def cache_data(ttl: int | None = None):
@@ -21,6 +20,20 @@ except Exception:  # pragma: no cover
             return lru_cache(maxsize=128)(func)
 
         return decorator
+
+    def cache_resource(func):
+        return lru_cache(maxsize=1)(func)
+
+
+@cache_resource
+def _load_finbert_pipeline():
+    try:
+        from transformers import pipeline
+
+        return pipeline("sentiment-analysis", model="ProsusAI/finbert")
+    except Exception as exc:
+        logger.warning("Unable to load FinBERT model, falling back to neutral headlines: %s", exc)
+        return None
 
 
 @cache_data(ttl=3600)
@@ -48,11 +61,27 @@ def _get_market_sentiment_signals(ticker: str) -> dict:
 
 def analyze_sentiment(ticker: str) -> dict:
     scored = []
+    scored_inputs = []
     for article in get_news(ticker):
         title = article.get("title") or article.get("content", {}).get("title")
         if not title:
             continue
-        score = TextBlob(title).sentiment.polarity
+        scored_inputs.append((article, title))
+
+    finbert = _load_finbert_pipeline() if scored_inputs else None
+    if finbert is None:
+        model_outputs = [{"label": "neutral", "score": 0.0} for _ in scored_inputs]
+    else:
+        try:
+            model_outputs = finbert([title for _, title in scored_inputs])
+        except Exception as exc:
+            logger.warning("FinBERT inference failed, falling back to neutral headlines: %s", exc)
+            model_outputs = [{"label": "neutral", "score": 0.0} for _ in scored_inputs]
+
+    for (article, title), model_output in zip(scored_inputs, model_outputs):
+        model_label = str(model_output.get("label", "neutral")).lower()
+        confidence = float(model_output.get("score", 0.0) or 0.0)
+        score = confidence if model_label == "positive" else -confidence if model_label == "negative" else 0.0
         scored.append(
             {
                 "headline": title,

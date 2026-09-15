@@ -3,7 +3,8 @@ pandas
 numpy
 plotly
 ta
-textblob
+transformers
+torch
 requests
 python-dotenv
 beautifulsoup4==4.13.4

@@ -126,6 +126,8 @@ sentiment, and macro context, with all final scores clamped to that range.
 - **Fundamental score** contributes up to 30 points after valuation, growth,
   balance-sheet, and analyst-sentiment checks.
 - **Sentiment score** contributes up to 20 points from recent news tone.
+  Sentiment headline scoring uses FinBERT (`ProsusAI/finbert`) via the
+  `transformers` + `torch` dependencies.
 - **Overall macro regime** adds a modest overlay (`risk_on` / `risk_off`) of
   roughly +3 / -5 points.
 - **Sector momentum** now adds a small stock-specific overlay of **+3** when the
