@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ DEFAULT_FAST_SCREEN_MARGIN = 15
 DEFAULT_SANITY_TICKERS = ("AAPL", "MSFT")
 DEFAULT_BATCH_RETENTION = 4
 COMMON_STOCK_TYPES = {"CS", "COMMON STOCK", "COMMON_STOCK"}
+UPLOAD_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class GitHubReleaseClient:
@@ -100,20 +102,58 @@ class GitHubReleaseClient:
                 return
 
     def upload_asset(self, release: dict[str, Any], asset_path: Path, asset_name: str) -> dict[str, Any]:
+        asset_size_bytes = int(asset_path.stat().st_size)
+        logger.info("Uploading release asset %s (%d bytes)", asset_name, asset_size_bytes)
         self.delete_asset_if_exists(release, asset_name)
         upload_url = str(release.get("upload_url") or "").split("{", 1)[0]
-        with asset_path.open("rb") as fh:
-            response = self.session.post(
-                upload_url,
-                params={"name": asset_name},
-                headers={"Content-Type": "application/octet-stream"},
-                data=fh.read(),
-                timeout=120,
-            )
-        if response.status_code >= 400:
-            raise RuntimeError(f"GitHub asset upload failed: {response.status_code} {response.text}")
-        payload = response.json()
-        return payload if isinstance(payload, dict) else {}
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            logger.info("Uploading asset %s attempt %d/3", asset_name, attempt)
+            try:
+                with asset_path.open("rb") as fh:
+                    response = self.session.post(
+                        upload_url,
+                        params={"name": asset_name},
+                        headers={"Content-Type": "application/octet-stream"},
+                        data=fh,
+                        timeout=120,
+                    )
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == 3:
+                    raise RuntimeError(f"GitHub asset upload failed for {asset_name}: {exc}") from exc
+                logger.warning("Upload failed for %s on attempt %d/3: %s", asset_name, attempt, exc)
+                time.sleep(attempt * 2)
+                continue
+            if response.status_code >= 400:
+                is_retryable = int(response.status_code) in UPLOAD_RETRYABLE_STATUS_CODES
+                if not is_retryable or attempt == 3:
+                    raise RuntimeError(f"GitHub asset upload failed: {response.status_code} {response.text}")
+                logger.warning(
+                    "Upload failed for %s on attempt %d/3: HTTP %s",
+                    asset_name,
+                    attempt,
+                    response.status_code,
+                )
+                time.sleep(attempt * 2)
+                continue
+            if response.status_code != 201:
+                raise RuntimeError(
+                    f"GitHub asset upload returned unexpected status: {response.status_code} {response.text}"
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError(f"GitHub asset upload succeeded but returned invalid JSON for {asset_name}") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f"GitHub asset upload succeeded but returned unexpected JSON payload type for {asset_name}"
+                )
+            logger.info("Uploaded asset %s successfully", asset_name)
+            return payload
+        if last_error is not None:
+            raise RuntimeError(f"GitHub asset upload failed for {asset_name}: {last_error}") from last_error
+        raise RuntimeError(f"GitHub asset upload failed for {asset_name}: exhausted retries")
 
     def list_releases(self, *, per_page: int = 100) -> list[dict[str, Any]]:
         response = self.session.get(f"{self.api_base}/releases", params={"per_page": per_page}, timeout=60)
@@ -370,35 +410,49 @@ def _promote_outputs(args: argparse.Namespace, batch_path: Path, manifest_path: 
     token = str(os.getenv("GITHUB_TOKEN") or "").strip()
     if not repository or not token:
         raise RuntimeError("Promotion requires repository and GITHUB_TOKEN")
+    logger.info("Promoting outputs to GitHub Releases repository=%s tag=%s", repository, release_tag)
     client = GitHubReleaseClient(repository, token)
+    logger.info("Ensuring batch release exists for tag=%s", release_tag)
     batch_release = client.ensure_release(
         tag=release_tag,
         name=release_tag,
         body=f"Automated LightGBM batch promotion for {release_tag}",
         target_commitish=os.getenv("GITHUB_SHA"),
     )
+    logger.info("Uploading merged batch asset path=%s", batch_path)
     client.upload_asset(batch_release, batch_path, DEFAULT_BATCH_ASSET_NAME)
+    logger.info("Ensuring live manifest release exists for tag=%s", DEFAULT_LIVE_RELEASE_TAG)
     live_release = client.ensure_release(
         tag=DEFAULT_LIVE_RELEASE_TAG,
         name=DEFAULT_LIVE_RELEASE_TAG,
         body="Stable pointer to the latest promoted LightGBM batch manifest.",
         target_commitish=os.getenv("GITHUB_SHA"),
     )
+    logger.info("Uploading live manifest asset path=%s", manifest_path)
     client.upload_asset(live_release, manifest_path, DEFAULT_LIVE_MANIFEST_ASSET_NAME)
 
 
 def reduce_and_validate(args: argparse.Namespace) -> int:
+    logger.info("Starting reduce_and_validate for partial_dir=%s", args.partial_dir)
     partial_files = sorted(Path(args.partial_dir).glob("*.joblib"))
     if not partial_files:
         raise RuntimeError(f"No partial batch files found under {args.partial_dir}")
+    logger.info("Found %d partial shard files", len(partial_files))
     macro_table = joblib.load(Path(args.macro_file)) if args.macro_file else None
+    if args.macro_file:
+        macro_rows = len(macro_table) if macro_table is not None else 0
+        logger.info("Loaded shared macro table from %s with %d rows", args.macro_file, macro_rows)
     repository = resolve_release_repository(args.repository)
     created_at = _utc_now().isoformat().replace("+00:00", "Z")
     batch_id = str(args.batch_id).strip()
+    logger.info("Merging partial batches for batch_id=%s", batch_id)
     current_models, current_meta, expected_tickers, extras = _merge_partial_batches(partial_files)
+    logger.info("Merged partials into %d current models", len(current_models))
+    logger.info("Validating expected horizons and training row counts")
     _validate_expected_horizons(current_models, expected_tickers)
     _validate_row_counts(current_meta, int(args.min_rows_per_horizon))
 
+    logger.info("Creating and persisting current merged batch to %s", args.output_batch)
     current_batch = create_return_model_batch(
         batch_id=batch_id,
         models=current_models,
@@ -408,12 +462,16 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
     merged_batch_path = Path(args.output_batch)
     merged_batch_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(current_batch, merged_batch_path)
+    logger.info("Validating merged batch reload from %s", merged_batch_path)
     reloaded = load_return_model_batch(merged_batch_path)
     if not reloaded.get("models"):
         raise RuntimeError("Merged batch failed clean joblib reload")
+    logger.info("Running smoke test predictions on sanity tickers=%s", tuple(args.sanity_tickers))
     _smoke_test_predictions(current_models, macro_table, tuple(args.sanity_tickers))
 
+    logger.info("Loading previous live manifest and batch state from %s", repository)
     previous_manifest, previous_batch = _load_previous_live_state(repository)
+    logger.info("Merging current batch with previous live state")
     live_models, live_meta, carried_forward, dropped_stale = merge_current_and_previous_batches(
         current_batch,
         previous_manifest=previous_manifest,
@@ -428,6 +486,7 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
         created_at=created_at,
     )
     joblib.dump(live_batch, merged_batch_path)
+    logger.info("Building live manifest and writing to %s", args.output_manifest)
     manifest = build_live_manifest(
         repository=repository,
         batch_id=batch_id,
@@ -445,12 +504,17 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
     }
     manifest_path = Path(args.output_manifest)
     _json_dump(manifest_path, manifest)
-    print(
-        f"Merged current={len(current_models)} live={len(live_models)} carried_forward={len(carried_forward)} dropped_stale={len(dropped_stale)}"
+    merged_summary = (
+        f"Merged current={len(current_models)} live={len(live_models)} "
+        f"carried_forward={len(carried_forward)} dropped_stale={len(dropped_stale)}"
     )
+    logger.info(merged_summary)
+    print(merged_summary, flush=True)
     if args.promote:
+        logger.info("Promote flag enabled; uploading batch and manifest to releases")
         _promote_outputs(args, merged_batch_path, manifest_path, release_tag)
-        print(f"Promoted release tag {release_tag}")
+        logger.info("Promoted release tag %s", release_tag)
+        print(f"Promoted release tag {release_tag}", flush=True)
     return 0
 
 
