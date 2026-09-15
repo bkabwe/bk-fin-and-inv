@@ -203,11 +203,20 @@ def discover(args: argparse.Namespace) -> int:
     if max_tickers > 0 and len(filtered) > max_tickers:
         ranked = sorted(enumerate(filtered), key=lambda pair: -int(pair[1].get("fast_score", 0)))
         retained_indices = sorted(idx for idx, _ in ranked[:max_tickers])
+        duplicate_counts: dict[str, int] = {}
         for _, item in ranked[max_tickers:]:
             ticker = str(item.get("ticker") or "").strip().upper()
             if not ticker:
                 continue
-            skipped[ticker] = {"reason": "max_tickers_cap", "fast_score": int(item.get("fast_score") or 0)}
+            skipped_key = ticker
+            if skipped_key in skipped:
+                duplicate_counts[ticker] = duplicate_counts.get(ticker, 0) + 1
+                skipped_key = f"{ticker}__cap{duplicate_counts[ticker]}"
+            skipped[skipped_key] = {
+                "reason": "max_tickers_cap",
+                "ticker": ticker,
+                "fast_score": int(item.get("fast_score") or 0),
+            }
         filtered = [filtered[idx] for idx in retained_indices]
 
     output_payload = {

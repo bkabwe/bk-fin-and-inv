@@ -101,6 +101,10 @@ class LightGBMBatchPipelineTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(len(payload["tickers"]), 1)
+            self.assertEqual(payload["tickers"][0]["ticker"], "AAA")
+            self.assertEqual(payload["tickers"][0]["exchange"], "XNAS")
+            capped = [entry for entry in payload["skipped"].values() if entry.get("reason") == "max_tickers_cap"]
+            self.assertEqual(len(capped), 2)
 
 
 if __name__ == "__main__":
