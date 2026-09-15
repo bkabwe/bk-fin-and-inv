@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import os
 from io import BytesIO
 from typing import Any
@@ -124,7 +123,13 @@ def merge_current_and_previous_batches(
     previous_batch: dict[str, Any] | None = None,
     max_stale_cycles: int = 4,
 ) -> tuple[dict[str, dict[int, object]], dict[str, dict[str, Any]], list[str], list[str]]:
-    current_models = copy.deepcopy(((current_batch or {}).get("models") or {}))
+    # `live_models` below always rebuilds fresh per-ticker dicts from `current_models`
+    # rather than mutating it in place, so a defensive copy.deepcopy() here is not
+    # required for correctness. The trained model objects are immutable after
+    # training, and deep-copying them was needlessly duplicating the entire
+    # (multi-GB, for a full production batch) model set in memory during
+    # reduce-promote, which contributed to out-of-memory failures.
+    current_models = (current_batch or {}).get("models") or {}
     current_meta = get_batch_training_metadata(current_batch)
     batch_created_at = (current_batch or {}).get("created_at")
     live_models: dict[str, dict[int, object]] = {
