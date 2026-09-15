@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: '0 9 1 */2 *'
 
+permissions:
+  contents: read
+
 env:
   PYTHON_VERSION: '3.11'
   LIGHTGBM_RELEASE_REPOSITORY: ${{ github.repository }}
