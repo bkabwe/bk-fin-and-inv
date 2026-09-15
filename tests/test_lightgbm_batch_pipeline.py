@@ -11,12 +11,14 @@ from scripts.lightgbm_batch_pipeline import GitHubReleaseClient
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, payload: dict | None = None, text: str = ""):
+    def __init__(self, status_code: int, payload: dict | Exception | None = None, text: str = ""):
         self.status_code = status_code
         self._payload = payload or {}
         self.text = text
 
     def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
         return self._payload
 
 
@@ -146,6 +148,30 @@ class GitHubReleaseClientUploadTests(unittest.TestCase):
 
         self.assertEqual(client.session.post.call_count, 3)
         self.assertEqual(sleep_mock.call_args_list, [call(2), call(4)])
+
+    def test_upload_asset_raises_on_unexpected_success_status(self):
+        client = GitHubReleaseClient("bkabwe/bk-fin-and-inv", "test-token")
+        client.delete_asset_if_exists = MagicMock()
+        client.session.post = MagicMock(return_value=_FakeResponse(302, {"ok": True}, text="redirect"))
+        release = {"upload_url": "https://uploads.github.test/upload{?name}"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            asset_path = Path(tmpdir) / "asset.bin"
+            asset_path.write_bytes(b"hello world")
+            with self.assertRaisesRegex(RuntimeError, "unexpected status: 302"):
+                client.upload_asset(release, asset_path, "asset.bin")
+
+    def test_upload_asset_raises_when_response_json_invalid(self):
+        client = GitHubReleaseClient("bkabwe/bk-fin-and-inv", "test-token")
+        client.delete_asset_if_exists = MagicMock()
+        client.session.post = MagicMock(return_value=_FakeResponse(201, ValueError("bad json")))
+        release = {"upload_url": "https://uploads.github.test/upload{?name}"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            asset_path = Path(tmpdir) / "asset.bin"
+            asset_path.write_bytes(b"hello world")
+            with self.assertRaisesRegex(RuntimeError, "returned invalid JSON"):
+                client.upload_asset(release, asset_path, "asset.bin")
 
 
 if __name__ == "__main__":

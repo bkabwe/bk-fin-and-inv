@@ -137,7 +137,14 @@ class GitHubReleaseClient:
                 )
                 time.sleep(attempt * 2)
                 continue
-            payload = response.json()
+            if response.status_code != 201:
+                raise RuntimeError(
+                    f"GitHub asset upload returned unexpected status: {response.status_code} {response.text}"
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError(f"GitHub asset upload succeeded but returned invalid JSON for {asset_name}") from exc
             logger.info("Uploaded asset %s successfully", asset_name)
             return payload if isinstance(payload, dict) else {}
         if last_error is not None:
