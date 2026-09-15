@@ -9,7 +9,6 @@ from ta.trend import MACD
 
 from modules.data_fetcher import get_stock_data
 from modules.polygon_client import is_polygon_configured
-from modules.prediction_tracker import record_prediction
 from modules.scoring_engine import analyze_stock
 from modules.validators import sanitize_ticker
 
@@ -33,38 +32,6 @@ if ticker_input:
         st.error("No price data available.")
         st.stop()
     tech = analysis["technical"]["data"]
-
-    # Record projections for the track-record feature (one per horizon).
-    try:
-        _proj = analysis.get("projections") or {}
-        _current_price = float(_proj.get("current_price") or analysis.get("current_price") or 0)
-        _company = analysis.get("company") or ticker
-        _score = int(analysis.get("score") or 0)
-        _dq = str(_proj.get("data_quality") or "Limited")
-        for _horizon_key, _target_k, _low_k, _high_k, _upside_k, _basis_k in [
-            ("short_term", "short_term_target", "short_term_low", "short_term_high", "short_term_upside", "short_term_basis"),
-            ("medium_term", "medium_term_target", "medium_term_low", "medium_term_high", "medium_term_upside", "medium_term_basis"),
-            ("long_term", "long_term_target", "long_term_low", "long_term_high", "long_term_upside", "long_term_basis"),
-        ]:
-            _tp = float(_proj.get(_target_k) or 0)
-            _up = float(_proj.get(_upside_k) or 0)
-            if _current_price > 0 and _tp > 0:
-                record_prediction(
-                    ticker=ticker,
-                    company=_company,
-                    horizon=_horizon_key,
-                    current_price=_current_price,
-                    target_price=_tp,
-                    target_low=float(_proj.get(_low_k) or _tp * 0.95),
-                    target_high=float(_proj.get(_high_k) or _tp * 1.05),
-                    projected_upside_pct=_up,
-                    score=_score,
-                    data_quality=_dq,
-                    models_used=str(_proj.get(_basis_k) or ""),
-                    source="stock_analysis",
-                )
-    except Exception:
-        pass  # Never block UI for tracking failures
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
     fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="OHLC"), row=1, col=1)

@@ -187,6 +187,49 @@ def record_predictions_from_scan(
 
 
 # ---------------------------------------------------------------------------
+# Public API — excursion checks
+# ---------------------------------------------------------------------------
+
+def compute_max_price_since_scan(
+    ticker: str,
+    scan_date: str | date,
+    end_date: str | date | None = None,
+) -> float | None:
+    from modules.data_fetcher import get_stock_data  # local import to avoid circular
+
+    try:
+        start = scan_date if isinstance(scan_date, date) else date.fromisoformat(str(scan_date)[:10])
+    except ValueError:
+        return None
+
+    try:
+        stop = date.today() if end_date is None else (end_date if isinstance(end_date, date) else date.fromisoformat(str(end_date)[:10]))
+    except ValueError:
+        return None
+
+    if stop < start:
+        return None
+
+    days_back = max(30, (stop - start).days + 10)
+    df = get_stock_data(str(ticker or "").strip().upper(), period=f"{days_back}d", interval="1d")
+    if df.empty:
+        return None
+
+    price_col = "High" if "High" in df.columns else "Close" if "Close" in df.columns else None
+    if price_col is None:
+        return None
+
+    prices = df[price_col].astype(float)
+    candidates = [
+        float(price)
+        for idx, price in zip(prices.index, prices.values)
+        if start <= (idx.date() if hasattr(idx, "date") else date.fromisoformat(str(idx)[:10])) <= stop
+        and price == price
+    ]
+    return round(max(candidates), 4) if candidates else None
+
+
+# ---------------------------------------------------------------------------
 # Public API — resolution
 # ---------------------------------------------------------------------------
 

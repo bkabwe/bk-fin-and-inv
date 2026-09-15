@@ -1,0 +1,26 @@
+name: Grading Report Medium-Term
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 1 */2 *'
+
+env:
+  PYTHON_VERSION: '3.11'
+  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+  BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+  SCAN_EMAIL_RECIPIENTS: ${{ secrets.SCAN_EMAIL_RECIPIENTS }}
+  SCAN_EMAIL_FROM: ${{ secrets.SCAN_EMAIL_FROM }}
+
+jobs:
+  grading-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Send medium-term grading report
+        run: python scripts/grading_report.py --horizon medium_term
