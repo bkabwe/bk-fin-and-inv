@@ -201,20 +201,14 @@ def discover(args: argparse.Namespace) -> int:
     macro_table = get_macro_feature_table(start_date, end_date)
     max_tickers = int(getattr(args, "max_tickers", 0) or 0)
     if max_tickers > 0 and len(filtered) > max_tickers:
-        ranked = sorted(filtered, key=lambda item: -int(item.get("fast_score", 0)))
-        retained_tickers = {
-            str(item.get("ticker") or "").strip().upper()
-            for item in ranked[:max_tickers]
-            if str(item.get("ticker") or "").strip()
-        }
-        for item in ranked[max_tickers:]:
+        ranked = sorted(enumerate(filtered), key=lambda pair: -int(pair[1].get("fast_score", 0)))
+        retained_indices = sorted(idx for idx, _ in ranked[:max_tickers])
+        for _, item in ranked[max_tickers:]:
             ticker = str(item.get("ticker") or "").strip().upper()
             if not ticker:
                 continue
             skipped[ticker] = {"reason": "max_tickers_cap", "fast_score": int(item.get("fast_score") or 0)}
-        filtered = [
-            item for item in filtered if str(item.get("ticker") or "").strip().upper() in retained_tickers
-        ]
+        filtered = [filtered[idx] for idx in retained_indices]
 
     output_payload = {
         "discovered_at": discovered_at,
