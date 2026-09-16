@@ -32,12 +32,13 @@ from modules.lightgbm_batch import (
     batch_asset_part_name,
     batch_asset_urls_from_manifest,
     build_live_manifest,
+    combine_current_and_carried_forward,
     create_return_model_batch,
+    extract_carry_forward_state,
     fetch_live_manifest,
     get_batch_training_metadata,
     load_return_model_batch,
     load_return_model_batch_from_urls,
-    merge_current_and_previous_batches,
     resolve_release_repository,
 )
 from modules.lightgbm_model import (
@@ -447,7 +448,32 @@ def _smoke_test_predictions(models: dict[str, dict[int, object]], macro_table: p
         raise RuntimeError("No sanity tickers were present in the merged batch for smoke testing")
 
 
-def _load_previous_live_state(repository: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _needs_previous_batch_download(
+    previous_manifest: dict[str, Any], current_tickers: set[str], max_stale_cycles: int
+) -> bool:
+    # Downloading and deserializing the full previous live batch is a multi-GB
+    # operation. It is only useful for tickers that would actually be carried
+    # forward: present in the previous manifest, missing from this cycle's
+    # freshly trained `current_tickers`, and still within the stale-cycle
+    # retention window. Once the ticker universe stabilizes week over week,
+    # that carry-forward set is typically empty, so skip the expensive
+    # download entirely in that common case -- unconditionally downloading it
+    # (on top of the already-in-memory current batch) was a direct
+    # contributor to reduce-promote out-of-memory failures.
+    previous_tickers = (previous_manifest or {}).get("tickers") or {}
+    for ticker, prior_state in previous_tickers.items():
+        clean_ticker = str(ticker or "").strip().upper()
+        if not clean_ticker or clean_ticker in current_tickers:
+            continue
+        next_cycles = int((prior_state or {}).get("cycles_since_training") or 0) + 1
+        if next_cycles <= int(max_stale_cycles):
+            return True
+    return False
+
+
+def _load_previous_live_state(
+    repository: str, *, current_tickers: set[str] | None = None, max_stale_cycles: int = 4
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         manifest = fetch_live_manifest(repository=repository)
     except Exception as exc:
@@ -455,6 +481,9 @@ def _load_previous_live_state(repository: str) -> tuple[dict[str, Any], dict[str
         return {}, {}
     asset_urls = batch_asset_urls_from_manifest(manifest)
     if not asset_urls:
+        return manifest, {}
+    if not _needs_previous_batch_download(manifest, current_tickers or set(), max_stale_cycles):
+        logger.info("Skipping previous live batch download: no carry-forward candidate tickers")
         return manifest, {}
     try:
         batch = load_return_model_batch_from_urls(asset_urls)
@@ -570,23 +599,40 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
     _smoke_test_predictions(current_models, macro_table, tuple(args.sanity_tickers))
     logger.info("Smoke test predictions passed for sanity tickers=%s", tuple(args.sanity_tickers))
 
-    previous_manifest, previous_batch = _load_previous_live_state(repository)
-    live_models, live_meta, carried_forward, dropped_stale = merge_current_and_previous_batches(
-        current_batch,
+    current_tickers = set(current_models.keys())
+    trained_tickers = sorted(current_tickers)
+    # `current_batch`/`current_models` (the just-persisted, potentially
+    # multi-GB current model set) are dropped here, before fetching the
+    # previous live batch (also potentially multi-GB). Holding both fully
+    # deserialized in memory at once was pushing reduce-promote past the
+    # runner's memory ceiling once a previous live release exists to merge
+    # against -- the current set is reloaded from the file we just wrote
+    # further down, once the previous batch has been reduced to only the
+    # (typically much smaller) subset of models actually carried forward.
+    del current_batch, current_models, current_meta
+
+    previous_manifest, previous_batch = _load_previous_live_state(
+        repository,
+        current_tickers=current_tickers,
+        max_stale_cycles=int(args.max_stale_cycles),
+    )
+    carried_models, carried_meta, carried_forward, dropped_stale = extract_carry_forward_state(
+        current_tickers=current_tickers,
         previous_manifest=previous_manifest,
         previous_batch=previous_batch,
         max_stale_cycles=int(args.max_stale_cycles),
     )
-    # `previous_batch` (the full previous release's model set, potentially the
-    # largest single object held during reduce-promote) and `previous_manifest`
-    # are only needed transiently by merge_current_and_previous_batches() above:
-    # any model objects it decided to carry forward are already referenced by
-    # `live_models`. Dropping these references here (rather than letting them
-    # linger as live locals until the function returns) lets the previous
-    # batch's now-superseded/dropped model objects be garbage collected before
-    # we build and serialize `live_batch` below, reducing peak memory during
-    # the most memory-intensive part of reduce-promote.
+    # The full previous batch is only needed to extract the carried-forward
+    # subset above; drop it immediately afterward so it is never resident in
+    # memory alongside the reloaded current batch below.
     del previous_manifest, previous_batch
+
+    current_batch = load_return_model_batch(merged_batch_path)
+    live_models, live_meta = combine_current_and_carried_forward(
+        current_batch, carried_models=carried_models, carried_meta=carried_meta
+    )
+    del current_batch, carried_models, carried_meta
+
     release_tag = f"{DEFAULT_BATCH_RELEASE_PREFIX}-{batch_id}"
     live_batch = create_return_model_batch(
         batch_id=batch_id,
@@ -608,7 +654,7 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
     )
     manifest["current_run"] = {
         "expected_tickers": expected_tickers,
-        "trained_tickers": sorted(current_models.keys()),
+        "trained_tickers": trained_tickers,
         "carried_forward_tickers": carried_forward,
         "dropped_stale_tickers": dropped_stale,
         "skipped": extras.get("skipped") or {},
@@ -616,7 +662,7 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
     manifest_path = Path(args.output_manifest)
     _json_dump(manifest_path, manifest)
     print(
-        f"Merged current={len(current_models)} live={len(live_models)} carried_forward={len(carried_forward)} dropped_stale={len(dropped_stale)}"
+        f"Merged current={len(trained_tickers)} live={len(live_models)} carried_forward={len(carried_forward)} dropped_stale={len(dropped_stale)}"
     )
     if args.promote:
         _promote_outputs(args, merged_batch_path, manifest_path, release_tag)
