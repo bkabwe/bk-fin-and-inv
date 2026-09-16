@@ -64,6 +64,15 @@ except Exception:  # pragma: no cover
                     if ev is not None:
                         ev.set()
 
+            def clear() -> None:
+                """Mirror `st.cache_data`'s `.clear()` so callers (including
+                tests) can reset this cache the same way regardless of
+                whether Streamlit is installed."""
+                with _lock:
+                    _cache.clear()
+                    _inflight.clear()
+
+            wrapper.clear = clear
             return wrapper
 
         return decorator
@@ -164,7 +173,16 @@ def get_all_active_ticker_details() -> list[dict[str, Any]]:
 
 @cache_data(ttl=86400)
 def get_sp500_tickers() -> list[str]:
-    """Fetch S&P 500 constituents via Wikipedia table (index-membership source)."""
+    """Fetch S&P 500 constituents via Wikipedia table (index-membership source).
+
+    KNOWN LIMITATION (survivorship bias): this returns *current* index
+    membership only. Both LightGBM training and walk-forward backtests that
+    sample from this universe therefore only ever see tickers still in the
+    index today, which can inflate apparent historical accuracy relative to
+    what a point-in-time historical membership list would show. Treat
+    reported backtest win rates with that caveat in mind; a true fix would
+    require sourcing a point-in-time historical membership list.
+    """
     try:
         resp = requests.get(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",

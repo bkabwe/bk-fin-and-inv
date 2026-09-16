@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from functools import lru_cache
 from statistics import mean
 
@@ -15,9 +17,43 @@ try:
     cache_resource = st.cache_resource
 except Exception:  # pragma: no cover
 
-    def cache_data(ttl: int | None = None):
+    def cache_data(ttl: int | None = None):  # type: ignore[misc]
+        """TTL-aware, stampede-safe cache fallback for non-Streamlit usage."""
+
         def decorator(func):
-            return lru_cache(maxsize=128)(func)
+            _cache: dict = {}
+            _inflight: dict = {}
+            _lock = threading.Lock()
+
+            def wrapper(*args, **kwargs):
+                key = (args, tuple(sorted(kwargs.items())))
+                while True:
+                    now = time.monotonic()
+                    with _lock:
+                        entry = _cache.get(key)
+                        if entry is not None:
+                            value, ts = entry
+                            if ttl is None or (now - ts) < ttl:
+                                return value
+                        event = _inflight.get(key)
+                        if event is None:
+                            ev = threading.Event()
+                            _inflight[key] = ev
+                            break
+                    event.wait(timeout=300)
+
+                try:
+                    result = func(*args, **kwargs)
+                    with _lock:
+                        _cache[key] = (result, time.monotonic())
+                    return result
+                finally:
+                    with _lock:
+                        ev = _inflight.pop(key, None)
+                    if ev is not None:
+                        ev.set()
+
+            return wrapper
 
         return decorator
 
@@ -59,7 +95,7 @@ def _get_market_sentiment_signals(ticker: str) -> dict:
     }
 
 
-def analyze_sentiment(ticker: str) -> dict:
+def _analyze_sentiment_uncached(ticker: str) -> dict:
     scored = []
     scored_inputs = []
     for article in get_news(ticker):
@@ -78,7 +114,7 @@ def analyze_sentiment(ticker: str) -> dict:
             logger.warning("FinBERT inference failed, falling back to neutral headlines: %s", exc)
             model_outputs = [{"label": "neutral", "score": 0.0} for _ in scored_inputs]
 
-    for (article, title), model_output in zip(scored_inputs, model_outputs):
+    for (article, title), model_output in zip(scored_inputs, model_outputs, strict=False):
         model_label = str(model_output.get("label", "neutral")).lower()
         confidence = float(model_output.get("score", 0.0) or 0.0)
         score = confidence if model_label == "positive" else -confidence if model_label == "negative" else 0.0
@@ -134,3 +170,12 @@ def analyze_sentiment(ticker: str) -> dict:
         "put_call_ratio": extra.get("put_call_ratio"),
         "options_sentiment": options_interpretation,
     }
+
+
+# `analyze_sentiment`'s inputs (news headlines) are already cached upstream via
+# `get_news` (ttl=900), but FinBERT inference itself re-ran on every call even
+# when the underlying cached news hadn't changed. Cache the composed result
+# here too (same 15-minute TTL as `get_news`) so repeated calls for the same
+# ticker within that window skip both the news re-fetch *and* the FinBERT
+# batch-inference pass.
+analyze_sentiment = cache_data(ttl=900)(_analyze_sentiment_uncached)

@@ -160,6 +160,11 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
 
         with (
             patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            # `_load_live_lightgbm_models` checks the release-backed manifest/batch
+            # before falling back to `load_return_models`. Without this mock, the
+            # unpatched manifest lookup makes a real network call to GitHub
+            # Releases (and can download a multi-GB production model batch).
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value={}),
             patch("modules.scoring_engine.load_return_models", return_value={}) as load_mock,
             patch("modules.scoring_engine.predict_forward_return") as predict_mock,
             patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),
@@ -232,6 +237,7 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
 
         with (
             patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value={}),
             patch("modules.scoring_engine.load_return_models", return_value={30: model_30, 180: model_180, 720: model_720}) as load_mock,
             patch("modules.scoring_engine.predict_forward_return", side_effect=_predict) as predict_mock,
             patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),
@@ -281,6 +287,7 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
 
         with (
             patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value={}),
             patch("modules.scoring_engine.load_return_models", return_value={30: model_30, 180: model_180}),
             patch("modules.scoring_engine.predict_forward_return", side_effect=_predict),
             patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),

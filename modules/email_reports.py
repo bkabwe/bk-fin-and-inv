@@ -7,6 +7,10 @@ from typing import Iterable
 
 import requests
 
+from modules.logger import get_logger
+
+logger = get_logger(__name__)
+
 BREVO_EMAIL_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 
@@ -130,10 +134,10 @@ def send_brevo_email(
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
             sent_count += 1
-            print(f"Brevo email sent to {recipient}")
+            logger.info("Brevo email sent to %s", recipient)
         except Exception as exc:
             message = f"Brevo send failed for {recipient}: {exc}"
-            print(message)
+            logger.warning(message)
             failures.append(message)
 
     if failures:

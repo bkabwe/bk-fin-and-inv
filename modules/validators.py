@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import re
 
 TICKER_PATTERN = re.compile(r"^[A-Z0-9\-\.]{1,10}$")
@@ -21,8 +22,6 @@ def sanitize_ticker(ticker: str) -> str:
 def sanitize_ticker_list(tickers: list[str]) -> list[str]:
     result = []
     for ticker in tickers[:MAX_CUSTOM_TICKERS]:
-        try:
+        with contextlib.suppress(ValueError):
             result.append(sanitize_ticker(ticker))
-        except ValueError:
-            pass
     return result

@@ -3,17 +3,23 @@ name: Grading Report Medium-Term
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 9 1 */2 *'
+    # 30m after scan-email-medium-term to avoid racing on prediction storage.
+    - cron: '30 9 1 */2 *'
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: grading-report-medium-term
+  cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12'  # numpy==2.5.3 (requirements-workflows.txt) requires Python 3.12+
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
   BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
   SCAN_EMAIL_RECIPIENTS: ${{ secrets.SCAN_EMAIL_RECIPIENTS }}
   SCAN_EMAIL_FROM: ${{ secrets.SCAN_EMAIL_FROM }}
+  WORKFLOW_ALERT_RECIPIENTS: ${{ secrets.WORKFLOW_ALERT_RECIPIENTS }}
 
 jobs:
   grading-report:
@@ -24,6 +30,40 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-workflows.txt
       - name: Send medium-term grading report
         run: python scripts/grading_report.py --horizon medium_term
+      - name: Persist prediction tracker state
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain -- data/predictions.json)" ]; then
+            echo "No changes to data/predictions.json"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/predictions.json
+          git commit -m "chore: update prediction tracker state [skip ci]"
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected, rebasing onto latest and retrying ($attempt/3)"
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase "origin/${GITHUB_REF_NAME}"
+          done
+          git push
+
+  notify-on-failure:
+    needs: grading-report
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install notifier dependencies
+        run: pip install requests
+      - name: Send workflow-failure alert
+        run: python scripts/notify_workflow_failure.py --workflow "Grading Report Medium-Term"

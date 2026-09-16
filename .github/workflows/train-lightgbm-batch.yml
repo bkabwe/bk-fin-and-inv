@@ -3,18 +3,28 @@ name: Train LightGBM Batch
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 9 * * 1'
+    # Runs first so discover -> train -> reduce/promote finishes with a buffer
+    # before the short-term scan/grading crons read the freshly promoted manifest.
+    - cron: '0 6 * * 1'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: train-lightgbm-batch
+  cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12'  # numpy==2.5.3 (requirements-workflows.txt) requires Python 3.12+
   MATRIX_JOBS: '4'
   LIGHTGBM_RELEASE_REPOSITORY: ${{ github.repository }}
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
   FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
   SEC_EDGAR_CONTACT_EMAIL: ${{ secrets.SEC_EDGAR_CONTACT_EMAIL }}
+  BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+  SCAN_EMAIL_RECIPIENTS: ${{ secrets.SCAN_EMAIL_RECIPIENTS }}
+  SCAN_EMAIL_FROM: ${{ secrets.SCAN_EMAIL_FROM }}
+  WORKFLOW_ALERT_RECIPIENTS: ${{ secrets.WORKFLOW_ALERT_RECIPIENTS }}
 
 jobs:
   discover:
@@ -27,7 +37,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-workflows.txt
       - name: Generate batch id
         id: batch
         run: echo "batch_id=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
@@ -58,7 +68,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-workflows.txt
       - name: Download training inputs
         uses: actions/download-artifact@v4.1.3
         with:
@@ -84,6 +94,8 @@ jobs:
   reduce-promote:
     needs: [discover, train]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -92,7 +104,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-workflows.txt
       - name: Download training inputs
         uses: actions/download-artifact@v4.1.3
         with:
@@ -127,3 +139,17 @@ jobs:
           python scripts/lightgbm_batch_pipeline.py cleanup \
             --repository '${{ github.repository }}' \
             --keep-promoted-batches 4
+
+  notify-on-failure:
+    needs: [discover, train, reduce-promote]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install notifier dependencies
+        run: pip install requests
+      - name: Send workflow-failure alert
+        run: python scripts/notify_workflow_failure.py --workflow "Train LightGBM Batch"

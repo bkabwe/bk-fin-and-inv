@@ -1,7 +1,10 @@
 """Prediction Tracker — persist price projections and resolve them after their target date.
 
 Uses the same atomic-JSON-write pattern as modules/portfolio.py.
-Storage: data/predictions.json (excluded from git via .gitignore data/*.json).
+Storage: data/predictions.json. Unlike other data/*.json files, this one is
+explicitly un-ignored in .gitignore and committed back by CI (see the
+scan-email-* / grading-report-* workflows) so history survives across
+ephemeral workflow filesystems.
 """
 from __future__ import annotations
 
@@ -26,6 +29,21 @@ HORIZON_DAYS: dict[str, int] = {
     "short_term": 21,
     "medium_term": 90,
     "long_term": 365,
+}
+
+# Maps the internal row-dict keys populated by
+# modules.profit_opportunities.analyze_ticker_for_horizon (prefixed with "_"
+# like _rsi, stripped before display/API response) to the field names used
+# in a prediction record's "sub_scores" dict. These are the five technical
+# sub-scores flagged in the architecture review as suspected of being highly
+# correlated (see modules/scoring_engine.py's analyze_stock); recording them
+# here is what makes compute_subscore_correlation_stats() below usable.
+SUBSCORE_ROW_FIELDS: dict[str, str] = {
+    "_trend_score": "trend",
+    "_momentum_score": "momentum",
+    "_rs_score": "relative_strength",
+    "_breakout_score": "breakout",
+    "_volume_quality_score": "volume_quality",
 }
 
 
@@ -85,8 +103,12 @@ def record_prediction(
     data_quality: str,
     models_used: str,
     source: str,  # "profit_opportunities" | "stock_analysis" | "screener"
+    sub_scores: dict[str, float] | None = None,
 ) -> str | None:
     """Persist a prediction if no unresolved record exists for (ticker, horizon) today.
+
+    ``sub_scores`` optionally records the technical sub-score breakdown (see
+    SUBSCORE_ROW_FIELDS) at scan time, enabling compute_subscore_correlation_stats.
 
     Returns the prediction id if recorded, or None if it was deduped.
     """
@@ -123,6 +145,7 @@ def record_prediction(
         "data_quality": data_quality,
         "models_used": models_used,
         "source": source,
+        "sub_scores": dict(sub_scores) if sub_scores else None,
         "status": "pending",
         # resolved fields — filled in later
         "actual_price_at_target_date": None,
@@ -165,6 +188,11 @@ def record_predictions_from_scan(
             # low/high — gracefully fall back to ±5 % of target if missing
             target_low = float(row.get("target_low") or target_price * 0.95)
             target_high = float(row.get("target_high") or target_price * 1.05)
+            sub_scores = {
+                record_key: float(row[row_key])
+                for row_key, record_key in SUBSCORE_ROW_FIELDS.items()
+                if row.get(row_key) is not None
+            }
             pid = record_prediction(
                 ticker=ticker,
                 company=str(row.get("company") or row.get("Company") or ticker),
@@ -178,6 +206,7 @@ def record_predictions_from_scan(
                 data_quality=str(row.get("data_quality") or row.get("Confidence") or "Limited"),
                 models_used=str(row.get("basis") or row.get("Basis") or row.get("models_used") or ""),
                 source=source,
+                sub_scores=sub_scores or None,
             )
             if pid:
                 count += 1
@@ -195,8 +224,9 @@ def compute_max_price_since_scan(
     scan_date: str | date,
     end_date: str | date | None = None,
 ) -> float | None:
-    from modules.data_fetcher import get_stock_data  # local import to avoid circular
-
+    # Imported locally (rather than at module level) so tests can patch
+    # ``modules.data_fetcher.get_stock_data`` directly.
+    from modules.data_fetcher import get_stock_data
     try:
         start = scan_date if isinstance(scan_date, date) else date.fromisoformat(str(scan_date)[:10])
     except ValueError:
@@ -222,7 +252,7 @@ def compute_max_price_since_scan(
     prices = df[price_col].astype(float)
     candidates = [
         float(price)
-        for idx, price in zip(prices.index, prices.values)
+        for idx, price in zip(prices.index, prices.values, strict=False)
         if start <= (idx.date() if hasattr(idx, "date") else date.fromisoformat(str(idx)[:10])) <= stop
         and price == price
     ]
@@ -238,7 +268,9 @@ def resolve_pending_predictions() -> dict[str, int]:
 
     Returns a summary dict: {"resolved": n, "no_data": n, "still_pending": n}.
     """
-    from modules.data_fetcher import get_stock_data  # local import to avoid circular
+    # Imported locally (rather than at module level) so tests can patch
+    # ``modules.data_fetcher.get_stock_data`` directly.
+    from modules.data_fetcher import get_stock_data
 
     records = _load_all()
     today = date.today()
@@ -275,10 +307,10 @@ def resolve_pending_predictions() -> dict[str, int]:
                 for d in close.index
             ]
             # Find the closest available date on or after target_date.
-            candidates = [(d, p) for d, p in zip(index_dates, close.values) if d >= target_date]
+            candidates = [(d, p) for d, p in zip(index_dates, close.values, strict=False) if d >= target_date]
             if not candidates:
                 # Fall back to the most recent available date.
-                candidates = list(zip(index_dates, close.values))
+                candidates = list(zip(index_dates, close.values, strict=False))
             if not candidates:
                 raise ValueError("no price candidates")
 
@@ -421,3 +453,134 @@ def get_summary_stats() -> dict:
         "by_source": {s: _stats(v) for s, v in sources.items()},
         "by_confidence": {c: _stats(v) for c, v in confidences.items()},
     }
+
+
+# ---------------------------------------------------------------------------
+# Public API — score-vs-outcome validation
+# ---------------------------------------------------------------------------
+
+def _pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
+    """Pearson correlation coefficient. Returns None if undefined (no variance)."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=False))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    denom = (var_x * var_y) ** 0.5
+    if denom <= 1e-12:
+        return None
+    return cov / denom
+
+
+def _score_ic_stats(subset: list[dict], min_samples: int) -> dict:
+    """Information coefficient + top/bottom-third precision for one subset."""
+    n = len(subset)
+    if n < min_samples:
+        return {
+            "count": n,
+            "information_coefficient": None,
+            "precision_at_top_third": None,
+            "precision_at_bottom_third": None,
+        }
+
+    scores = [float(r["score"]) for r in subset]
+    returns = [float(r["actual_return_pct"]) for r in subset]
+    ic = _pearson_correlation(scores, returns)
+
+    ordered = sorted(subset, key=lambda r: float(r["score"]), reverse=True)
+    third = max(1, n // 3)
+    top, bottom = ordered[:third], ordered[-third:]
+
+    def _hit_rate(rows: list[dict]) -> float | None:
+        return round(sum(1 for r in rows if r.get("hit_target")) / len(rows) * 100, 1) if rows else None
+
+    return {
+        "count": n,
+        "information_coefficient": round(ic, 4) if ic is not None else None,
+        "precision_at_top_third": _hit_rate(top),
+        "precision_at_bottom_third": _hit_rate(bottom),
+    }
+
+
+def compute_score_validation_stats(min_samples: int = 5) -> dict:
+    """Correlate recorded composite scores (analyze_stock's 0-100 score) against
+    realized forward returns, once predictions are resolved.
+
+    This closes the validation loop flagged in the architecture review: the
+    composite score is recorded at scan time (see record_prediction) but was
+    never checked against what actually happened afterward. Reports:
+      - information_coefficient: Pearson correlation between the recorded
+        score and the realized return_pct (positive => higher scores tend to
+        precede better outcomes).
+      - precision_at_top_third / precision_at_bottom_third: the price-target
+        hit rate for the highest- and lowest-scored thirds, so a skewed
+        distribution doesn't hide a genuinely useful (or useless) score.
+
+    Returns {"overall": {...}, "by_horizon": {horizon: {...}}}. Any bucket
+    with fewer than `min_samples` resolved predictions returns None values
+    rather than a misleadingly precise statistic from a tiny sample.
+    """
+    records = _load_all()
+    resolved = [
+        r
+        for r in records
+        if r.get("status") == "resolved" and r.get("score") is not None and r.get("actual_return_pct") is not None
+    ]
+
+    by_horizon = {h: _score_ic_stats([r for r in resolved if r.get("horizon") == h], min_samples) for h in HORIZON_DAYS}
+    return {
+        "overall": _score_ic_stats(resolved, min_samples),
+        "by_horizon": by_horizon,
+    }
+
+
+def compute_subscore_correlation_stats(min_samples: int = 10) -> dict:
+    """Pairwise Pearson correlation among the 5 technical sub-scores recorded
+    at scan time (see SUBSCORE_ROW_FIELDS): trend, momentum, relative_strength,
+    breakout, and volume_quality.
+
+    This is the empirical check flagged in the architecture review and in
+    modules/scoring_engine.py's analyze_stock docstring comment: these
+    sub-scores were suspected of mostly re-deriving the same underlying
+    "uptrend + volume confirmation" signal, over-crediting it several times
+    within the 0-50 technical total, but that was never measured against
+    real scan history.
+
+    Unlike compute_score_validation_stats above, this does **not** require
+    resolved outcomes -- it correlates the sub-scores against each other
+    across every recorded scan (pending or resolved), so it becomes usable
+    as soon as enough scan history exists, without waiting weeks/months for
+    target dates to resolve.
+
+    Returns {"pairs": {"breakout/momentum": {"correlation": float | None,
+    "count": int}, ...}, "total_records_with_subscores": int}. A pair with
+    fewer than `min_samples` records with both fields populated reports
+    correlation=None rather than a misleading statistic from a tiny sample.
+    High positive correlations (e.g. > 0.6-0.7) between a pair would support
+    down-weighting or consolidating them; this function only measures the
+    correlation; deciding what to do about it is a follow-up.
+    """
+    records = _load_all()
+    subscore_rows = [r["sub_scores"] for r in records if isinstance(r.get("sub_scores"), dict)]
+
+    field_names = sorted(set(SUBSCORE_ROW_FIELDS.values()))
+    pairs: dict[str, dict] = {}
+    for i, field_a in enumerate(field_names):
+        for field_b in field_names[i + 1 :]:
+            xs: list[float] = []
+            ys: list[float] = []
+            for row in subscore_rows:
+                a, b = row.get(field_a), row.get(field_b)
+                if a is not None and b is not None:
+                    xs.append(float(a))
+                    ys.append(float(b))
+            correlation = _pearson_correlation(xs, ys) if len(xs) >= min_samples else None
+            pairs[f"{field_a}/{field_b}"] = {
+                "correlation": round(correlation, 4) if correlation is not None else None,
+                "count": len(xs),
+            }
+
+    return {"pairs": pairs, "total_records_with_subscores": len(subscore_rows)}

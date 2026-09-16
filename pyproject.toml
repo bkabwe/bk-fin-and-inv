@@ -1,0 +1,11 @@
+[tool.mypy]
+# Advisory-only type-checking scoped to `modules/` (the shared analysis
+# library used by the Streamlit app, FastAPI backend, and scripts/). Not
+# yet a hard CI gate -- see `.github/workflows/ci.yml`'s `typecheck` job,
+# which runs this non-blocking (`continue-on-error: true`) so existing
+# findings don't fail PRs while type coverage is incrementally improved.
+python_version = "3.12"
+files = ["modules"]
+ignore_missing_imports = true
+warn_unused_ignores = false
+disable_error_code = ["import-untyped"]

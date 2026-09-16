@@ -54,11 +54,17 @@ class ScanEmailReportTests(unittest.TestCase):
                 },
             }
 
-        with patch("scripts.scan_email_report.get_stock_data", return_value=sample_frame):
-            with patch("scripts.scan_email_report.fast_screen_score", return_value=(42, None)):
-                with patch("scripts.scan_email_report.analyze_stock", side_effect=_analysis_for):
-                    with patch("scripts.scan_email_report.record_predictions_from_scan", return_value=2) as record_mock:
-                        results, stats = scan_email_report.run_profit_opportunities_scan(["AAPL", "MSFT"], "short_term")
+        # run_profit_opportunities_scan() delegates the actual per-ticker
+        # fast-screen/analysis/data-fetch calls to modules.profit_opportunities
+        # (shared with the Streamlit page and the FastAPI route), so patch
+        # targets live there rather than on scripts.scan_email_report.
+        with (
+            patch("modules.profit_opportunities.get_stock_data", return_value=sample_frame),
+            patch("modules.profit_opportunities.fast_screen_score", return_value=(42, None)),
+            patch("modules.profit_opportunities.analyze_stock", side_effect=_analysis_for),
+            patch("scripts.scan_email_report.record_predictions_from_scan", return_value=2) as record_mock,
+        ):
+            results, stats = scan_email_report.run_profit_opportunities_scan(["AAPL", "MSFT"], "short_term")
 
         record_mock.assert_called_once()
         self.assertEqual(record_mock.call_args.kwargs["horizon"], "short_term")
@@ -221,21 +227,26 @@ class StockAnalysisPageTests(unittest.TestCase):
         fake_ta_momentum = types.SimpleNamespace(RSIIndicator=lambda *args, **kwargs: types.SimpleNamespace(rsi=lambda: pd.Series([57.0, 57.0, 57.0])))
         fake_ta_trend = types.SimpleNamespace(MACD=lambda *args, **kwargs: types.SimpleNamespace(macd=lambda: pd.Series([0.1, 0.2, 0.3]), macd_signal=lambda: pd.Series([0.05, 0.1, 0.15])))
 
-        with patch.dict(
-            sys.modules,
-            {
-                "streamlit": fake_streamlit,
-                "plotly.graph_objects": fake_graph_objects,
-                "plotly.subplots": fake_plotly_subplots,
-                "ta.momentum": fake_ta_momentum,
-                "ta.trend": fake_ta_trend,
-            },
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "streamlit": fake_streamlit,
+                    "plotly.graph_objects": fake_graph_objects,
+                    "plotly.subplots": fake_plotly_subplots,
+                    "ta.momentum": fake_ta_momentum,
+                    "ta.trend": fake_ta_trend,
+                },
+            ),
+            patch("modules.polygon_client.is_polygon_configured", return_value=True),
+            patch("modules.scoring_engine.analyze_stock", return_value=analysis),
+            patch("modules.data_fetcher.get_stock_data", return_value=price_frame),
+            patch(
+                "modules.prediction_tracker.record_prediction",
+                side_effect=AssertionError("record_prediction should not be called"),
+            ) as record_mock,
         ):
-            with patch("modules.polygon_client.is_polygon_configured", return_value=True):
-                with patch("modules.scoring_engine.analyze_stock", return_value=analysis):
-                    with patch("modules.data_fetcher.get_stock_data", return_value=price_frame):
-                        with patch("modules.prediction_tracker.record_prediction", side_effect=AssertionError("record_prediction should not be called")) as record_mock:
-                            runpy.run_path(str(STOCK_ANALYSIS_PAGE), run_name="__main__")
+            runpy.run_path(str(STOCK_ANALYSIS_PAGE), run_name="__main__")
 
         record_mock.assert_not_called()
 

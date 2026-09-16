@@ -11,7 +11,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from modules.email_reports import render_html_table, render_metric_tiles, render_report_html, send_brevo_email
-from modules.prediction_tracker import HORIZON_DAYS, compute_max_price_since_scan, get_all_predictions, resolve_pending_predictions
+from modules.prediction_tracker import (
+    HORIZON_DAYS,
+    compute_max_price_since_scan,
+    compute_score_validation_stats,
+    get_all_predictions,
+    resolve_pending_predictions,
+)
 
 HORIZON_LABELS = {
     "short_term": "Short-Term (1–4 weeks)",
@@ -111,7 +117,14 @@ def compute_batch_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build_grading_report(horizon: str, scan_date: date, grading_date: date, rows: list[dict[str, Any]], summary: dict[str, Any]) -> str:
+def build_grading_report(
+    horizon: str,
+    scan_date: date,
+    grading_date: date,
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+    score_validation: dict[str, Any] | None = None,
+) -> str:
     preview_rows = []
     for row in rows:
         preview_rows.append(
@@ -180,6 +193,29 @@ def build_grading_report(horizon: str, scan_date: date, grading_date: date, rows
             )
         ),
     ]
+
+    score_stats = (score_validation or {}).get("overall") or {}
+    if score_stats.get("count"):
+        ic = score_stats.get("information_coefficient")
+        sections.append(
+            "<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Score validation (all-time, this horizon)</h2>"
+            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Does a higher composite score actually precede a better outcome? "
+            f"Computed across all {int(score_stats['count'])} resolved {HORIZON_LABELS[horizon]} predictions to date, not just this batch.</p>"
+            + render_metric_tiles(
+                [
+                    {"label": "Information coefficient", "value": "—" if ic is None else f"{ic:.3f}"},
+                    {
+                        "label": "Top-third hit rate",
+                        "value": "—" if score_stats.get("precision_at_top_third") is None else f"{score_stats['precision_at_top_third']:.1f}%",
+                    },
+                    {
+                        "label": "Bottom-third hit rate",
+                        "value": "—" if score_stats.get("precision_at_bottom_third") is None else f"{score_stats['precision_at_bottom_third']:.1f}%",
+                    },
+                ]
+            )
+        )
+
     return render_report_html(
         title=f"{HORIZON_LABELS[horizon]} grading report",
         subtitle=f"Scan date {scan_date.isoformat()} · grading date {grading_date.isoformat()} · tracked batch size {len(rows)}",
@@ -205,7 +241,8 @@ def generate_grading_report(horizon: str) -> int:
         )
     rows = build_grading_rows(batch_records[:75], grading_date)
     summary = compute_batch_summary(rows)
-    html_content = build_grading_report(horizon, scan_date, grading_date, rows, summary)
+    score_validation = compute_score_validation_stats()
+    html_content = build_grading_report(horizon, scan_date, grading_date, rows, summary, score_validation)
     subject = f"BK Self {HORIZON_LABELS[horizon]} grading report — {scan_date.isoformat()}"
     sent_count = send_brevo_email(subject=subject, html_content=html_content)
     print(f"Sent grading report to {sent_count} recipient(s)")

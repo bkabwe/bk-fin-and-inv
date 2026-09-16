@@ -51,7 +51,6 @@ def detect_chart_patterns(df: pd.DataFrame) -> list[dict[str, float | str | None
     close = df["Close"].tail(180).astype(float)
     high = df["High"].tail(180).astype(float)
     low = df["Low"].tail(180).astype(float)
-    vol = df["Volume"].tail(180).astype(float)
     patterns: list[dict[str, float | str | None]] = []
 
     def add(name: str, implication: str, description: str, target: float | None = None):

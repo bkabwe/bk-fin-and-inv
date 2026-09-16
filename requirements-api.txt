@@ -1,6 +1,7 @@
-fastapi
-uvicorn[standard]
-celery[redis]
-redis
-pydantic>=2.0
-python-dotenv
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+celery[redis]==5.6.3
+redis==6.4.0
+pydantic==2.13.5
+python-dotenv==1.2.3
+httpx==0.28.1

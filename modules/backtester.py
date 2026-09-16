@@ -178,6 +178,25 @@ def run_walk_forward(
     evaluate_naive_baseline: bool = False,
     lightgbm_diagnostics: bool = False,
 ) -> dict:
+    """Walk-forward RMSE comparison across ARIMA/trend/LightGBM (and optionally
+    a naive baseline) for a single ticker/horizon.
+
+    KNOWN LIMITATIONS (documented, not yet addressed):
+
+    - **RMSE-metric geometry favors terminal-point accuracy.** Every model's
+      forecast is converted into a smooth geometric curve toward one terminal
+      return guess (see the ``growth``/``pred_path`` construction below)
+      before computing RMSE. This structurally advantages models optimized
+      directly for terminal return (like LightGBM) over general-purpose
+      extrapolators (ARIMA/trend), even though it doesn't fully explain any
+      one model's win rate on its own. A supplementary path-level metric
+      (not just terminal-return RMSE) would give a fuller comparison.
+    - **No transaction costs or slippage.** These RMSE comparisons measure
+      price-forecast accuracy only, not net-of-cost tradeable returns. A
+      model "beating" another on RMSE here is directional-accuracy evidence,
+      not proof of profitability after costs; a P&L-style, cost-aware
+      evaluation would be a separate, additional validation layer.
+    """
     default = {
         "arima_rmse": 1.0,
         "trend_rmse": 1.0,

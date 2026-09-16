@@ -8,6 +8,15 @@ Comprehensive US stock analysis toolkit inspired by Richard W. Schabacker's tech
 pip install -r requirements.txt
 ```
 
+`requirements.txt` is the full set needed to run the Streamlit dashboard
+locally (adds `streamlit`, `plotly`, `Pillow` for the UI on top of the core
+analysis stack). The scheduled GitHub Actions workflows (scan/grading email
+reports, LightGBM batch training) never render the Streamlit UI, so they
+install the leaner `requirements-workflows.txt` instead — see
+`.github/workflows/*.yml`. The FastAPI/Celery backend under `api/` uses
+`requirements-api.txt` in addition to one of the above (see
+[Optional FastAPI + React frontend](#optional-fastapi--react-frontend)).
+
 ### macOS note for LightGBM
 
 On macOS, `lightgbm` also requires the OpenMP runtime (`libomp`) at the
@@ -36,6 +45,10 @@ brew install libomp
   and grading reports. Whitespace around addresses is ignored.
 - `SCAN_EMAIL_FROM` — verified Brevo sender email address used with the fixed
   sender display name `BK Self`.
+- `WORKFLOW_ALERT_RECIPIENTS` — optional comma-separated email recipients for
+  workflow-failure alerts only (see "Workflow-failure alerts" below). If
+  unset, alerts fall back to `SCAN_EMAIL_FROM` alone, so by default only the
+  maintainer is paged rather than the full `SCAN_EMAIL_RECIPIENTS` list.
 
 You can provide it either as a normal shell environment variable:
 
@@ -71,6 +84,32 @@ streamlit run app.py
 ```bash
 python analyze_stock.py AAPL
 ```
+
+## Optional FastAPI + React frontend
+
+Everything in this app is available through the Streamlit dashboard above.
+A second, optional interface exists under `api/` (FastAPI + Celery/Redis job
+queue) and `frontend/` (React + Vite SPA) for anyone who wants a
+non-blocking, async version of the Profit Opportunities scan (with a stop
+button) instead of Streamlit's blocking scan. It duplicates — rather than
+replaces — the Streamlit feature set and is not used by any of the scheduled
+GitHub Actions workflows, which call `scripts/*.py` against `modules/`
+directly.
+
+Requirements: `pip install -r requirements-workflows.txt -r requirements-api.txt`
+(the API/Celery layer doesn't render the Streamlit UI, so it doesn't need
+`requirements.txt`'s `streamlit`/`plotly`/`Pillow`) and a local Redis
+instance (`redis://localhost:6379/0` by default; see `api/worker.py`).
+
+```bash
+./start-api.sh
+```
+
+This starts Redis (via `brew services`, macOS-only), the Celery worker
+(`celery -A api.worker worker`), the FastAPI backend (`uvicorn api.main:app`
+on port 8000, docs at `/docs`), and the Vite dev server (`npm run dev` under
+`frontend/`, port 5173) together. Start services individually if you're not
+on macOS or don't use Homebrew's `redis` service.
 
 ## Feature Overview
 
@@ -123,11 +162,17 @@ sentiment, and macro context, with all final scores clamped to that range.
 
 - **Technical score** contributes up to 50 points from trend, momentum, volume,
   patterns, breakout quality, and relative strength.
-- **Fundamental score** contributes up to 30 points after valuation, growth,
-  balance-sheet, and analyst-sentiment checks.
-- **Sentiment score** contributes up to 20 points from recent news tone.
-  Sentiment headline scoring uses FinBERT (`ProsusAI/finbert`) via the
-  `transformers` + `torch` dependencies.
+- **Fundamental score** (valuation, growth, balance-sheet, and analyst-sentiment
+  checks) and **Sentiment score** (recent news tone) together contribute a
+  combined 50 points, split 30/20 by default. When callers pass
+  `investment_horizon` (`short_term`/`medium_term`/`long_term`, the same
+  canonical keys used by the Profit Opportunities scan), sentiment's share
+  decays for longer horizons and fundamentals pick up the difference: 30/20
+  (short_term, default), 36/14 (medium_term), 42/8 (long_term). This mirrors
+  how price-projection ensemble weights already shrink LightGBM's influence at
+  longer horizons. Callers that don't pass a horizon keep the original flat
+  30/20 split. Sentiment headline scoring uses FinBERT (`ProsusAI/finbert`)
+  via the `transformers` + `torch` dependencies.
 - **Overall macro regime** adds a modest overlay (`risk_on` / `risk_off`) of
   roughly +3 / -5 points.
 - **Sector momentum** now adds a small stock-specific overlay of **+3** when the
@@ -154,6 +199,84 @@ signals and exposes:
   drawdown/recovery stats, golden/death-cross history)
 
 Short-Term and Medium-Term scoring logic/weights are unchanged.
+
+## Known modeling limitations & caveats
+
+These are documented, audited findings that are intentionally **not** being
+force-fixed without stronger evidence or a clearer cost/benefit case. They are
+tracked here so future changes can address them with real data/evidence
+rather than guesswork:
+
+- **Correlated technical sub-scores**: `trend_score`, `momentum_score`
+  (RSI+MACD), `rs_score`, `breakout_score`, and `volume_quality_score` largely
+  fire off the same underlying "uptrend + volume" signal, potentially
+  over-crediting a single pattern several times within the 0–50 technical
+  total. These five sub-scores are now recorded per scan alongside each
+  prediction (see `modules/prediction_tracker.py`'s `SUBSCORE_ROW_FIELDS`),
+  and `compute_subscore_correlation_stats()` empirically measures their
+  pairwise correlation across recorded scan history once enough predictions
+  have accumulated — no down-weighting/consolidation has been applied yet,
+  pending that analysis.
+- **DCF methodology is dated**: the DCF estimate is still Graham's unmodified
+  1962 heuristic (`8.5 + 2×growth`), known to be unreliable for high-growth,
+  negative-earnings, or cyclical names. `analyze_fundamentals()` now blends it
+  with a comparables-based estimate (trailing EPS × sector-benchmark P/E) into
+  a `valuation_estimate` used by the scoring ensemble, so a single dated
+  heuristic no longer drives that ensemble slot alone — but neither input is
+  a modern multi-stage DCF, so this remains a documented simplification.
+- **Sector P/E benchmarks now have a manual refresh path**: `SECTOR_BENCHMARK_PE`
+  in `modules/fundamental_analysis.py` remains a hardcoded static fallback,
+  but `scripts/refresh_sector_pe.py` can be run periodically (manually, or via
+  a scheduled workflow) to compute fresh per-sector median trailing P/Es from
+  live ticker data and write them to `data/sector_benchmark_pe.json`
+  (gitignored, local/derived data); `get_sector_benchmark_pe()` prefers that
+  refreshed file over the static dict whenever it exists.
+- **Survivorship bias in the ticker universe**: `get_sp500_tickers()` scrapes
+  the *current* Wikipedia membership table, so LightGBM training and
+  walk-forward backtests only ever see tickers still in the index today,
+  which can inflate apparent historical accuracy versus a true point-in-time
+  historical membership list. A survivorship-bias-aware ticker universe
+  (e.g. a point-in-time membership snapshot) remains a follow-up data
+  project rather than a quick fix — see the docstring on
+  `modules/data_fetcher.get_sp500_tickers()` for the full caveat.
+- **RMSE-metric geometry favors terminal-point accuracy**: the LightGBM
+  walk-forward comparison converts every model's forecast into a smooth
+  geometric curve toward one terminal-return guess before computing RMSE,
+  which structurally advantages models optimized directly for terminal
+  return (like LightGBM) over general-purpose extrapolators (ARIMA/trend). A
+  supplementary path-level metric would give a fuller comparison.
+- **No transaction costs or slippage in backtest RMSE**: backtests measure
+  price-forecast RMSE, not net-of-cost tradeable returns. Treat backtest wins
+  as directional-accuracy evidence only, not proof of after-cost
+  profitability.
+
+## Testing & CI
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull
+request:
+- **test**: installs `requirements.txt` + `requirements-api.txt`, runs the
+  full `unittest` suite.
+- **lint**: `ruff check --select E9,F,B,SIM .` (syntax errors, pyflakes,
+  flake8-bugbear, and flake8-simplify — still not full style/complexity
+  linting), then `frontend/`'s `tsc --noEmit` type-check and `npm test`
+  (Vitest).
+- **typecheck**: `mypy` (config in `pyproject.toml`), scoped to `modules/`.
+  This job is advisory only (`continue-on-error: true`) and will not fail a
+  PR — it surfaces type issues incrementally as coverage improves. It runs
+  on Python 3.12 (rather than the `PYTHON_VERSION` used by `test`/`lint`)
+  because numpy's bundled type stubs need 3.12+ to parse.
+
+Separately, `.github/workflows/train-lightgbm-batch.yml`,
+`scan-email-short-term.yml`, `scan-email-medium-term.yml`,
+`grading-report-short-term.yml`, and `grading-report-medium-term.yml` run on
+schedules to retrain/promote LightGBM models and send scan/grading email
+reports. They install `requirements-workflows.txt` (not the full
+`requirements.txt`, since they only run `scripts/*.py` against `modules/`
+headlessly) and don't touch `api/` or `frontend/`.
 
 ## Troubleshooting
 
@@ -186,6 +309,28 @@ medium-term profit-opportunity horizons, attach screener/profit-opportunity top
 for later grading. The grading workflows run `scripts/grading_report.py` to
 evaluate the exact prior recorded scan batch using both point-in-time resolution
 and max-price-since-scan excursion checks.
+
+### Workflow-failure alerts
+
+All 5 scheduled workflows (`train-lightgbm-batch.yml`, `scan-email-short-term.yml`,
+`scan-email-medium-term.yml`, `grading-report-short-term.yml`, and
+`grading-report-medium-term.yml`) include a `notify-on-failure` job
+(`if: failure()`, depending on every other job in the workflow) that emails a
+short failure alert — repo, branch, and a link to the failed run — via the same
+Brevo API integration used for scan/grading reports
+(`scripts/notify_workflow_failure.py`, reusing `modules/email_reports.py`'s
+`send_brevo_email`). This surfaces pipeline breaks (e.g. a reduce/promote job
+failure) proactively instead of only being noticed by chance. The notifier only
+installs `requests` (not the full `requirements-workflows.txt`), and any
+failure while sending the alert itself is swallowed so it never masks or
+replaces the original job failure it's reporting on.
+
+These alerts intentionally go to a **separate, narrower** recipient list than
+the scan/grading reports: `WORKFLOW_ALERT_RECIPIENTS` if set, otherwise just
+`SCAN_EMAIL_FROM` (the maintainer's own address) — never the full
+`SCAN_EMAIL_RECIPIENTS` distribution list, since a CI/pipeline failure is an
+operational concern for whoever maintains the workflows, not every scan-report
+recipient.
 
 ### Track-record bugfix: Stock Analysis no longer auto-records predictions
 
@@ -380,7 +525,10 @@ Predictions are recorded from three sources:
 Each prediction stores: ticker, company, horizon (`short_term` / `medium_term` /
 `long_term`), scan date, estimated target date, current price at scan, target
 price, target low/high band, projected upside %, score, confidence tier,
-model basis string, and source.
+model basis string, source, and (when available) a `sub_scores` breakdown of
+the five technical sub-scores (`trend`, `momentum`, `relative_strength`,
+`breakout`, `volume_quality`) used to empirically check their correlation —
+see `compute_subscore_correlation_stats()` in `modules/prediction_tracker.py`.
 
 Predictions are deduplicated by `(ticker, horizon, scan_date)` so re-running
 the same scan on the same day does not create duplicate entries.
@@ -437,5 +585,8 @@ Returns the full predictions list, optionally filtered by `status`
 ### Storage
 Predictions are persisted to `data/predictions.json` using the same
 atomic-write pattern (tempfile + `os.replace`) used by the portfolio and
-watchlist modules.  The file is excluded from git via `.gitignore`
-(`data/*.json`).
+watchlist modules. Unlike other `data/*.json` files (which hold personal
+portfolio/watchlist data and stay untracked), `data/predictions.json` is
+explicitly un-ignored in `.gitignore` and is committed back to the repository
+by the `scan-email-*` and `grading-report-*` GitHub Actions workflows after
+each run, so prediction history survives across ephemeral CI filesystems.

@@ -14,7 +14,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from modules.data_fetcher import get_stock_data
 from modules.email_reports import csv_attachment, render_html_table, render_metric_tiles, render_report_html, send_brevo_email
 from modules.fred_client import get_macro_feature_table
 from modules.lightgbm_batch import (
@@ -23,28 +22,19 @@ from modules.lightgbm_batch import (
     load_return_model_batch_from_urls,
     resolve_release_repository,
 )
-from modules.prediction_tracker import record_predictions_from_scan
-from modules.scoring_engine import analyze_stock, fast_screen_score
+from modules.prediction_tracker import SUBSCORE_ROW_FIELDS, record_predictions_from_scan
+from modules.profit_opportunities import (
+    DEFAULT_FAST_SCREEN_MARGIN,
+    HORIZON_SETTINGS as _ALL_HORIZON_SETTINGS,
+    filter_by_upside,
+    scan_profit_opportunities,
+)
 from modules.screener import run_screener
 
-HORIZON_SETTINGS = {
-    "short_term": {
-        "label": "Short-Term (1–4 weeks)",
-        "target_key": "short_term_target",
-        "target_low_key": "short_term_low",
-        "target_high_key": "short_term_high",
-        "upside_key": "short_term_upside",
-        "basis_key": "short_term_basis",
-    },
-    "medium_term": {
-        "label": "Medium-Term (1–6 months)",
-        "target_key": "medium_term_target",
-        "target_low_key": "medium_term_low",
-        "target_high_key": "medium_term_high",
-        "upside_key": "medium_term_upside",
-        "basis_key": "medium_term_basis",
-    },
-}
+# Scheduled scans only cover short/medium term horizons; keep the same
+# restricted subset here (rather than the full three-horizon superset in
+# modules.profit_opportunities, which also serves the long-term Streamlit page).
+HORIZON_SETTINGS = {k: v for k, v in _ALL_HORIZON_SETTINGS.items() if k in ("short_term", "medium_term")}
 DEFAULT_MIN_SCORE = 50
 DEFAULT_MIN_UPSIDE_PCT = 15.0
 DEFAULT_FAST_SCREEN_PROXY_THRESHOLD = 15
@@ -62,17 +52,19 @@ def live_scoring_context(manifest: dict[str, Any], batch: dict[str, Any], shared
         kwargs.setdefault("shared_macro_table", shared_macro_table)
         return original_build_feature_table(*args, **kwargs)
 
-    with patch.object(scoring_engine, "_load_live_lightgbm_manifest", return_value=manifest):
-        with patch.object(scoring_engine, "_load_live_lightgbm_batch", return_value=batch):
-            with patch.object(scoring_engine, "build_feature_table", side_effect=_build_feature_table_with_shared_macro):
-                yield
+    with (
+        patch.object(scoring_engine, "_load_live_lightgbm_manifest", return_value=manifest),
+        patch.object(scoring_engine, "_load_live_lightgbm_batch", return_value=batch),
+        patch.object(scoring_engine, "build_feature_table", side_effect=_build_feature_table_with_shared_macro),
+    ):
+        yield
 
 
 def load_live_scan_inputs(repository: str | None = None) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     manifest = fetch_live_manifest(repository=resolve_release_repository(repository))
     tickers = sorted(
         str(ticker).strip().upper()
-        for ticker in ((manifest or {}).get("tickers") or {}).keys()
+        for ticker in ((manifest or {}).get("tickers") or {})
         if str(ticker).strip()
     )
     if not tickers:
@@ -91,7 +83,7 @@ def load_live_scan_inputs(repository: str | None = None) -> tuple[dict[str, Any]
 def fetch_shared_macro_table(lookback_days: int = 365 * 5) -> pd.DataFrame:
     end_date = datetime.now(UTC).date()
     start_date = end_date - timedelta(days=int(lookback_days))
-    macro_table = get_macro_feature_table(start_date, end_date)
+    macro_table = get_macro_feature_table(start_date, end_date, realtime_end=end_date)
     print(f"Loaded shared FRED macro table rows: {len(macro_table)}")
     return macro_table
 
@@ -102,67 +94,32 @@ def run_profit_opportunities_scan(
     *,
     min_upside_pct: float = DEFAULT_MIN_UPSIDE_PCT,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
-    settings = HORIZON_SETTINGS[horizon]
-    rows: list[dict[str, Any]] = []
-    fast_filtered_count = 0
-    passed_fast_screen_count = 0
-    failed_count = 0
+    scanned = scan_profit_opportunities(
+        tickers,
+        horizon,
+        use_fast_screen=True,
+        fast_screen_base=DEFAULT_FAST_SCREEN_PROXY_THRESHOLD + DEFAULT_FAST_SCREEN_MARGIN,
+        fast_screen_margin=DEFAULT_FAST_SCREEN_MARGIN,
+        parallel=False,
+        prefetch_price_period="1y",
+    )
+    results = filter_by_upside(scanned, horizon, min_upside_pct=min_upside_pct, max_results=TOP_RESULTS_LIMIT)
+    # Capture rows (with internal _rsi/_*_score fields intact) for recording
+    # before stripping them from the DataFrame used for the CSV/HTML report.
+    recorded_rows = results.to_dict("records")
+    results = results.drop(columns=["_rsi", *SUBSCORE_ROW_FIELDS], errors="ignore")
 
-    for ticker in tickers:
-        try:
-            price_data = get_stock_data(ticker, period="1y", interval="1d")
-            fast_score, err = fast_screen_score(ticker, data=price_data)
-            if err is not None:
-                failed_count += 1
-                print(f"Fast-screen failed for {ticker}: {err}")
-                continue
-            if fast_score < DEFAULT_FAST_SCREEN_PROXY_THRESHOLD:
-                fast_filtered_count += 1
-                continue
-
-            passed_fast_screen_count += 1
-            analysis = analyze_stock(
-                ticker,
-                data_override=price_data,
-                projection_data_override=price_data,
-            )
-            projections = analysis.get("projections") or {}
-            current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
-            target_price = float(projections.get(settings["target_key"]) or 0)
-            upside = float(projections.get(settings["upside_key"]) or 0)
-            if current_price <= 0 or target_price <= 0 or upside <= 0 or upside < float(min_upside_pct):
-                continue
-            rows.append(
-                {
-                    "Ticker": ticker,
-                    "Company": analysis.get("company") or ticker,
-                    "Score": int(analysis.get("score") or 0),
-                    "Current Price": round(current_price, 4),
-                    "Target Price": round(target_price, 4),
-                    "Target Low": round(float(projections.get(settings["target_low_key"]) or target_price * 0.95), 4),
-                    "Target High": round(float(projections.get(settings["target_high_key"]) or target_price * 1.05), 4),
-                    "Projected Upside %": round(upside, 4),
-                    "Confidence": str(projections.get("data_quality") or "Limited"),
-                    "Basis": str(projections.get(settings["basis_key"]) or ""),
-                }
-            )
-        except Exception as exc:
-            failed_count += 1
-            print(f"Profit-opportunity analysis failed for {ticker}: {exc}")
-
-    if rows:
-        results = pd.DataFrame(rows).sort_values("Projected Upside %", ascending=False).head(TOP_RESULTS_LIMIT).reset_index(drop=True)
-        recorded_count = record_predictions_from_scan(results.to_dict("records"), horizon=horizon, source="profit_opportunities")
+    if recorded_rows:
+        recorded_count = record_predictions_from_scan(recorded_rows, horizon=horizon, source="profit_opportunities")
     else:
-        results = pd.DataFrame(columns=["Ticker", "Company", "Score", "Current Price", "Target Price", "Target Low", "Target High", "Projected Upside %", "Confidence", "Basis"])
         recorded_count = 0
 
     return results, {
-        "scanned_count": len(tickers),
-        "fast_filtered_count": fast_filtered_count,
-        "passed_fast_screen_count": passed_fast_screen_count,
-        "failed_count": failed_count,
-        "qualified_count": len(rows),
+        "scanned_count": int(scanned.attrs.get("scanned_count", len(tickers))),
+        "fast_filtered_count": int(scanned.attrs.get("fast_filtered_count", 0)),
+        "passed_fast_screen_count": int(scanned.attrs.get("fully_analyzed_count", 0)),
+        "failed_count": int(scanned.attrs.get("failed_count", 0)),
+        "qualified_count": len(results),
         "recorded_count": recorded_count,
     }
 

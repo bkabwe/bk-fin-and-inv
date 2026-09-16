@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +55,33 @@ LIGHTGBM_BATCH_LOCAL_PATH = _REPO_ROOT / "data" / DEFAULT_BATCH_ASSET_NAME
 LIGHTGBM_WEIGHT_30D = 0.15
 LIGHTGBM_WEIGHT_180D = 0.08
 
+# Fundamental+sentiment point pool in the composite 0-100 score is fixed at 50
+# points, but the split between them shifts as the requested investment
+# horizon lengthens: sentiment (recent news tone) decays toward longer
+# horizons while fundamentals (valuation/balance-sheet/growth quality, which
+# matter more over longer holding periods) pick up the freed-up weight. This
+# mirrors how price-projection ensemble weights already shrink LightGBM's
+# influence from 30d (LIGHTGBM_WEIGHT_30D) to 180d (LIGHTGBM_WEIGHT_180D) to
+# 0 at 720d. ``investment_horizon`` uses the same canonical keys as
+# ``modules.profit_opportunities.HORIZON_SETTINGS``
+# (short_term/medium_term/long_term); omitting it (None) preserves the
+# original flat 30/20 split for backward compatibility with callers that
+# don't track a horizon.
+_FUNDAMENTAL_SENTIMENT_WEIGHTS: dict[str | None, tuple[int, int]] = {
+    None: (30, 20),
+    "short_term": (30, 20),
+    "medium_term": (36, 14),
+    "long_term": (42, 8),
+}
+
+
+def _fundamental_sentiment_weights(investment_horizon: str | None) -> tuple[int, int]:
+    """Return the (fundamental_weight, sentiment_weight) point caps to use for
+    the composite score's fundamental/sentiment components, decaying
+    sentiment's share for longer ``investment_horizon`` values."""
+    return _FUNDAMENTAL_SENTIMENT_WEIGHTS.get(investment_horizon, _FUNDAMENTAL_SENTIMENT_WEIGHTS[None])
+
+
 try:
     import streamlit as st
 
@@ -98,6 +126,15 @@ except Exception:  # pragma: no cover
                     if ev is not None:
                         ev.set()
 
+            def clear() -> None:
+                """Mirror `st.cache_data`'s `.clear()` so callers (including
+                tests) can reset this cache the same way regardless of
+                whether Streamlit is installed."""
+                with _lock:
+                    _cache.clear()
+                    _inflight.clear()
+
+            wrapper.clear = clear
             return wrapper
 
         return decorator
@@ -458,7 +495,7 @@ def _garch_confidence_from_returns(current_price: float, log_returns: np.ndarray
     if not ARCH_AVAILABLE or len(log_returns) < 60 or current_price <= 0:
         return None, None
     try:
-        model = arch_model(log_returns * 100, vol="Garch", p=1, q=1, rescale=False)
+        model = arch_model(log_returns * 100, vol="GARCH", p=1, q=1, rescale=False)
         fit = model.fit(disp="off")
         fcast = fit.forecast(horizon=max(horizon_days, 1), reindex=False)
         var = float(fcast.variance.values[-1, min(horizon_days - 1, fcast.variance.shape[1] - 1)])
@@ -636,11 +673,15 @@ def _get_price_projections_core(
     else:
         models_skipped.append("Fundamental Fair Value: no EPS data")
 
-    dcf_estimate = metrics.get("dcf_estimate")
+    # valuation_estimate blends the Graham-DCF heuristic with a sector-P/E
+    # comparables cross-check (see modules/fundamental_analysis.py); this is
+    # what feeds the "DCF" ensemble slot below, so a single-model artifact in
+    # one approach doesn't dominate this weighted-ensemble input.
+    dcf_estimate = metrics.get("valuation_estimate")
     if dcf_estimate:
-        models_used.append("DCF Estimate")
+        models_used.append("DCF+Comps Estimate")
     else:
-        models_skipped.append("DCF Estimate: unavailable")
+        models_skipped.append("DCF+Comps Estimate: unavailable")
 
     resistance_levels = sorted([float(x) for x in technical.get("resistance_levels", []) if x is not None])
     nearest_resistance = next((value for value in resistance_levels if value >= current_price), None)
@@ -671,7 +712,7 @@ def _get_price_projections_core(
             ("Trend", trend_180, medium_model_weights.get("trend", 0.0)),
             ("LightGBM", lightgbm_projections.get(180), medium_model_weights.get("lightgbm", 0.0)),
             ("Fundamental", fair_value, 0.20),
-            ("DCF", dcf_estimate, 0.10),
+            ("DCF+Comps", dcf_estimate, 0.10),
             ("Analyst x0.65", analyst_medium, 0.15),
         ]
     )
@@ -680,7 +721,7 @@ def _get_price_projections_core(
             ("ARIMA", arima_720, long_model_weights.get("arima", 0.0)),
             ("Trend", trend_720, long_model_weights.get("trend", 0.0)),
             ("Fundamental", fair_value, 0.20),
-            ("DCF", dcf_estimate, 0.10),
+            ("DCF+Comps", dcf_estimate, 0.10),
             ("Analyst", analyst_long, 0.20),
         ]
     )
@@ -840,6 +881,7 @@ def analyze_stock(
     data_override: pd.DataFrame | None = None,
     info_override: dict | None = None,
     projection_data_override: pd.DataFrame | None = None,
+    investment_horizon: str | None = None,
 ) -> dict:
     data = data_override if data_override is not None else get_stock_data(ticker, period=period, interval=interval)
     info = info_override if info_override is not None else get_stock_info(ticker)
@@ -855,15 +897,11 @@ def analyze_stock(
         except Exception:
             trailing_52w = data.tail(252)
     if "fiftyTwoWeekHigh" not in info and not trailing_52w.empty and "High" in trailing_52w:
-        try:
+        with contextlib.suppress(Exception):
             info["fiftyTwoWeekHigh"] = float(trailing_52w["High"].astype(float).max())
-        except Exception:
-            pass
     if "fiftyTwoWeekLow" not in info and not trailing_52w.empty and "Low" in trailing_52w:
-        try:
+        with contextlib.suppress(Exception):
             info["fiftyTwoWeekLow"] = float(trailing_52w["Low"].astype(float).min())
-        except Exception:
-            pass
 
     technical = analyze_technical(data)
     if not data.empty:
@@ -884,6 +922,19 @@ def analyze_stock(
     spy_data = get_stock_data("SPY", period=period, interval=interval)
     relative_strength = relative_strength_vs_spy(data, spy_data)
 
+    # NOTE (known limitation, audited but not re-weighted): trend_score,
+    # momentum_score, rs_score, breakout_score, and volume_quality_score below
+    # largely derive from the same underlying "uptrend + volume confirmation"
+    # signal, so a single strong trend can be credited across several of
+    # these sub-scores at once within the 0-50 technical total. These five
+    # sub-scores are now recorded per scan (see
+    # modules.profit_opportunities.analyze_ticker_for_horizon's "_*_score"
+    # row fields and modules.prediction_tracker.SUBSCORE_ROW_FIELDS), and
+    # modules.prediction_tracker.compute_subscore_correlation_stats()
+    # empirically measures their pairwise correlation across recorded scan
+    # history once enough predictions have accumulated. Until that analysis
+    # shows otherwise, treat the technical total as directionally useful but
+    # not as five independent signals.
     trend_score = 15 if technical["trend"] == "uptrend" else 8 if technical["trend"] == "sideways" else 2
     rsi, macd, signal = (
         technical["indicators"].get("rsi"),
@@ -941,8 +992,9 @@ def analyze_stock(
             trend_score + momentum_score + volume_score + pattern_score + trendline_score + rs_score + breakout_score + volume_quality_score,
         ),
     )
-    fundamental_total = round((fundamentals["fundamental_score"] / 100) * 30)
-    sentiment_total = round(((sentiment["sentiment_score"] + 1) / 2) * 20)
+    fundamental_weight, sentiment_weight = _fundamental_sentiment_weights(investment_horizon)
+    fundamental_total = round((fundamentals["fundamental_score"] / 100) * fundamental_weight)
+    sentiment_total = round(((sentiment["sentiment_score"] + 1) / 2) * sentiment_weight)
     base_total = technical_total + fundamental_total + sentiment_total + macro_score + sector_momentum_score + market_cap_score
 
     horizon = "Medium-Term Setup"
