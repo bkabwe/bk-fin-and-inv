@@ -84,6 +84,8 @@ jobs:
   reduce-promote:
     needs: [discover, train]
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
