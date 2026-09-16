@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from io import BytesIO
+import tempfile
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -117,17 +118,25 @@ def load_return_model_batch_from_urls(urls: list[str], *, timeout: int = 30) -> 
 
     Batches larger than GitHub's 2 GiB per-asset limit are uploaded as multiple
     ordered parts (see `batch_asset_part_name`); this reassembles them in order
-    into a single in-memory buffer before deserializing.
+    into a temp file on disk (rather than an in-memory buffer) before
+    deserializing. Writing to disk means the raw downloaded bytes and the
+    deserialized python objects are never both resident in memory at once --
+    for a multi-GB batch, buffering the full download in memory before
+    `joblib.load()` deserialized a second full copy on top of it was a direct
+    contributor to reduce-promote out-of-memory failures.
     """
-    buffer = BytesIO()
-    for url in urls:
-        response = requests.get(str(url).strip(), timeout=timeout, stream=True)
-        response.raise_for_status()
-        for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
-            if chunk:
-                buffer.write(chunk)
-    buffer.seek(0)
-    return load_return_model_batch(buffer)
+    with tempfile.NamedTemporaryFile(suffix=".joblib", delete=False) as tmp_fh:
+        tmp_path = Path(tmp_fh.name)
+        for url in urls:
+            response = requests.get(str(url).strip(), timeout=timeout, stream=True)
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                if chunk:
+                    tmp_fh.write(chunk)
+    try:
+        return load_return_model_batch(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def load_return_model_batch_from_url(url: str, *, timeout: int = 30) -> dict[str, Any]:
@@ -154,13 +163,61 @@ def get_batch_training_metadata(batch: dict[str, Any] | None) -> dict[str, dict[
     }
 
 
-def merge_current_and_previous_batches(
-    current_batch: dict[str, Any] | None,
+def extract_carry_forward_state(
     *,
+    current_tickers: set[str],
     previous_manifest: dict[str, Any] | None = None,
     previous_batch: dict[str, Any] | None = None,
     max_stale_cycles: int = 4,
 ) -> tuple[dict[str, dict[int, object]], dict[str, dict[str, Any]], list[str], list[str]]:
+    """Extract only the previous-release models that would be carried forward.
+
+    This depends only on `current_tickers` (a cheap set of ticker strings) --
+    not the current batch's full model set -- so callers can free the
+    (multi-GB) current model set from memory before loading the (also
+    multi-GB) previous batch, and only need to hold the small carried-forward
+    subset returned here alongside the current models afterward. Holding both
+    full batches in memory at once was a direct contributor to reduce-promote
+    out-of-memory failures once a previous live release exists to merge
+    against.
+    """
+    previous_manifest_tickers = ((previous_manifest or {}).get("tickers") or {}) if isinstance(previous_manifest, dict) else {}
+    previous_models = ((previous_batch or {}).get("models") or {}) if isinstance(previous_batch, dict) else {}
+    previous_meta = get_batch_training_metadata(previous_batch)
+    carried_models: dict[str, dict[int, object]] = {}
+    carried_meta: dict[str, dict[str, Any]] = {}
+    carried_forward: list[str] = []
+    dropped_stale: list[str] = []
+
+    for ticker, prior_state in previous_manifest_tickers.items():
+        clean_ticker = str(ticker or "").strip().upper()
+        if not clean_ticker or clean_ticker in current_tickers:
+            continue
+        ticker_models = previous_models.get(clean_ticker)
+        if not isinstance(ticker_models, dict) or not ticker_models:
+            dropped_stale.append(clean_ticker)
+            continue
+        next_cycles = int((prior_state or {}).get("cycles_since_training") or 0) + 1
+        if next_cycles > int(max_stale_cycles):
+            dropped_stale.append(clean_ticker)
+            continue
+        carried_models[clean_ticker] = {int(horizon): model for horizon, model in ticker_models.items()}
+        merged = dict(previous_meta.get(clean_ticker) or {})
+        merged["exchange"] = (prior_state or {}).get("exchange") or merged.get("exchange")
+        merged["last_trained"] = (prior_state or {}).get("last_trained") or merged.get("last_trained")
+        merged["cycles_since_training"] = next_cycles
+        carried_meta[clean_ticker] = merged
+        carried_forward.append(clean_ticker)
+
+    return carried_models, carried_meta, sorted(carried_forward), sorted(set(dropped_stale))
+
+
+def combine_current_and_carried_forward(
+    current_batch: dict[str, Any] | None,
+    *,
+    carried_models: dict[str, dict[int, object]] | None = None,
+    carried_meta: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict[str, dict[int, object]], dict[str, dict[str, Any]]]:
     # `live_models` below always rebuilds fresh per-ticker dicts from `current_models`
     # rather than mutating it in place, so a defensive copy.deepcopy() here is not
     # required for correctness. The trained model objects are immutable after
@@ -182,33 +239,31 @@ def merge_current_and_previous_batches(
         merged["cycles_since_training"] = 0
         live_meta[ticker] = merged
 
-    previous_manifest_tickers = ((previous_manifest or {}).get("tickers") or {}) if isinstance(previous_manifest, dict) else {}
-    previous_models = ((previous_batch or {}).get("models") or {}) if isinstance(previous_batch, dict) else {}
-    previous_meta = get_batch_training_metadata(previous_batch)
-    carried_forward: list[str] = []
-    dropped_stale: list[str] = []
+    live_models.update(carried_models or {})
+    live_meta.update(carried_meta or {})
+    return live_models, live_meta
 
-    for ticker, prior_state in previous_manifest_tickers.items():
-        clean_ticker = str(ticker or "").strip().upper()
-        if not clean_ticker or clean_ticker in live_models:
-            continue
-        ticker_models = previous_models.get(clean_ticker)
-        if not isinstance(ticker_models, dict) or not ticker_models:
-            dropped_stale.append(clean_ticker)
-            continue
-        next_cycles = int((prior_state or {}).get("cycles_since_training") or 0) + 1
-        if next_cycles > int(max_stale_cycles):
-            dropped_stale.append(clean_ticker)
-            continue
-        live_models[clean_ticker] = {int(horizon): model for horizon, model in ticker_models.items()}
-        merged = dict(previous_meta.get(clean_ticker) or {})
-        merged["exchange"] = (prior_state or {}).get("exchange") or merged.get("exchange")
-        merged["last_trained"] = (prior_state or {}).get("last_trained") or merged.get("last_trained")
-        merged["cycles_since_training"] = next_cycles
-        live_meta[clean_ticker] = merged
-        carried_forward.append(clean_ticker)
 
-    return live_models, live_meta, sorted(carried_forward), sorted(set(dropped_stale))
+def merge_current_and_previous_batches(
+    current_batch: dict[str, Any] | None,
+    *,
+    previous_manifest: dict[str, Any] | None = None,
+    previous_batch: dict[str, Any] | None = None,
+    max_stale_cycles: int = 4,
+) -> tuple[dict[str, dict[int, object]], dict[str, dict[str, Any]], list[str], list[str]]:
+    current_tickers = {
+        str(ticker).strip().upper() for ticker in ((current_batch or {}).get("models") or {}) if str(ticker).strip()
+    }
+    carried_models, carried_meta, carried_forward, dropped_stale = extract_carry_forward_state(
+        current_tickers=current_tickers,
+        previous_manifest=previous_manifest,
+        previous_batch=previous_batch,
+        max_stale_cycles=max_stale_cycles,
+    )
+    live_models, live_meta = combine_current_and_carried_forward(
+        current_batch, carried_models=carried_models, carried_meta=carried_meta
+    )
+    return live_models, live_meta, carried_forward, dropped_stale
 
 
 def build_live_manifest(

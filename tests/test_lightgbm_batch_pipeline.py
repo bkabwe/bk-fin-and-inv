@@ -326,9 +326,13 @@ class ReduceAndValidateMemoryTests(unittest.TestCase):
     The original reduce_and_validate() re-loaded the just-dumped merged batch from
     disk via load_return_model_batch() purely to assert it was non-empty, holding a
     second full in-memory copy of the (potentially multi-GB) model set. These tests
-    assert that call is gone (load_return_model_batch is only ever invoked once per
-    partial shard file, never again for the merged output) while the emptiness
-    validation it used to provide is still enforced.
+    assert that emptiness-validation reload is gone (load_return_model_batch is only
+    invoked once per partial shard file up through smoke testing) while the
+    emptiness validation it used to provide is still enforced. A later, deliberate
+    reload of the merged batch was reintroduced further downstream (see
+    ReduceAndValidatePreviousBatchMemoryTests below) so the just-freed current model
+    set and a previous live batch are never both fully resident in memory at once;
+    that reload only happens after this test's intentional early failure.
     """
 
     def test_reduce_and_validate_does_not_reload_merged_batch_from_disk(self):
@@ -376,6 +380,126 @@ class ReduceAndValidateMemoryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "Merged batch is empty or failed to persist"):
                 pipeline.reduce_and_validate(args)
+
+
+class ReduceAndValidatePreviousBatchMemoryTests(unittest.TestCase):
+    """Regression tests for the OOM fixed by never holding both the current and
+    previous live batches fully deserialized in memory at the same time.
+
+    Once a previous `lightgbm-model-live` release exists, the original
+    reduce_and_validate() downloaded and deserialized it unconditionally while the
+    just-built current batch was still fully resident, and merged them together --
+    doubling peak memory for a full-universe batch. These tests assert the
+    expensive previous-batch download is skipped when nothing would be carried
+    forward, and that a full run correctly reloads the current batch from disk
+    (rather than keeping the original in-memory copy alive) to combine with a
+    small carried-forward delta extracted from the previous batch.
+    """
+
+    def _previous_manifest(self, *, ticker: str, cycles_since_training: int) -> dict:
+        return {
+            "latest_batch": {
+                "asset_url": "https://github.com/bkabwe/bk-fin-and-inv/releases/download/lightgbm-batch-20260908T172900Z/return_model_batch.joblib",
+            },
+            "tickers": {
+                ticker: {
+                    "exchange": "XNAS",
+                    "last_trained": "2026-09-08T17:29:00Z",
+                    "cycles_since_training": cycles_since_training,
+                    "trained_horizons": [30, 180],
+                    "row_counts": {"30": 60, "180": 60},
+                    "batch_id": "20260908T172900Z",
+                }
+            }
+        }
+
+    def test_needs_previous_batch_download_true_when_carry_forward_candidate_exists(self):
+        manifest = self._previous_manifest(ticker="CCC", cycles_since_training=0)
+        self.assertTrue(
+            pipeline._needs_previous_batch_download(manifest, current_tickers={"AAA", "BBB"}, max_stale_cycles=4)
+        )
+
+    def test_needs_previous_batch_download_false_when_ticker_already_current(self):
+        manifest = self._previous_manifest(ticker="AAA", cycles_since_training=0)
+        self.assertFalse(
+            pipeline._needs_previous_batch_download(manifest, current_tickers={"AAA", "BBB"}, max_stale_cycles=4)
+        )
+
+    def test_needs_previous_batch_download_false_when_beyond_stale_cycles(self):
+        manifest = self._previous_manifest(ticker="CCC", cycles_since_training=4)
+        self.assertFalse(
+            pipeline._needs_previous_batch_download(manifest, current_tickers={"AAA", "BBB"}, max_stale_cycles=4)
+        )
+
+    def test_load_previous_live_state_skips_download_when_nothing_to_carry_forward(self):
+        manifest = self._previous_manifest(ticker="AAA", cycles_since_training=0)
+        with (
+            patch.object(pipeline, "fetch_live_manifest", return_value=manifest),
+            patch.object(pipeline, "load_return_model_batch_from_urls") as download_mock,
+        ):
+            returned_manifest, returned_batch = pipeline._load_previous_live_state(
+                "bkabwe/bk-fin-and-inv", current_tickers={"AAA", "BBB"}, max_stale_cycles=4
+            )
+        download_mock.assert_not_called()
+        self.assertEqual(returned_manifest, manifest)
+        self.assertEqual(returned_batch, {})
+
+    def test_reduce_and_validate_reloads_current_batch_to_combine_with_carried_forward(self):
+        with tempfile.TemporaryDirectory() as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            partial_dir = tmpdir / "partials"
+            partial_dir.mkdir()
+            _write_partial_shard(partial_dir / "shard-0.joblib", ticker="AAA")
+            _write_partial_shard(partial_dir / "shard-1.joblib", ticker="BBB")
+
+            previous_batch = pipeline.create_return_model_batch(
+                batch_id="20260908T172900Z",
+                models={"CCC": {30: object(), 180: object()}},
+                training_metadata={
+                    "CCC": {
+                        "exchange": "XNAS",
+                        "row_counts": {"30": 60, "180": 60},
+                        "trained_horizons": [30, 180],
+                        "last_trained": "2026-09-08T17:29:00Z",
+                        "fast_score": 70,
+                        "current_price": 50.0,
+                    }
+                },
+                created_at="2026-09-08T17:29:00Z",
+            )
+            previous_manifest = self._previous_manifest(ticker="CCC", cycles_since_training=0)
+
+            args = _reduce_args(partial_dir, tmpdir, sanity_tickers=("AAA",))
+
+            with (
+                patch.object(pipeline, "fetch_live_manifest", return_value=previous_manifest),
+                patch.object(pipeline, "load_return_model_batch_from_urls", return_value=previous_batch) as download_mock,
+                patch.object(
+                    pipeline, "load_return_model_batch", side_effect=pipeline.load_return_model_batch
+                ) as load_mock,
+                # Smoke testing (price history/feature/prediction) is exercised by
+                # other tests; it is irrelevant to the previous-batch memory
+                # behavior under test here, so stub it out as a no-op.
+                patch.object(pipeline, "_smoke_test_predictions"),
+            ):
+                result = pipeline.reduce_and_validate(args)
+
+            self.assertEqual(result, 0)
+            # The previous live batch is only fetched once, and only because CCC
+            # was a genuine carry-forward candidate.
+            download_mock.assert_called_once()
+            # One load per partial shard file, plus exactly one reload of the
+            # merged current batch to combine it with the carried-forward delta
+            # once the previous batch's own reference has already been dropped.
+            self.assertEqual(load_mock.call_count, 3)
+
+            manifest = json.loads(Path(args.output_manifest).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["current_run"]["trained_tickers"], ["AAA", "BBB"])
+            self.assertEqual(manifest["current_run"]["carried_forward_tickers"], ["CCC"])
+            self.assertIn("CCC", manifest["tickers"])
+
+            live_batch = pipeline.load_return_model_batch(Path(args.output_batch))
+            self.assertEqual(set(live_batch["models"].keys()), {"AAA", "BBB", "CCC"})
 
 
 class BatchAssetSplittingTests(unittest.TestCase):
