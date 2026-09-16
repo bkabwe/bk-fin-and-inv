@@ -1,0 +1,23 @@
+# Dependencies for `.github/workflows/train-lightgbm-batch.yml` only
+# (discover/train-shard/reduce/cleanup subcommands of
+# `scripts/lightgbm_batch_pipeline.py`).
+#
+# This is `requirements-workflows.txt` minus `transformers`/`torch`: the
+# batch pipeline only calls the technical-only `fast_screen_score` (never
+# `analyze_sentiment`), so it doesn't need the FinBERT stack. Skipping torch's
+# multi-GB CUDA wheel downloads keeps install time down and leaves more disk
+# headroom on the runner for the `reduce-promote` job, which already has to
+# hold multiple multi-GB batch files (downloaded shards, the merged batch,
+# and its split upload parts) at once. See `requirements-workflows.txt` for
+# the scan/grading-report workflows that do need FinBERT sentiment.
+pandas==3.0.5
+numpy==2.5.3
+ta==0.11.0
+requests==2.34.2
+python-dotenv==1.2.3
+beautifulsoup4==4.13.4
+lxml==6.1.0
+statsmodels==0.15.0
+scikit-learn==1.9.1
+lightgbm==4.7.0
+arch==8.0.0

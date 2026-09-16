@@ -1,12 +1,19 @@
-# Dependencies for headless GitHub Actions workflows (scheduled scans,
-# grading reports, and LightGBM batch training) that run `scripts/*.py`
-# against `modules/` directly and never render the Streamlit UI.
+# Dependencies for headless GitHub Actions workflows (scheduled scans and
+# grading reports) that run `scripts/*.py` against `modules/` directly and
+# never render the Streamlit UI.
 #
 # Deliberately excludes UI-only packages from requirements.txt (`streamlit`,
 # `plotly`, `Pillow`): every `modules/` file that optionally uses Streamlit
 # (`import streamlit as st` for `st.cache_data`) already falls back to a
 # local TTL-aware cache when Streamlit isn't installed, so these workflows
 # don't need it. See `requirements.txt` for the full Streamlit dashboard set.
+#
+# `train-lightgbm-batch.yml` installs the leaner `requirements-lightgbm-batch.txt`
+# instead: `scripts/lightgbm_batch_pipeline.py` never calls `analyze_sentiment`
+# (only the technical-only `fast_screen_score`), so it doesn't need the
+# `torch`/`transformers` FinBERT stack below, and skipping their multi-GB
+# CUDA wheel downloads leaves more disk headroom for that workflow's
+# multi-GB batch merge/promote step.
 pandas==3.0.5
 numpy==2.5.3
 ta==0.11.0
