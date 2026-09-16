@@ -44,7 +44,7 @@ class ArimaHardeningTests(unittest.TestCase):
                 return init_result
             method_kwargs = kwargs.get("method_kwargs", {})
             if method == "statespace" and method_kwargs.get("method") != "powell":
-                warnings.warn("did not converge", arima_hardening.ConvergenceWarning)
+                warnings.warn("did not converge", arima_hardening.ConvergenceWarning, stacklevel=2)
                 return primary_result
             return retry_result
 

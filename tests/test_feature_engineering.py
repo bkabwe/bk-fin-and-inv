@@ -27,9 +27,11 @@ class FeatureEngineeringTechnicalTests(unittest.TestCase):
     def test_rsi_ema_and_rolling_volatility(self):
         price_data = _sample_price_frame(40)
 
-        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}):
-            with patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()):
-                table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()),
+        ):
+            table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
 
         close = price_data["Close"].values
         alpha = 2.0 / (12.0 + 1.0)
@@ -51,9 +53,11 @@ class FeatureEngineeringTechnicalTests(unittest.TestCase):
         price_data["Close"] = 10.0
         price_data["High"] = 10.5
         price_data["Low"] = 9.5
-        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}):
-            with patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()):
-                table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=30)
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()),
+        ):
+            table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=30)
 
         self.assertAlmostEqual(float(table["technical_rsi_14d"].iloc[-1]), 50.0, places=6)
 
@@ -100,9 +104,11 @@ class FeatureEngineeringFundamentalTests(unittest.TestCase):
             }
         }
 
-        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value=company_facts):
-            with patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()):
-                table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=120)
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value=company_facts),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()),
+        ):
+            table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=120)
 
         self.assertAlmostEqual(float(table.loc["2024-01-20", "fundamental_gross_margin"]), 0.40, places=6)
         self.assertAlmostEqual(float(table.loc["2024-04-10", "fundamental_gross_margin"]), 0.40, places=6)
@@ -119,9 +125,11 @@ class FeatureEngineeringFundamentalTests(unittest.TestCase):
 class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
     def test_missing_fundamental_and_macro_data_returns_nan_columns(self):
         price_data = _sample_price_frame(40)
-        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}):
-            with patch("modules.feature_engineering.fred_client.get_macro_feature_table", side_effect=RuntimeError("fred unavailable")):
-                table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", side_effect=RuntimeError("fred unavailable")),
+        ):
+            table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
 
         self.assertFalse(table.empty)
         self.assertTrue(table["fundamental_gross_margin"].isna().all())
@@ -133,9 +141,11 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
 
     def test_insufficient_price_history_keeps_undercomputable_features_nan(self):
         price_data = _sample_price_frame(5)
-        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}):
-            with patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()):
-                table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=5)
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()),
+        ):
+            table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=5)
 
         self.assertEqual(len(table), 5)
         self.assertTrue(table["technical_volatility_30d"].isna().all())
@@ -147,10 +157,12 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
         price_data = _sample_price_frame(40)
         if hasattr(feature_engineering._build_feature_table_cached, "clear"):
             feature_engineering._build_feature_table_cached.clear()
-        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}) as sec_mock:
-            with patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()) as macro_mock:
-                first = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
-                second = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}) as sec_mock,
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()) as macro_mock,
+        ):
+            first = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
+            second = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
 
         self.assertEqual(sec_mock.call_count, 1)
         self.assertEqual(macro_mock.call_count, 1)
@@ -178,14 +190,16 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
             },
             index=pd.date_range("2023-12-15", periods=60, freq="D"),
         )
-        with patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}):
-            with patch("modules.feature_engineering.fred_client.get_macro_feature_table") as macro_mock:
-                table = feature_engineering.build_feature_table(
-                    "AAPL",
-                    price_data,
-                    lookback_days=40,
-                    shared_macro_table=shared_macro,
-                )
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table") as macro_mock,
+        ):
+            table = feature_engineering.build_feature_table(
+                "AAPL",
+                price_data,
+                lookback_days=40,
+                shared_macro_table=shared_macro,
+            )
 
         macro_mock.assert_not_called()
         self.assertFalse(table.empty)

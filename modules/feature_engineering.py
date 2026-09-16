@@ -188,10 +188,10 @@ def _fundamental_daily_features(ticker: str, daily_index: pd.DatetimeIndex) -> p
 
     filed_features = pd.DataFrame(index=revenue.index.union(liabilities.index).union(equity.index).union(gross_profit.index).sort_values())
     filed_features["gross_margin"] = [
-        _safe_div(gp, rev) for gp, rev in zip(gross_profit.reindex(filed_features.index), revenue.reindex(filed_features.index))
+        _safe_div(gp, rev) for gp, rev in zip(gross_profit.reindex(filed_features.index), revenue.reindex(filed_features.index), strict=False)
     ]
     debt_to_equity_values: list[float] = []
-    for liab, eq in zip(liabilities.reindex(filed_features.index), equity.reindex(filed_features.index)):
+    for liab, eq in zip(liabilities.reindex(filed_features.index), equity.reindex(filed_features.index), strict=False):
         ratio = _safe_div(liab, eq)
         # Keep SEC adapter compatibility: debtToEquity is represented as percent points (ratio * 100).
         debt_to_equity_values.append((ratio * 100.0) if ratio is not None else np.nan)

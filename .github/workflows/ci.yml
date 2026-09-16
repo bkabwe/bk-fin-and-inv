@@ -36,8 +36,8 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install ruff
         run: pip install ruff
-      - name: Lint Python (syntax errors + pyflakes)
-        run: ruff check --select E9,F .
+      - name: Lint Python (syntax errors, pyflakes, bugbear, simplify)
+        run: ruff check --select E9,F,B,SIM .
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}

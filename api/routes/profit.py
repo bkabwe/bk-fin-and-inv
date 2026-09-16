@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -183,7 +184,5 @@ def run_profit_task(job_id: str, params: dict):
     )
 
     # Record predictions for the track-record feature.
-    try:
+    with contextlib.suppress(Exception):  # Never let tracking failures break the task
         record_predictions_from_scan(final_rows, horizon=key, source="profit_opportunities")
-    except Exception:
-        pass  # Never let tracking failures break the task

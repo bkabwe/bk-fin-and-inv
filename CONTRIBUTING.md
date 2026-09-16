@@ -34,11 +34,10 @@ three requirements files (`requirements.txt`, `requirements-workflows.txt`,
    pip install ruff
    ruff check .
    ```
-   CI currently enforces `ruff check --select E9,F .` (syntax errors and
-   pyflakes) as a hard gate; broader rule sets (bugbear `B`, simplify `SIM`)
-   are being phased in incrementally, so also skim `ruff check .` output for
-   anything relevant to your change even if the CI gate doesn't fail on it
-   yet.
+   CI enforces `ruff check --select E9,F,B,SIM .` (syntax errors, pyflakes,
+   bugbear, simplify) as a hard gate; broader rule sets are being phased in
+   incrementally, so also skim `ruff check .` output for anything relevant
+   to your change even if the CI gate doesn't cover it yet.
 
 3. **If you changed `frontend/`**, also run:
    ```bash

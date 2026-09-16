@@ -192,7 +192,7 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         expected_starts = list(range(0, max(1, len(close_index) - (60 + 30) + 1), 30))[:10]
         expected_windows = [close_index[start : start + 60] for start in expected_starts]
         self.assertEqual(len(captured_training_row_indexes), len(expected_windows))
-        for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows):
+        for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows, strict=False):
             self.assertTrue(captured_index.equals(expected_index))
 
     def test_walk_forward_normalizes_timezone_aware_lightgbm_training_window_indexes(self):
@@ -261,7 +261,7 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         expected_windows = [normalized_index[start : start + 60] for start in expected_starts]
 
         self.assertEqual(len(captured_training_row_indexes), len(expected_windows))
-        for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows):
+        for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows, strict=False):
             self.assertIsNone(getattr(captured_index, "tz", None))
             self.assertEqual(len(captured_index), 60)
             self.assertTrue(captured_index.equals(expected_index))
@@ -335,9 +335,9 @@ class WalkForwardLightGBMTests(unittest.TestCase):
             patch("modules.backtester.SKLEARN_AVAILABLE", False),
             patch("modules.backtester.LIGHTGBM_AVAILABLE", True),
             patch("modules.backtester.build_feature_table", side_effect=RuntimeError("boom")),
+            self.assertLogs("modules.backtester", level="WARNING") as captured,
         ):
-            with self.assertLogs("modules.backtester", level="WARNING") as captured:
-                result = backtester.run_walk_forward("AAPL-LGBM-FAIL", data, evaluate_lightgbm=True)
+            result = backtester.run_walk_forward("AAPL-LGBM-FAIL", data, evaluate_lightgbm=True)
 
         self.assertIsNone(result["lightgbm_rmse"])
         self.assertEqual(result["lightgbm_windows"], 0)

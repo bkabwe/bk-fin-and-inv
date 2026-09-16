@@ -52,17 +52,19 @@ def live_scoring_context(manifest: dict[str, Any], batch: dict[str, Any], shared
         kwargs.setdefault("shared_macro_table", shared_macro_table)
         return original_build_feature_table(*args, **kwargs)
 
-    with patch.object(scoring_engine, "_load_live_lightgbm_manifest", return_value=manifest):
-        with patch.object(scoring_engine, "_load_live_lightgbm_batch", return_value=batch):
-            with patch.object(scoring_engine, "build_feature_table", side_effect=_build_feature_table_with_shared_macro):
-                yield
+    with (
+        patch.object(scoring_engine, "_load_live_lightgbm_manifest", return_value=manifest),
+        patch.object(scoring_engine, "_load_live_lightgbm_batch", return_value=batch),
+        patch.object(scoring_engine, "build_feature_table", side_effect=_build_feature_table_with_shared_macro),
+    ):
+        yield
 
 
 def load_live_scan_inputs(repository: str | None = None) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     manifest = fetch_live_manifest(repository=resolve_release_repository(repository))
     tickers = sorted(
         str(ticker).strip().upper()
-        for ticker in ((manifest or {}).get("tickers") or {}).keys()
+        for ticker in ((manifest or {}).get("tickers") or {})
         if str(ticker).strip()
     )
     if not tickers:

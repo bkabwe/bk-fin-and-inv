@@ -222,12 +222,14 @@ class RunScreenerTests(unittest.TestCase):
         )
 
     def test_run_screener_wraps_universe_fetch_runtime_errors(self):
-        with patch("modules.screener.get_nasdaq_tickers", side_effect=RuntimeError("upstream outage")):
-            with self.assertRaisesRegex(
+        with (
+            patch("modules.screener.get_nasdaq_tickers", side_effect=RuntimeError("upstream outage")),
+            self.assertRaisesRegex(
                 RuntimeError,
                 "Unable to fetch ticker universe 'nasdaq': upstream outage",
-            ):
-                screener.run_screener(universe="nasdaq", max_workers=1)
+            ),
+        ):
+            screener.run_screener(universe="nasdaq", max_workers=1)
 
 
 if __name__ == "__main__":

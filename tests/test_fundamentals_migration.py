@@ -41,9 +41,11 @@ class RetryBehaviorTests(unittest.TestCase):
             attempts["count"] += 1
             raise _http_error(403)
 
-        with patch("modules.polygon_client.time.sleep") as sleep_mock:
-            with self.assertRaises(requests.exceptions.HTTPError):
-                polygon_client._fetch_with_retry(_fetch, max_retries=3, base_delay=0.01)
+        with (
+            patch("modules.polygon_client.time.sleep") as sleep_mock,
+            self.assertRaises(requests.exceptions.HTTPError),
+        ):
+            polygon_client._fetch_with_retry(_fetch, max_retries=3, base_delay=0.01)
         self.assertEqual(attempts["count"], 1)
         sleep_mock.assert_not_called()
 
@@ -69,9 +71,11 @@ class RetryBehaviorTests(unittest.TestCase):
             attempts["count"] += 1
             raise _http_error(403)
 
-        with patch("modules.fred_client.time.sleep") as sleep_mock:
-            with self.assertRaises(requests.exceptions.HTTPError):
-                fred_client._fetch_with_retry(_fetch, max_retries=3, base_delay=0.01)
+        with (
+            patch("modules.fred_client.time.sleep") as sleep_mock,
+            self.assertRaises(requests.exceptions.HTTPError),
+        ):
+            fred_client._fetch_with_retry(_fetch, max_retries=3, base_delay=0.01)
         self.assertEqual(attempts["count"], 1)
         sleep_mock.assert_not_called()
 
@@ -147,11 +151,13 @@ class FredMacroRegimeTests(unittest.TestCase):
         response.json.return_value = payload
         response.raise_for_status.return_value = None
 
-        with patch.dict("os.environ", {"FRED_API_KEY": "fred-key"}, clear=False):
-            with patch("modules.fred_client.requests.get") as get_mock:
-                get_mock.return_value = response
+        with (
+            patch.dict("os.environ", {"FRED_API_KEY": "fred-key"}, clear=False),
+            patch("modules.fred_client.requests.get") as get_mock,
+        ):
+            get_mock.return_value = response
 
-                df = fred_client.get_vix_observations("2026-09-01", "2026-09-03")
+            df = fred_client.get_vix_observations("2026-09-01", "2026-09-03")
 
         self.assertEqual(list(df.columns), ["Close"])
         self.assertEqual(len(df), 2)

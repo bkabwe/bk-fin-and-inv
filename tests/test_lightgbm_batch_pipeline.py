@@ -341,14 +341,16 @@ class ReduceAndValidateMemoryTests(unittest.TestCase):
 
             args = _reduce_args(partial_dir, tmpdir, sanity_tickers=("ZZZ",))
 
-            with patch.object(
-                pipeline, "load_return_model_batch", side_effect=pipeline.load_return_model_batch
-            ) as load_mock:
-                # ZZZ is not part of the merged batch, so the smoke test intentionally
-                # fails fast (before any network/model-prediction calls) once past the
-                # merged-batch validation this test is targeting.
-                with self.assertRaisesRegex(RuntimeError, "No sanity tickers were present"):
-                    pipeline.reduce_and_validate(args)
+            # ZZZ is not part of the merged batch, so the smoke test intentionally
+            # fails fast (before any network/model-prediction calls) once past the
+            # merged-batch validation this test is targeting.
+            with (
+                patch.object(
+                    pipeline, "load_return_model_batch", side_effect=pipeline.load_return_model_batch
+                ) as load_mock,
+                self.assertRaisesRegex(RuntimeError, "No sanity tickers were present"),
+            ):
+                pipeline.reduce_and_validate(args)
 
             # Exactly one load per partial shard file, and no additional reload of the
             # merged current_batch that was just written to disk.

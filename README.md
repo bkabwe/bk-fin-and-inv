@@ -244,9 +244,10 @@ python -m unittest discover -s tests -p "test_*.py" -v
 request:
 - **test**: installs `requirements.txt` + `requirements-api.txt`, runs the
   full `unittest` suite.
-- **lint**: `ruff check --select E9,F .` (Python syntax errors + pyflakes
-  only — not full style/complexity linting), then `frontend/`'s `tsc
-  --noEmit` type-check and `npm test` (Vitest).
+- **lint**: `ruff check --select E9,F,B,SIM .` (syntax errors, pyflakes,
+  flake8-bugbear, and flake8-simplify — still not full style/complexity
+  linting), then `frontend/`'s `tsc --noEmit` type-check and `npm test`
+  (Vitest).
 
 Separately, `.github/workflows/train-lightgbm-batch.yml`,
 `scan-email-short-term.yml`, `scan-email-medium-term.yml`,

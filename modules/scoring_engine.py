@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 import numpy as np
@@ -892,15 +893,11 @@ def analyze_stock(
         except Exception:
             trailing_52w = data.tail(252)
     if "fiftyTwoWeekHigh" not in info and not trailing_52w.empty and "High" in trailing_52w:
-        try:
+        with contextlib.suppress(Exception):
             info["fiftyTwoWeekHigh"] = float(trailing_52w["High"].astype(float).max())
-        except Exception:
-            pass
     if "fiftyTwoWeekLow" not in info and not trailing_52w.empty and "Low" in trailing_52w:
-        try:
+        with contextlib.suppress(Exception):
             info["fiftyTwoWeekLow"] = float(trailing_52w["Low"].astype(float).min())
-        except Exception:
-            pass
 
     technical = analyze_technical(data)
     if not data.empty:

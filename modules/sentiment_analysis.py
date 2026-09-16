@@ -114,7 +114,7 @@ def _analyze_sentiment_uncached(ticker: str) -> dict:
             logger.warning("FinBERT inference failed, falling back to neutral headlines: %s", exc)
             model_outputs = [{"label": "neutral", "score": 0.0} for _ in scored_inputs]
 
-    for (article, title), model_output in zip(scored_inputs, model_outputs):
+    for (article, title), model_output in zip(scored_inputs, model_outputs, strict=False):
         model_label = str(model_output.get("label", "neutral")).lower()
         confidence = float(model_output.get("score", 0.0) or 0.0)
         score = confidence if model_label == "positive" else -confidence if model_label == "negative" else 0.0

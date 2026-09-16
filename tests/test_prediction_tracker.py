@@ -179,7 +179,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         for idx, sample in enumerate(samples):
             self._record(ticker=f"T{idx}", score=sample["score"])
         records = prediction_tracker.get_all_predictions()
-        for rec, sample in zip(records, samples):
+        for rec, sample in zip(records, samples, strict=False):
             rec["status"] = "resolved"
             rec["actual_return_pct"] = sample["actual_return_pct"]
             rec["hit_target"] = sample["hit_target"]

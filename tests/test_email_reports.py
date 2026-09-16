@@ -29,14 +29,15 @@ class ParseRecipientsTests(unittest.TestCase):
         self.assertEqual(parse_recipients(" a@x.com ,, b@y.com ,"), ["a@x.com", "b@y.com"])
 
     def test_empty_raises_runtime_error(self):
-        with patch.dict("os.environ", {"SCAN_EMAIL_RECIPIENTS": ""}, clear=False):
-            with self.assertRaises(RuntimeError):
-                parse_recipients()
+        with (
+            patch.dict("os.environ", {"SCAN_EMAIL_RECIPIENTS": ""}, clear=False),
+            self.assertRaises(RuntimeError),
+        ):
+            parse_recipients()
 
     def test_none_and_missing_env_raises(self):
-        with patch.dict("os.environ", {}, clear=True):
-            with self.assertRaises(RuntimeError):
-                parse_recipients(None)
+        with patch.dict("os.environ", {}, clear=True), self.assertRaises(RuntimeError):
+            parse_recipients(None)
 
 
 class BuildSenderTests(unittest.TestCase):
@@ -45,9 +46,11 @@ class BuildSenderTests(unittest.TestCase):
             self.assertEqual(build_sender(), {"name": "BK Self", "email": "sender@x.com"})
 
     def test_missing_env_raises(self):
-        with patch.dict("os.environ", {"SCAN_EMAIL_FROM": ""}, clear=False):
-            with self.assertRaises(RuntimeError):
-                build_sender()
+        with (
+            patch.dict("os.environ", {"SCAN_EMAIL_FROM": ""}, clear=False),
+            self.assertRaises(RuntimeError),
+        ):
+            build_sender()
 
 
 class CsvAttachmentTests(unittest.TestCase):
@@ -134,9 +137,11 @@ class SendBrevoEmailTests(unittest.TestCase):
         return env
 
     def test_missing_api_key_raises(self):
-        with patch.dict("os.environ", {"BREVO_API_KEY": ""}, clear=False):
-            with self.assertRaises(RuntimeError):
-                send_brevo_email(subject="s", html_content="<p>hi</p>")
+        with (
+            patch.dict("os.environ", {"BREVO_API_KEY": ""}, clear=False),
+            self.assertRaises(RuntimeError),
+        ):
+            send_brevo_email(subject="s", html_content="<p>hi</p>")
 
     @patch("modules.email_reports.requests.Session")
     def test_sends_to_all_recipients_and_returns_count(self, mock_session_cls):
@@ -177,9 +182,11 @@ class SendBrevoEmailTests(unittest.TestCase):
         mock_session.post.return_value = MagicMock(status_code=500, text="server error")
         mock_session_cls.return_value = mock_session
 
-        with patch.dict("os.environ", self._env(), clear=False):
-            with self.assertRaises(RuntimeError):
-                send_brevo_email(subject="Report", html_content="<p>hi</p>")
+        with (
+            patch.dict("os.environ", self._env(), clear=False),
+            self.assertRaises(RuntimeError),
+        ):
+            send_brevo_email(subject="Report", html_content="<p>hi</p>")
 
     @patch("modules.email_reports.requests.Session")
     def test_partial_failure_still_raises_but_reports_prior_successes(self, mock_session_cls):
@@ -190,9 +197,11 @@ class SendBrevoEmailTests(unittest.TestCase):
         ]
         mock_session_cls.return_value = mock_session
 
-        with patch.dict("os.environ", self._env(), clear=False):
-            with self.assertRaises(RuntimeError) as ctx:
-                send_brevo_email(subject="Report", html_content="<p>hi</p>")
+        with (
+            patch.dict("os.environ", self._env(), clear=False),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            send_brevo_email(subject="Report", html_content="<p>hi</p>")
 
         self.assertIn("r2@x.com", str(ctx.exception))
 

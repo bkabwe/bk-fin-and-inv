@@ -226,7 +226,7 @@ def compute_max_price_since_scan(
     prices = df[price_col].astype(float)
     candidates = [
         float(price)
-        for idx, price in zip(prices.index, prices.values)
+        for idx, price in zip(prices.index, prices.values, strict=False)
         if start <= (idx.date() if hasattr(idx, "date") else date.fromisoformat(str(idx)[:10])) <= stop
         and price == price
     ]
@@ -281,10 +281,10 @@ def resolve_pending_predictions() -> dict[str, int]:
                 for d in close.index
             ]
             # Find the closest available date on or after target_date.
-            candidates = [(d, p) for d, p in zip(index_dates, close.values) if d >= target_date]
+            candidates = [(d, p) for d, p in zip(index_dates, close.values, strict=False) if d >= target_date]
             if not candidates:
                 # Fall back to the most recent available date.
-                candidates = list(zip(index_dates, close.values))
+                candidates = list(zip(index_dates, close.values, strict=False))
             if not candidates:
                 raise ValueError("no price candidates")
 
@@ -440,7 +440,7 @@ def _pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
         return None
     mean_x = sum(xs) / n
     mean_y = sum(ys) / n
-    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=False))
     var_x = sum((x - mean_x) ** 2 for x in xs)
     var_y = sum((y - mean_y) ** 2 for y in ys)
     denom = (var_x * var_y) ** 0.5
