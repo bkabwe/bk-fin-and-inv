@@ -7,16 +7,16 @@
 # (`import streamlit as st` for `st.cache_data`) already falls back to a
 # local TTL-aware cache when Streamlit isn't installed, so these workflows
 # don't need it. See `requirements.txt` for the full Streamlit dashboard set.
-pandas
-numpy
-ta
-transformers
-torch
-requests
-python-dotenv
+pandas==3.0.5
+numpy==2.5.3
+ta==0.11.0
+transformers==5.17.0
+torch==2.14.0
+requests==2.34.2
+python-dotenv==1.2.3
 beautifulsoup4==4.13.4
 lxml==6.1.0
-statsmodels
-scikit-learn
+statsmodels==0.15.0
+scikit-learn==1.9.1
 lightgbm==4.7.0
-arch
+arch==8.0.0
