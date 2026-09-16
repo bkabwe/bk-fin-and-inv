@@ -9,8 +9,9 @@ permissions:
   contents: read
 
 env:
-  PYTHON_VERSION: '3.11'
-  MYPY_PYTHON_VERSION: '3.12'
+  # numpy==2.5.3 (pinned in requirements.txt) only ships wheels for
+  # Python 3.12+, so every job that installs requirements.txt needs 3.12.
+  PYTHON_VERSION: '3.12'
   NODE_VERSION: '20'
 
 jobs:
@@ -56,15 +57,13 @@ jobs:
     # Advisory-only Python type-checking (mypy), scoped to `modules/` via
     # pyproject.toml. Findings are informational and never fail the build
     # (continue-on-error) while type coverage across the codebase matures.
-    # Uses a newer Python than the `test`/`lint` jobs because numpy's bundled
-    # type stubs use PEP 695 syntax that requires Python 3.12+ to parse.
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.MYPY_PYTHON_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
         run: |
           pip install -r requirements.txt

@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12'  # numpy==2.5.3 (requirements-workflows.txt) requires Python 3.12+
   MATRIX_JOBS: '4'
   LIGHTGBM_RELEASE_REPOSITORY: ${{ github.repository }}
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
