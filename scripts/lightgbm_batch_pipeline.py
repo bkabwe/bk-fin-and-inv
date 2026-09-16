@@ -21,16 +21,20 @@ from modules.data_fetcher import get_all_active_ticker_details, get_stock_data
 from modules.feature_engineering import build_feature_table
 from modules.fred_client import get_macro_feature_table
 from modules.lightgbm_batch import (
+    BATCH_ASSET_SPLIT_CHUNK_BYTES,
     DEFAULT_BATCH_ASSET_NAME,
     DEFAULT_BATCH_RELEASE_PREFIX,
     DEFAULT_LIVE_MANIFEST_ASSET_NAME,
     DEFAULT_LIVE_RELEASE_TAG,
+    batch_asset_part_count,
+    batch_asset_part_name,
+    batch_asset_urls_from_manifest,
     build_live_manifest,
     create_return_model_batch,
     fetch_live_manifest,
     get_batch_training_metadata,
     load_return_model_batch,
-    load_return_model_batch_from_url,
+    load_return_model_batch_from_urls,
     merge_current_and_previous_batches,
     resolve_release_repository,
 )
@@ -396,15 +400,62 @@ def _load_previous_live_state(repository: str) -> tuple[dict[str, Any], dict[str
     except Exception as exc:
         logger.warning("Previous live manifest unavailable: %s", exc)
         return {}, {}
-    asset_url = str((((manifest or {}).get("latest_batch") or {}).get("asset_url") or "")).strip()
-    if not asset_url:
+    asset_urls = batch_asset_urls_from_manifest(manifest)
+    if not asset_urls:
         return manifest, {}
     try:
-        batch = load_return_model_batch_from_url(asset_url)
+        batch = load_return_model_batch_from_urls(asset_urls)
     except Exception as exc:
         logger.warning("Previous live batch unavailable: %s", exc)
         return manifest, {}
     return manifest, batch
+
+
+def _split_large_file(path: Path, chunk_size: int = BATCH_ASSET_SPLIT_CHUNK_BYTES) -> list[Path]:
+    """Split `path` into ordered part files no larger than `chunk_size` bytes.
+
+    GitHub rejects release assets over 2 GiB, so a full-universe batch file
+    must be split into smaller parts before upload. Returns `[path]` unchanged
+    when splitting is not needed.
+    """
+    size_bytes = int(path.stat().st_size)
+    total_parts = batch_asset_part_count(size_bytes, chunk_size=chunk_size)
+    if total_parts <= 1:
+        return [path]
+    read_chunk_bytes = 8 * 1024 * 1024
+    part_paths: list[Path] = []
+    with path.open("rb") as source_fh:
+        for index in range(1, total_parts + 1):
+            part_path = path.with_name(f"{path.name}.part{index:03d}of{total_parts:03d}")
+            remaining = chunk_size
+            with part_path.open("wb") as part_fh:
+                while remaining > 0:
+                    chunk = source_fh.read(min(read_chunk_bytes, remaining))
+                    if not chunk:
+                        break
+                    part_fh.write(chunk)
+                    remaining -= len(chunk)
+            part_paths.append(part_path)
+    return part_paths
+
+
+def _upload_batch_asset(
+    client: GitHubReleaseClient,
+    release: dict[str, Any],
+    batch_path: Path,
+    *,
+    chunk_size: int = BATCH_ASSET_SPLIT_CHUNK_BYTES,
+) -> None:
+    part_paths = _split_large_file(batch_path, chunk_size=chunk_size)
+    total_parts = len(part_paths)
+    try:
+        for index, part_path in enumerate(part_paths, start=1):
+            asset_name = batch_asset_part_name(DEFAULT_BATCH_ASSET_NAME, index, total_parts)
+            client.upload_asset(release, part_path, asset_name)
+    finally:
+        if total_parts > 1:
+            for part_path in part_paths:
+                part_path.unlink(missing_ok=True)
 
 
 def _promote_outputs(args: argparse.Namespace, batch_path: Path, manifest_path: Path, release_tag: str) -> None:
@@ -420,7 +471,7 @@ def _promote_outputs(args: argparse.Namespace, batch_path: Path, manifest_path: 
         body=f"Automated LightGBM batch promotion for {release_tag}",
         target_commitish=os.getenv("GITHUB_SHA"),
     )
-    client.upload_asset(batch_release, batch_path, DEFAULT_BATCH_ASSET_NAME)
+    _upload_batch_asset(client, batch_release, batch_path)
     live_release = client.ensure_release(
         tag=DEFAULT_LIVE_RELEASE_TAG,
         name=DEFAULT_LIVE_RELEASE_TAG,
@@ -481,7 +532,8 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
         created_at=created_at,
     )
     joblib.dump(live_batch, merged_batch_path)
-    logger.info("Persisted live batch (current + carried-forward) to %s (%d bytes)", merged_batch_path, merged_batch_path.stat().st_size)
+    live_batch_size_bytes = merged_batch_path.stat().st_size
+    logger.info("Persisted live batch (current + carried-forward) to %s (%d bytes)", merged_batch_path, live_batch_size_bytes)
     manifest = build_live_manifest(
         repository=repository,
         batch_id=batch_id,
@@ -489,6 +541,7 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
         batch_asset_name=DEFAULT_BATCH_ASSET_NAME,
         created_at=created_at,
         training_metadata=live_meta,
+        asset_part_count=batch_asset_part_count(live_batch_size_bytes),
     )
     manifest["current_run"] = {
         "expected_tickers": expected_tickers,
