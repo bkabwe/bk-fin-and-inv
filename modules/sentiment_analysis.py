@@ -95,7 +95,7 @@ def _get_market_sentiment_signals(ticker: str) -> dict:
     }
 
 
-def analyze_sentiment(ticker: str) -> dict:
+def _analyze_sentiment_uncached(ticker: str) -> dict:
     scored = []
     scored_inputs = []
     for article in get_news(ticker):
@@ -170,3 +170,12 @@ def analyze_sentiment(ticker: str) -> dict:
         "put_call_ratio": extra.get("put_call_ratio"),
         "options_sentiment": options_interpretation,
     }
+
+
+# `analyze_sentiment`'s inputs (news headlines) are already cached upstream via
+# `get_news` (ttl=900), but FinBERT inference itself re-ran on every call even
+# when the underlying cached news hadn't changed. Cache the composed result
+# here too (same 15-minute TTL as `get_news`) so repeated calls for the same
+# ticker within that window skip both the news re-fetch *and* the FinBERT
+# batch-inference pass.
+analyze_sentiment = cache_data(ttl=900)(_analyze_sentiment_uncached)

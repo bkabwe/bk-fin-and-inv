@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import joblib
+import pandas as pd
 import requests
 
 from scripts import lightgbm_batch_pipeline as pipeline
@@ -186,6 +189,87 @@ class GitHubReleaseClientUploadTests(unittest.TestCase):
             asset_path.write_bytes(b"hello world")
             with self.assertRaisesRegex(RuntimeError, "unexpected JSON payload type"):
                 client.upload_asset(release, asset_path, "asset.bin")
+
+
+def _discover_args(tmpdir: Path, **overrides) -> argparse.Namespace:
+    defaults = dict(
+        output=str(tmpdir / "discovery.json"),
+        macro_output=str(tmpdir / "macro.joblib"),
+        price_floor=0.10,
+        fast_screen_min_score=pipeline.DEFAULT_FAST_SCREEN_MIN_SCORE,
+        fast_screen_margin=pipeline.DEFAULT_FAST_SCREEN_MARGIN,
+        fast_screen_period="1y",
+        fast_screen_interval="1d",
+        matrix_jobs=4,
+        macro_lookback_days=365 * 5,
+        discover_workers=4,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class DiscoverParallelizationTests(unittest.TestCase):
+    """discover() parallelizes per-ticker Polygon/fast-screen work across threads.
+
+    _chunk_for_shard() routes tickers to shards using their index in the
+    `filtered` list (idx % shard_count), so the order of `filtered` must stay
+    deterministic (matching the input tickers' order) regardless of which
+    thread finishes first.
+    """
+
+    def test_filtered_order_matches_input_order_despite_out_of_order_completion(self):
+        tickers = [{"ticker": t, "primary_exchange": "XNYS", "type": "CS"} for t in ["AAA", "BBB", "CCC", "DDD", "EEE"]]
+
+        # Stagger fake "network" latency so tickers complete in reverse of
+        # their input order (EEE finishes first, AAA finishes last).
+        delays = {"AAA": 0.08, "BBB": 0.06, "CCC": 0.04, "DDD": 0.02, "EEE": 0.0}
+
+        def _fake_get_stock_data(ticker, period=None, interval=None):
+            time.sleep(delays[ticker])
+            return pd.DataFrame({"Close": [10.0, 11.0]})
+
+        def _fake_fast_screen_score(ticker, period=None, interval=None, data=None):
+            return 80, None
+
+        with tempfile.TemporaryDirectory() as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            args = _discover_args(tmpdir)
+            with (
+                patch.object(pipeline, "get_all_active_ticker_details", return_value=tickers),
+                patch.object(pipeline, "get_stock_data", side_effect=_fake_get_stock_data),
+                patch.object(pipeline, "fast_screen_score", side_effect=_fake_fast_screen_score),
+                patch.object(pipeline, "get_macro_feature_table", return_value=pd.DataFrame()),
+            ):
+                pipeline.discover(args)
+
+            payload = json.loads(Path(args.output).read_text(encoding="utf-8"))
+            self.assertEqual([row["ticker"] for row in payload["tickers"]], ["AAA", "BBB", "CCC", "DDD", "EEE"])
+
+    def test_failed_ticker_is_skipped_without_aborting_other_tickers(self):
+        tickers = [{"ticker": t, "primary_exchange": "XNYS", "type": "CS"} for t in ["AAA", "BBB", "CCC"]]
+
+        def _fake_get_stock_data(ticker, period=None, interval=None):
+            if ticker == "BBB":
+                raise RuntimeError("boom")
+            return pd.DataFrame({"Close": [10.0, 11.0]})
+
+        def _fake_fast_screen_score(ticker, period=None, interval=None, data=None):
+            return 80, None
+
+        with tempfile.TemporaryDirectory() as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            args = _discover_args(tmpdir)
+            with (
+                patch.object(pipeline, "get_all_active_ticker_details", return_value=tickers),
+                patch.object(pipeline, "get_stock_data", side_effect=_fake_get_stock_data),
+                patch.object(pipeline, "fast_screen_score", side_effect=_fake_fast_screen_score),
+                patch.object(pipeline, "get_macro_feature_table", return_value=pd.DataFrame()),
+            ):
+                pipeline.discover(args)
+
+            payload = json.loads(Path(args.output).read_text(encoding="utf-8"))
+            self.assertEqual([row["ticker"] for row in payload["tickers"]], ["AAA", "CCC"])
+            self.assertEqual(payload["skipped"]["BBB"]["reason"], "discover_error")
 
 
 def _write_partial_shard(

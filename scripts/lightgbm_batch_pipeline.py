@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -55,6 +57,9 @@ DEFAULT_FAST_SCREEN_MIN_SCORE = 50
 DEFAULT_FAST_SCREEN_MARGIN = 15
 DEFAULT_SANITY_TICKERS = ("AAPL", "MSFT")
 DEFAULT_BATCH_RETENTION = 4
+# I/O-bound per-ticker Polygon fetches in discover() benefit from the same
+# thread-pool concurrency used by modules/screener.py::run_screener().
+DEFAULT_DISCOVER_WORKERS = 8
 COMMON_STOCK_TYPES = {"CS", "COMMON STOCK", "COMMON_STOCK"}
 UPLOAD_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 UPLOAD_MAX_ATTEMPTS = 3
@@ -199,48 +204,83 @@ def _json_dump(path: Path, payload: Any) -> None:
 def discover(args: argparse.Namespace) -> int:
     discovered_at = _utc_now().isoformat().replace("+00:00", "Z")
     tickers = get_all_active_ticker_details()
-    filtered: list[dict[str, Any]] = []
     skipped: dict[str, dict[str, Any]] = {}
     fast_screen_threshold = int(args.fast_screen_min_score) - int(args.fast_screen_margin)
 
-    for row in tickers:
+    # Cheap, synchronous pre-filter first: non-common-stock rows and blank
+    # tickers require no network I/O, so keep them out of the parallel
+    # section below. `order` preserves each candidate's original position in
+    # `tickers` so the per-ticker Polygon/fast-screen work below can safely
+    # run out of order across threads while `filtered` is still reassembled
+    # deterministically afterwards.
+    candidates: list[tuple[int, str, dict[str, Any]]] = []
+    for order, row in enumerate(tickers):
         ticker = str(row.get("ticker") or "").strip().upper()
         if not ticker:
             continue
         if not _common_stock(row):
             skipped[ticker] = {"reason": "non_common_stock", "type": row.get("type")}
             continue
-        price_data = get_stock_data(ticker, period=args.fast_screen_period, interval=args.fast_screen_interval)
-        close = (
-            price_data["Close"].dropna()
-            if price_data is not None and not price_data.empty and "Close" in price_data
-            else pd.Series(dtype="float64")
-        )
-        current_price = float(close.iloc[-1]) if not close.empty else None
-        if current_price is None or float(current_price) < float(args.price_floor):
-            skipped[ticker] = {"reason": "price_below_floor", "current_price": current_price}
-            continue
-        fast_score, err = fast_screen_score(
-            ticker,
-            period=args.fast_screen_period,
-            interval=args.fast_screen_interval,
-            data=price_data,
-        )
-        if err:
-            skipped[ticker] = {"reason": "fast_screen_error", "detail": err}
-            continue
-        if int(fast_score) < fast_screen_threshold:
-            skipped[ticker] = {"reason": "fast_screen_below_threshold", "fast_score": int(fast_score)}
-            continue
-        filtered.append(
-            {
+        candidates.append((order, ticker, row))
+
+    # Parallelize the I/O-bound per-ticker work (Polygon price fetch + fast
+    # screen scoring) across threads, mirroring the ThreadPoolExecutor
+    # pattern used by modules/screener.py::run_screener(). Results are
+    # collected keyed by each candidate's original `order` so `filtered` can
+    # be rebuilt in the same order as `tickers` regardless of completion
+    # order -- `_chunk_for_shard()` depends on that stable ordering
+    # (`idx % shard_count`) to route each ticker to a consistent shard.
+    lock = threading.Lock()
+    filtered_by_order: dict[int, dict[str, Any]] = {}
+    discover_workers = max(1, int(getattr(args, "discover_workers", DEFAULT_DISCOVER_WORKERS) or DEFAULT_DISCOVER_WORKERS))
+
+    def _process_candidate(order: int, ticker: str, row: dict[str, Any]) -> None:
+        try:
+            price_data = get_stock_data(ticker, period=args.fast_screen_period, interval=args.fast_screen_interval)
+            close = (
+                price_data["Close"].dropna()
+                if price_data is not None and not price_data.empty and "Close" in price_data
+                else pd.Series(dtype="float64")
+            )
+            current_price = float(close.iloc[-1]) if not close.empty else None
+            if current_price is None or float(current_price) < float(args.price_floor):
+                with lock:
+                    skipped[ticker] = {"reason": "price_below_floor", "current_price": current_price}
+                return
+            fast_score, err = fast_screen_score(
+                ticker,
+                period=args.fast_screen_period,
+                interval=args.fast_screen_interval,
+                data=price_data,
+            )
+            if err:
+                with lock:
+                    skipped[ticker] = {"reason": "fast_screen_error", "detail": err}
+                return
+            if int(fast_score) < fast_screen_threshold:
+                with lock:
+                    skipped[ticker] = {"reason": "fast_screen_below_threshold", "fast_score": int(fast_score)}
+                return
+            entry = {
                 "ticker": ticker,
                 "exchange": row.get("primary_exchange"),
                 "type": row.get("type"),
                 "current_price": float(current_price),
                 "fast_score": int(fast_score),
             }
-        )
+            with lock:
+                filtered_by_order[order] = entry
+        except Exception as exc:
+            with lock:
+                skipped[ticker] = {"reason": "discover_error", "detail": str(exc)}
+            logger.warning("Unexpected error discovering %s: %s", ticker, exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=discover_workers) as executor:
+        futures = {executor.submit(_process_candidate, order, ticker, row): ticker for order, ticker, row in candidates}
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # exceptions are already handled inside _process_candidate
+
+    filtered: list[dict[str, Any]] = [filtered_by_order[order] for order, _, _ in candidates if order in filtered_by_order]
 
     end_date = _utc_now().date()
     start_date = end_date - timedelta(days=int(args.macro_lookback_days))
@@ -335,6 +375,19 @@ def train_shard(args: argparse.Namespace) -> int:
 
 
 def _merge_partial_batches(partial_files: list[Path]) -> tuple[dict[str, dict[int, object]], dict[str, dict[str, Any]], list[str], dict[str, Any]]:
+    # NOTE on residual memory-hygiene gap: each partial shard file is loaded
+    # one at a time (`payload` goes out of scope and becomes collectible at
+    # the next loop iteration/return), and `reduce_and_validate()` avoids a
+    # redundant reload of the merged batch and drops the previous release's
+    # batch as soon as it has been merged (see the `del previous_manifest,
+    # previous_batch` below). The remaining, unavoidable peak-memory floor is
+    # holding one fully-merged in-memory model set (`models` here) at a time.
+    # Fully streaming reduce/merge (e.g. writing per-ticker files and merging
+    # via disk-backed iteration instead of one big in-memory dict) would
+    # require a broader batch-storage-format redesign and is out of scope for
+    # this change; current ~16GB CI runners have enough headroom for today's
+    # universe size, so this is a durable-fix gap to revisit if the trained
+    # ticker universe grows substantially.
     models: dict[str, dict[int, object]] = {}
     metadata: dict[str, dict[str, Any]] = {}
     expected: list[str] = []
@@ -524,6 +577,16 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
         previous_batch=previous_batch,
         max_stale_cycles=int(args.max_stale_cycles),
     )
+    # `previous_batch` (the full previous release's model set, potentially the
+    # largest single object held during reduce-promote) and `previous_manifest`
+    # are only needed transiently by merge_current_and_previous_batches() above:
+    # any model objects it decided to carry forward are already referenced by
+    # `live_models`. Dropping these references here (rather than letting them
+    # linger as live locals until the function returns) lets the previous
+    # batch's now-superseded/dropped model objects be garbage collected before
+    # we build and serialize `live_batch` below, reducing peak memory during
+    # the most memory-intensive part of reduce-promote.
+    del previous_manifest, previous_batch
     release_tag = f"{DEFAULT_BATCH_RELEASE_PREFIX}-{batch_id}"
     live_batch = create_return_model_batch(
         batch_id=batch_id,
@@ -597,6 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument("--fast-screen-interval", default="1d")
     discover_parser.add_argument("--matrix-jobs", type=int, default=4)
     discover_parser.add_argument("--macro-lookback-days", type=int, default=365 * 5)
+    discover_parser.add_argument("--discover-workers", type=int, default=DEFAULT_DISCOVER_WORKERS)
     discover_parser.set_defaults(func=discover)
 
     train_parser = subparsers.add_parser("train-shard")

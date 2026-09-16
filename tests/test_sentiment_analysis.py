@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import importlib
-import sys
-import types
 import unittest
 from unittest.mock import Mock, patch
 
 
 def _load_sentiment_analysis_module():
-    fake_data_fetcher = types.SimpleNamespace(get_news=lambda _ticker: [], get_stock_info=lambda _ticker: {})
-    with patch.dict(sys.modules, {"modules.data_fetcher": fake_data_fetcher}):
-        module = importlib.import_module("modules.sentiment_analysis")
-        return importlib.reload(module)
+    # `modules.sentiment_analysis` is a process-wide singleton once imported;
+    # each test below isolates `get_news`/`_load_finbert_pipeline`/
+    # `_get_market_sentiment_signals` via `patch.object(...)` on the returned
+    # module for the scope of that test, so no module reload is required.
+    #
+    # NOTE: an earlier version of this helper swapped a fake module into
+    # `sys.modules["modules.data_fetcher"]` and called `importlib.reload()`
+    # to get an "isolated" module reference. That combination triggers a
+    # genuine bug in Streamlit's cache-write pickling path (a stale
+    # `CachedResult` class reference) once `analyze_sentiment` itself became
+    # `@cache_data`-wrapped, so it was replaced with a plain import.
+    module = importlib.import_module("modules.sentiment_analysis")
+    # `analyze_sentiment` is wrapped in a ttl-cache (see modules/sentiment_analysis.py);
+    # clear any residual cached entries from a previous test so each test
+    # starts from a clean cache.
+    if hasattr(module.analyze_sentiment, "clear"):
+        module.analyze_sentiment.clear()
+    return module
 
 
 class SentimentAnalysisTests(unittest.TestCase):
