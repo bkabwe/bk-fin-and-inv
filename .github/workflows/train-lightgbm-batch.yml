@@ -33,7 +33,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-workflows.txt
       - name: Generate batch id
         id: batch
         run: echo "batch_id=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
@@ -64,7 +64,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-workflows.txt
       - name: Download training inputs
         uses: actions/download-artifact@v4.1.3
         with:
@@ -100,7 +100,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-workflows.txt
       - name: Download training inputs
         uses: actions/download-artifact@v4.1.3
         with:

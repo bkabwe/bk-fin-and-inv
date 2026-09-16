@@ -1,0 +1,22 @@
+# Dependencies for headless GitHub Actions workflows (scheduled scans,
+# grading reports, and LightGBM batch training) that run `scripts/*.py`
+# against `modules/` directly and never render the Streamlit UI.
+#
+# Deliberately excludes UI-only packages from requirements.txt (`streamlit`,
+# `plotly`, `Pillow`): every `modules/` file that optionally uses Streamlit
+# (`import streamlit as st` for `st.cache_data`) already falls back to a
+# local TTL-aware cache when Streamlit isn't installed, so these workflows
+# don't need it. See `requirements.txt` for the full Streamlit dashboard set.
+pandas
+numpy
+ta
+transformers
+torch
+requests
+python-dotenv
+beautifulsoup4==4.13.4
+lxml==6.1.0
+statsmodels
+scikit-learn
+lightgbm==4.7.0
+arch

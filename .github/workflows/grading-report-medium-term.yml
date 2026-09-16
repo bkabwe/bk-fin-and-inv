@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-workflows.txt
       - name: Send medium-term grading report
         run: python scripts/grading_report.py --horizon medium_term
       - name: Persist prediction tracker state

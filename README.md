@@ -8,6 +8,15 @@ Comprehensive US stock analysis toolkit inspired by Richard W. Schabacker's tech
 pip install -r requirements.txt
 ```
 
+`requirements.txt` is the full set needed to run the Streamlit dashboard
+locally (adds `streamlit`, `plotly`, `Pillow` for the UI on top of the core
+analysis stack). The scheduled GitHub Actions workflows (scan/grading email
+reports, LightGBM batch training) never render the Streamlit UI, so they
+install the leaner `requirements-workflows.txt` instead — see
+`.github/workflows/*.yml`. The FastAPI/Celery backend under `api/` uses
+`requirements-api.txt` in addition to one of the above (see
+[Optional FastAPI + React frontend](#optional-fastapi--react-frontend)).
+
 ### macOS note for LightGBM
 
 On macOS, `lightgbm` also requires the OpenMP runtime (`libomp`) at the
@@ -71,6 +80,32 @@ streamlit run app.py
 ```bash
 python analyze_stock.py AAPL
 ```
+
+## Optional FastAPI + React frontend
+
+Everything in this app is available through the Streamlit dashboard above.
+A second, optional interface exists under `api/` (FastAPI + Celery/Redis job
+queue) and `frontend/` (React + Vite SPA) for anyone who wants a
+non-blocking, async version of the Profit Opportunities scan (with a stop
+button) instead of Streamlit's blocking scan. It duplicates — rather than
+replaces — the Streamlit feature set and is not used by any of the scheduled
+GitHub Actions workflows, which call `scripts/*.py` against `modules/`
+directly.
+
+Requirements: `pip install -r requirements-workflows.txt -r requirements-api.txt`
+(the API/Celery layer doesn't render the Streamlit UI, so it doesn't need
+`requirements.txt`'s `streamlit`/`plotly`/`Pillow`) and a local Redis
+instance (`redis://localhost:6379/0` by default; see `api/worker.py`).
+
+```bash
+./start-api.sh
+```
+
+This starts Redis (via `brew services`, macOS-only), the Celery worker
+(`celery -A api.worker worker`), the FastAPI backend (`uvicorn api.main:app`
+on port 8000, docs at `/docs`), and the Vite dev server (`npm run dev` under
+`frontend/`, port 5173) together. Start services individually if you're not
+on macOS or don't use Homebrew's `redis` service.
 
 ## Feature Overview
 
@@ -198,6 +233,28 @@ rather than guesswork:
   price-forecast RMSE, not net-of-cost tradeable returns. Treat backtest wins
   as directional-accuracy evidence only, not proof of after-cost
   profitability.
+
+## Testing & CI
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull
+request:
+- **test**: installs `requirements.txt` + `requirements-api.txt`, runs the
+  full `unittest` suite.
+- **lint**: `ruff check --select E9,F .` (Python syntax errors + pyflakes
+  only — not full style/complexity linting), then `frontend/`'s `tsc
+  --noEmit` type-check and `npm test` (Vitest).
+
+Separately, `.github/workflows/train-lightgbm-batch.yml`,
+`scan-email-short-term.yml`, `scan-email-medium-term.yml`,
+`grading-report-short-term.yml`, and `grading-report-medium-term.yml` run on
+schedules to retrain/promote LightGBM models and send scan/grading email
+reports. They install `requirements-workflows.txt` (not the full
+`requirements.txt`, since they only run `scripts/*.py` against `modules/`
+headlessly) and don't touch `api/` or `frontend/`.
 
 ## Troubleshooting
 

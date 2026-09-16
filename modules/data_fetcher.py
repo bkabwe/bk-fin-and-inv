@@ -64,6 +64,15 @@ except Exception:  # pragma: no cover
                     if ev is not None:
                         ev.set()
 
+            def clear() -> None:
+                """Mirror `st.cache_data`'s `.clear()` so callers (including
+                tests) can reset this cache the same way regardless of
+                whether Streamlit is installed."""
+                with _lock:
+                    _cache.clear()
+                    _inflight.clear()
+
+            wrapper.clear = clear
             return wrapper
 
         return decorator
