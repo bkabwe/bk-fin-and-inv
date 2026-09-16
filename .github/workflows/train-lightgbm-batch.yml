@@ -21,6 +21,9 @@ env:
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
   FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
   SEC_EDGAR_CONTACT_EMAIL: ${{ secrets.SEC_EDGAR_CONTACT_EMAIL }}
+  BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+  SCAN_EMAIL_RECIPIENTS: ${{ secrets.SCAN_EMAIL_RECIPIENTS }}
+  SCAN_EMAIL_FROM: ${{ secrets.SCAN_EMAIL_FROM }}
 
 jobs:
   discover:
@@ -135,3 +138,17 @@ jobs:
           python scripts/lightgbm_batch_pipeline.py cleanup \
             --repository '${{ github.repository }}' \
             --keep-promoted-batches 4
+
+  notify-on-failure:
+    needs: [discover, train, reduce-promote]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install notifier dependencies
+        run: pip install requests
+      - name: Send workflow-failure alert
+        run: python scripts/notify_workflow_failure.py --workflow "Train LightGBM Batch"

@@ -306,6 +306,21 @@ for later grading. The grading workflows run `scripts/grading_report.py` to
 evaluate the exact prior recorded scan batch using both point-in-time resolution
 and max-price-since-scan excursion checks.
 
+### Workflow-failure alerts
+
+All 5 scheduled workflows (`train-lightgbm-batch.yml`, `scan-email-short-term.yml`,
+`scan-email-medium-term.yml`, `grading-report-short-term.yml`, and
+`grading-report-medium-term.yml`) include a `notify-on-failure` job
+(`if: failure()`, depending on every other job in the workflow) that emails a
+short failure alert — repo, branch, and a link to the failed run — via the same
+Brevo API integration used for scan/grading reports
+(`scripts/notify_workflow_failure.py`, reusing `modules/email_reports.py`'s
+`send_brevo_email`). This surfaces pipeline breaks (e.g. a reduce/promote job
+failure) proactively instead of only being noticed by chance. The notifier only
+installs `requests` (not the full `requirements-workflows.txt`), and any
+failure while sending the alert itself is swallowed so it never masks or
+replaces the original job failure it's reporting on.
+
 ### Track-record bugfix: Stock Analysis no longer auto-records predictions
 
 Viewing a ticker on the Stock Analysis page no longer writes passive

@@ -60,3 +60,17 @@ jobs:
             git rebase "origin/${GITHUB_REF_NAME}"
           done
           git push
+
+  notify-on-failure:
+    needs: scan-email-report
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install notifier dependencies
+        run: pip install requests
+      - name: Send workflow-failure alert
+        run: python scripts/notify_workflow_failure.py --workflow "Scan Email Medium-Term"
