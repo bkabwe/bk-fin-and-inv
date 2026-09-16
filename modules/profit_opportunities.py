@@ -237,9 +237,10 @@ def analyze_ticker_for_horizon(
                 outcome["fast_filtered"] = True
                 return outcome
 
-        analyze_kwargs: dict[str, Any] = {}
+        analyze_kwargs: dict[str, Any] = {"investment_horizon": horizon}
         if price_data is not None:
-            analyze_kwargs = {"data_override": price_data, "projection_data_override": price_data}
+            analyze_kwargs["data_override"] = price_data
+            analyze_kwargs["projection_data_override"] = price_data
         analysis = analyze_stock(ticker, **analyze_kwargs)
         outcome["fully_analyzed"] = True
 

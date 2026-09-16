@@ -123,11 +123,17 @@ sentiment, and macro context, with all final scores clamped to that range.
 
 - **Technical score** contributes up to 50 points from trend, momentum, volume,
   patterns, breakout quality, and relative strength.
-- **Fundamental score** contributes up to 30 points after valuation, growth,
-  balance-sheet, and analyst-sentiment checks.
-- **Sentiment score** contributes up to 20 points from recent news tone.
-  Sentiment headline scoring uses FinBERT (`ProsusAI/finbert`) via the
-  `transformers` + `torch` dependencies.
+- **Fundamental score** (valuation, growth, balance-sheet, and analyst-sentiment
+  checks) and **Sentiment score** (recent news tone) together contribute a
+  combined 50 points, split 30/20 by default. When callers pass
+  `investment_horizon` (`short_term`/`medium_term`/`long_term`, the same
+  canonical keys used by the Profit Opportunities scan), sentiment's share
+  decays for longer horizons and fundamentals pick up the difference: 30/20
+  (short_term, default), 36/14 (medium_term), 42/8 (long_term). This mirrors
+  how price-projection ensemble weights already shrink LightGBM's influence at
+  longer horizons. Callers that don't pass a horizon keep the original flat
+  30/20 split. Sentiment headline scoring uses FinBERT (`ProsusAI/finbert`)
+  via the `transformers` + `torch` dependencies.
 - **Overall macro regime** adds a modest overlay (`risk_on` / `risk_off`) of
   roughly +3 / -5 points.
 - **Sector momentum** now adds a small stock-specific overlay of **+3** when the
@@ -154,6 +160,44 @@ signals and exposes:
   drawdown/recovery stats, golden/death-cross history)
 
 Short-Term and Medium-Term scoring logic/weights are unchanged.
+
+## Known modeling limitations & caveats
+
+These are documented, audited findings that are intentionally **not** being
+force-fixed without stronger evidence or a clearer cost/benefit case. They are
+tracked here so future changes can address them with real data/evidence
+rather than guesswork:
+
+- **Correlated technical sub-scores**: `trend_score`, `momentum_score`
+  (RSI+MACD), `rs_score`, `breakout_score`, and `volume_quality_score` largely
+  fire off the same underlying "uptrend + volume" signal, potentially
+  over-crediting a single pattern several times within the 0–50 technical
+  total. Confirming and correcting for this would require empirically
+  measuring correlation among these sub-scores across a real historical
+  ticker universe.
+- **DCF methodology is dated**: independent of the unit-conversion fix already
+  applied, the DCF estimate is Graham's unmodified 1962 heuristic
+  (`8.5 + 2×growth`), known to be unreliable for high-growth,
+  negative-earnings, or cyclical names. It remains one ensemble input among
+  several rather than a standalone valuation.
+- **Static sector P/E benchmarks**: `SECTOR_BENCHMARK_PE` in
+  `modules/fundamental_analysis.py` is a hardcoded dict with no refresh
+  mechanism, so sector multiples can drift out of date with rate cycles.
+- **Survivorship bias in the ticker universe**: `get_sp500_tickers()` scrapes
+  the *current* Wikipedia membership table, so LightGBM training and
+  walk-forward backtests only ever see tickers still in the index today,
+  which can inflate apparent historical accuracy versus a true point-in-time
+  historical membership list.
+- **RMSE-metric geometry favors terminal-point accuracy**: the LightGBM
+  walk-forward comparison converts every model's forecast into a smooth
+  geometric curve toward one terminal-return guess before computing RMSE,
+  which structurally advantages models optimized directly for terminal
+  return (like LightGBM) over general-purpose extrapolators (ARIMA/trend). A
+  supplementary path-level metric would give a fuller comparison.
+- **No transaction costs or slippage in backtest RMSE**: backtests measure
+  price-forecast RMSE, not net-of-cost tradeable returns. Treat backtest wins
+  as directional-accuracy evidence only, not proof of after-cost
+  profitability.
 
 ## Troubleshooting
 

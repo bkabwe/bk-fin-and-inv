@@ -4,6 +4,11 @@ from modules.logger import get_logger
 
 logger = get_logger(__name__)
 
+# KNOWN LIMITATION: static, hardcoded sector P/E benchmarks with no refresh
+# mechanism. Sector multiples drift with rate cycles, so these values can go
+# stale over time. Fix direction (not yet implemented): source benchmarks
+# dynamically (e.g. computed from the current ticker universe) or document/
+# schedule periodic manual updates.
 SECTOR_BENCHMARK_PE = {
     "Technology": 28,
     "Healthcare": 22,
@@ -112,6 +117,13 @@ def analyze_fundamentals(info: dict, current_price: float | None = None, risk_fr
         # everywhere else in this codebase (see modules/macro_regime.py). Multiply by 100
         # to convert to the percentage-number units the formula expects; otherwise the
         # 4.4/Y term inflates ~100x and blows past the ensemble's price-target safety cap.
+        #
+        # KNOWN LIMITATION (methodology, independent of the unit fix above): this is
+        # still Graham's unmodified 1962 heuristic (8.5 + 2*growth), which is known to
+        # be unreliable for high-growth, negative-earnings, or cyclical names. It is
+        # kept as one ensemble input among several rather than a standalone valuation;
+        # a multi-stage DCF with an explicit discount rate would be a more defensible
+        # (but materially more involved) replacement if this weight ever needs to grow.
         risk_free_rate_pct = risk_free_rate * 100.0
         dcf_estimate = eps_for_dcf * (8.5 + 2 * growth_rate_pct) * (4.4 / risk_free_rate_pct)
 
