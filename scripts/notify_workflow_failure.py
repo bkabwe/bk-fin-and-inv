@@ -18,12 +18,18 @@ when at least one of those jobs failed:
         - run: pip install requests
         - run: python scripts/notify_workflow_failure.py --workflow "Scan Email Short-Term"
 
-It reuses the existing Brevo email integration (modules.email_reports),
-so it only needs BREVO_API_KEY, SCAN_EMAIL_RECIPIENTS, and SCAN_EMAIL_FROM
-(already configured for the scan/grading email reports) -- no new secrets
-or notification channel required. Run/repo context is read from the
-standard GitHub Actions environment variables, so no extra inputs are
-required beyond --workflow.
+It reuses the existing Brevo email integration (modules.email_reports), so it
+only needs BREVO_API_KEY and SCAN_EMAIL_FROM (already configured for the
+scan/grading email reports) -- no new secrets or notification channel
+required. Run/repo context is read from the standard GitHub Actions
+environment variables, so no extra inputs are required beyond --workflow.
+
+Failure alerts deliberately do NOT go to SCAN_EMAIL_RECIPIENTS (the broader
+scan/grading report distribution list) -- that list may include people who
+shouldn't be paged about internal pipeline/CI failures. Instead, recipients
+are resolved via WORKFLOW_ALERT_RECIPIENTS (a comma-separated list, optional)
+falling back to SCAN_EMAIL_FROM alone (i.e. just the maintainer) when that
+variable isn't set. See resolve_alert_recipients() below.
 
 Deliberately lightweight: only `requests` is needed (not the full
 requirements-workflows.txt), so this step can still run and notify even if
@@ -73,10 +79,38 @@ def build_alert_html(workflow_name: str) -> str:
     )
 
 
+def resolve_alert_recipients() -> list[str]:
+    """Recipients for failure alerts -- deliberately independent of
+    SCAN_EMAIL_RECIPIENTS (the broader scan/grading report distribution
+    list), since a workflow/pipeline failure is an operational concern for
+    the maintainer, not something every report recipient needs to see.
+
+    Prefers WORKFLOW_ALERT_RECIPIENTS (comma-separated) when set; otherwise
+    falls back to the single SCAN_EMAIL_FROM address (i.e. just the
+    maintainer's own verified sender address).
+    """
+    raw = str(os.getenv("WORKFLOW_ALERT_RECIPIENTS") or "").strip()
+    if raw:
+        recipients = [value.strip() for value in raw.split(",") if value.strip()]
+        if recipients:
+            return recipients
+
+    fallback = str(os.getenv("SCAN_EMAIL_FROM") or "").strip()
+    if fallback:
+        return [fallback]
+
+    raise RuntimeError("Neither WORKFLOW_ALERT_RECIPIENTS nor SCAN_EMAIL_FROM is configured")
+
+
 def send_failure_alert(workflow_name: str) -> bool:
     """Best-effort send; returns True if the alert was sent to at least one recipient."""
     try:
-        sent = send_brevo_email(subject=f"\u26a0\ufe0f Workflow failed: {workflow_name}", html_content=build_alert_html(workflow_name))
+        recipients = resolve_alert_recipients()
+        sent = send_brevo_email(
+            subject=f"\u26a0\ufe0f Workflow failed: {workflow_name}",
+            html_content=build_alert_html(workflow_name),
+            recipients=recipients,
+        )
         if sent:
             logger.info("Sent workflow-failure alert for %s to %d recipient(s)", workflow_name, sent)
             return True

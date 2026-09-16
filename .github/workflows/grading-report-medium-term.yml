@@ -19,6 +19,7 @@ env:
   BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
   SCAN_EMAIL_RECIPIENTS: ${{ secrets.SCAN_EMAIL_RECIPIENTS }}
   SCAN_EMAIL_FROM: ${{ secrets.SCAN_EMAIL_FROM }}
+  WORKFLOW_ALERT_RECIPIENTS: ${{ secrets.WORKFLOW_ALERT_RECIPIENTS }}
 
 jobs:
   grading-report:

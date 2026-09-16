@@ -56,28 +56,68 @@ class BuildAlertHtmlTests(unittest.TestCase):
         self.assertNotIn("<a href", html_content)
 
 
+class ResolveAlertRecipientsTests(unittest.TestCase):
+    def test_prefers_workflow_alert_recipients_when_set(self):
+        env = {
+            "WORKFLOW_ALERT_RECIPIENTS": "me@example.com, second@example.com",
+            "SCAN_EMAIL_FROM": "reports@example.com",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            recipients = notify_workflow_failure.resolve_alert_recipients()
+
+        self.assertEqual(recipients, ["me@example.com", "second@example.com"])
+
+    def test_falls_back_to_scan_email_from_when_unset(self):
+        env = {"WORKFLOW_ALERT_RECIPIENTS": "", "SCAN_EMAIL_FROM": "reports@example.com"}
+        with patch.dict("os.environ", env, clear=False):
+            recipients = notify_workflow_failure.resolve_alert_recipients()
+
+        # Deliberately NOT the broader SCAN_EMAIL_RECIPIENTS distribution list.
+        self.assertEqual(recipients, ["reports@example.com"])
+
+    def test_raises_when_neither_variable_configured(self):
+        env = {"WORKFLOW_ALERT_RECIPIENTS": "", "SCAN_EMAIL_FROM": ""}
+        with patch.dict("os.environ", env, clear=False), self.assertRaises(RuntimeError):
+            notify_workflow_failure.resolve_alert_recipients()
+
+
 class SendFailureAlertTests(unittest.TestCase):
+    def _env(self, **overrides):
+        env = {"WORKFLOW_ALERT_RECIPIENTS": "", "SCAN_EMAIL_FROM": "reports@example.com"}
+        env.update(overrides)
+        return env
+
     @patch("scripts.notify_workflow_failure.send_brevo_email")
     def test_returns_true_when_email_sent(self, mock_send):
         mock_send.return_value = 2
 
-        result = notify_workflow_failure.send_failure_alert("Scan Email Short-Term")
+        with patch.dict("os.environ", self._env(), clear=False):
+            result = notify_workflow_failure.send_failure_alert("Scan Email Short-Term")
 
         self.assertTrue(result)
         mock_send.assert_called_once()
         self.assertIn("Scan Email Short-Term", mock_send.call_args.kwargs["subject"])
+        self.assertEqual(mock_send.call_args.kwargs["recipients"], ["reports@example.com"])
 
     @patch("scripts.notify_workflow_failure.send_brevo_email")
     def test_returns_false_when_no_recipients_sent(self, mock_send):
         mock_send.return_value = 0
 
-        result = notify_workflow_failure.send_failure_alert("Scan Email Short-Term")
+        with patch.dict("os.environ", self._env(), clear=False):
+            result = notify_workflow_failure.send_failure_alert("Scan Email Short-Term")
 
         self.assertFalse(result)
 
     @patch("scripts.notify_workflow_failure.send_brevo_email", side_effect=RuntimeError("BREVO_API_KEY is not configured"))
     def test_swallows_exceptions_and_returns_false(self, mock_send):
-        result = notify_workflow_failure.send_failure_alert("Scan Email Short-Term")
+        with patch.dict("os.environ", self._env(), clear=False):
+            result = notify_workflow_failure.send_failure_alert("Scan Email Short-Term")
+
+        self.assertFalse(result)
+
+    def test_swallows_missing_recipient_configuration_and_returns_false(self):
+        with patch.dict("os.environ", {"WORKFLOW_ALERT_RECIPIENTS": "", "SCAN_EMAIL_FROM": ""}, clear=False):
+            result = notify_workflow_failure.send_failure_alert("Scan Email Short-Term")
 
         self.assertFalse(result)
 

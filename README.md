@@ -45,6 +45,10 @@ brew install libomp
   and grading reports. Whitespace around addresses is ignored.
 - `SCAN_EMAIL_FROM` — verified Brevo sender email address used with the fixed
   sender display name `BK Self`.
+- `WORKFLOW_ALERT_RECIPIENTS` — optional comma-separated email recipients for
+  workflow-failure alerts only (see "Workflow-failure alerts" below). If
+  unset, alerts fall back to `SCAN_EMAIL_FROM` alone, so by default only the
+  maintainer is paged rather than the full `SCAN_EMAIL_RECIPIENTS` list.
 
 You can provide it either as a normal shell environment variable:
 
@@ -320,6 +324,13 @@ failure) proactively instead of only being noticed by chance. The notifier only
 installs `requests` (not the full `requirements-workflows.txt`), and any
 failure while sending the alert itself is swallowed so it never masks or
 replaces the original job failure it's reporting on.
+
+These alerts intentionally go to a **separate, narrower** recipient list than
+the scan/grading reports: `WORKFLOW_ALERT_RECIPIENTS` if set, otherwise just
+`SCAN_EMAIL_FROM` (the maintainer's own address) — never the full
+`SCAN_EMAIL_RECIPIENTS` distribution list, since a CI/pipeline failure is an
+operational concern for whoever maintains the workflows, not every scan-report
+recipient.
 
 ### Track-record bugfix: Stock Analysis no longer auto-records predictions
 
