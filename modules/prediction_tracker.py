@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from modules.data_fetcher import get_stock_data
 from modules.logger import get_logger
 
 logger = get_logger(__name__)
@@ -195,8 +196,6 @@ def compute_max_price_since_scan(
     scan_date: str | date,
     end_date: str | date | None = None,
 ) -> float | None:
-    from modules.data_fetcher import get_stock_data  # local import to avoid circular
-
     try:
         start = scan_date if isinstance(scan_date, date) else date.fromisoformat(str(scan_date)[:10])
     except ValueError:
@@ -238,8 +237,6 @@ def resolve_pending_predictions() -> dict[str, int]:
 
     Returns a summary dict: {"resolved": n, "no_data": n, "still_pending": n}.
     """
-    from modules.data_fetcher import get_stock_data  # local import to avoid circular
-
     records = _load_all()
     today = date.today()
     resolved_count = 0

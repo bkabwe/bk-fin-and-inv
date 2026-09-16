@@ -244,7 +244,7 @@ def discover(args: argparse.Namespace) -> int:
 
     end_date = _utc_now().date()
     start_date = end_date - timedelta(days=int(args.macro_lookback_days))
-    macro_table = get_macro_feature_table(start_date, end_date)
+    macro_table = get_macro_feature_table(start_date, end_date, realtime_end=end_date)
     output_payload = {
         "discovered_at": discovered_at,
         "price_floor": float(args.price_floor),

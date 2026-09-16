@@ -3,6 +3,7 @@ name: Scan Email Medium-Term
 on:
   workflow_dispatch:
   schedule:
+    # Bi-monthly on the 1st; staggered ahead of grading-report-medium-term.
     - cron: '0 9 1 */2 *'
 
 permissions:

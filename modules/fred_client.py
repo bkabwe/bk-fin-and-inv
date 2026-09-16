@@ -179,8 +179,30 @@ def _normalize_date(value: date | datetime | str) -> str:
     return str(value).strip()
 
 
+def _realtime_params(realtime_end: date | datetime | str | None) -> dict[str, str]:
+    """Build FRED real-time vintage params for point-in-time correctness.
+
+    Without these params, FRED returns each observation's *latest revised*
+    value regardless of when the request's data window ends. That is a
+    lookahead leak for revised series (e.g. CPIAUCSL) when used in
+    historical backtests: a value "known" on a past date would actually
+    reflect revisions published long after that date. Passing
+    ``realtime_start == realtime_end == realtime_end`` pins the response to
+    the single vintage of data that was publicly known as of that cutoff.
+    """
+
+    if realtime_end is None:
+        return {}
+    realtime_end_str = _normalize_date(realtime_end)
+    return {"realtime_start": realtime_end_str, "realtime_end": realtime_end_str}
+
+
 @cache_data(ttl=21600)
-def get_vix_observations(start_date: date | datetime | str, end_date: date | datetime | str) -> pd.DataFrame:
+def get_vix_observations(
+    start_date: date | datetime | str,
+    end_date: date | datetime | str,
+    realtime_end: date | datetime | str | None = None,
+) -> pd.DataFrame:
     payload = _request_json(
         "/series/observations",
         {
@@ -188,6 +210,7 @@ def get_vix_observations(start_date: date | datetime | str, end_date: date | dat
             "observation_start": _normalize_date(start_date),
             "observation_end": _normalize_date(end_date),
             "sort_order": "asc",
+            **_realtime_params(realtime_end),
         },
     )
     observations = payload.get("observations") or []
@@ -220,7 +243,12 @@ def get_vix_observations(start_date: date | datetime | str, end_date: date | dat
 
 
 @cache_data(ttl=21600)
-def get_series_observations(series_id: str, start_date: date | datetime | str, end_date: date | datetime | str) -> pd.DataFrame:
+def get_series_observations(
+    series_id: str,
+    start_date: date | datetime | str,
+    end_date: date | datetime | str,
+    realtime_end: date | datetime | str | None = None,
+) -> pd.DataFrame:
     payload = _request_json(
         "/series/observations",
         {
@@ -228,6 +256,7 @@ def get_series_observations(series_id: str, start_date: date | datetime | str, e
             "observation_start": _normalize_date(start_date),
             "observation_end": _normalize_date(end_date),
             "sort_order": "asc",
+            **_realtime_params(realtime_end),
         },
     )
     observations = payload.get("observations") or []
@@ -260,7 +289,11 @@ def get_series_observations(series_id: str, start_date: date | datetime | str, e
 
 
 @cache_data(ttl=21600)
-def get_macro_feature_table(start_date: date | datetime | str, end_date: date | datetime | str) -> pd.DataFrame:
+def get_macro_feature_table(
+    start_date: date | datetime | str,
+    end_date: date | datetime | str,
+    realtime_end: date | datetime | str | None = None,
+) -> pd.DataFrame:
     series_map = {
         "dgs10": FRED_10Y_TREASURY_SERIES_ID,
         "cpiaucsl": FRED_CPI_SERIES_ID,
@@ -270,7 +303,9 @@ def get_macro_feature_table(start_date: date | datetime | str, end_date: date | 
     frames: list[pd.DataFrame] = []
     for prefix, series_id in series_map.items():
         try:
-            series_df = get_series_observations(series_id, start_date, end_date).rename(columns={"value": f"{prefix}_level"})
+            series_df = get_series_observations(series_id, start_date, end_date, realtime_end=realtime_end).rename(
+                columns={"value": f"{prefix}_level"}
+            )
         except Exception as exc:
             logger.warning("FRED series %s unavailable: %s", series_id, exc)
             series_df = pd.DataFrame(columns=[f"{prefix}_level"])

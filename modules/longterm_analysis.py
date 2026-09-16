@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -29,11 +31,44 @@ try:
 
     cache_data = st.cache_data
 except Exception:  # pragma: no cover
-    from functools import lru_cache
 
-    def cache_data(ttl: int | None = None):
+    def cache_data(ttl: int | None = None):  # type: ignore[misc]
+        """TTL-aware, stampede-safe cache fallback for non-Streamlit usage."""
+
         def decorator(func):
-            return lru_cache(maxsize=128)(func)
+            _cache: dict = {}
+            _inflight: dict = {}
+            _lock = threading.Lock()
+
+            def wrapper(*args, **kwargs):
+                key = (args, tuple(sorted(kwargs.items())))
+                while True:
+                    now = time.monotonic()
+                    with _lock:
+                        entry = _cache.get(key)
+                        if entry is not None:
+                            value, ts = entry
+                            if ttl is None or (now - ts) < ttl:
+                                return value
+                        event = _inflight.get(key)
+                        if event is None:
+                            ev = threading.Event()
+                            _inflight[key] = ev
+                            break
+                    event.wait(timeout=300)
+
+                try:
+                    result = func(*args, **kwargs)
+                    with _lock:
+                        _cache[key] = (result, time.monotonic())
+                    return result
+                finally:
+                    with _lock:
+                        ev = _inflight.pop(key, None)
+                    if ev is not None:
+                        ev.set()
+
+            return wrapper
 
         return decorator
 

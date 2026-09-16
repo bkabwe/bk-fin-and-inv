@@ -3,7 +3,8 @@ name: Grading Report Medium-Term
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 9 1 */2 *'
+    # 30m after scan-email-medium-term to avoid racing on prediction storage.
+    - cron: '30 9 1 */2 *'
 
 permissions:
   contents: read

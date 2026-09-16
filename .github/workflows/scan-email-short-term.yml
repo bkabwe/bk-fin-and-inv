@@ -3,6 +3,7 @@ name: Scan Email Short-Term
 on:
   workflow_dispatch:
   schedule:
+    # 3h after train-lightgbm-batch (0 6 * * 1) so the promoted manifest is fresh.
     - cron: '0 9 * * 1'
 
 permissions:

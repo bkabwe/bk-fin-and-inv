@@ -243,7 +243,7 @@ def _macro_daily_features(daily_index: pd.DatetimeIndex, shared_macro_table: pd.
     start_date = daily_index.min().date()
     end_date = daily_index.max().date()
     try:
-        macro = fred_client.get_macro_feature_table(start_date, end_date)
+        macro = fred_client.get_macro_feature_table(start_date, end_date, realtime_end=end_date)
     except Exception as exc:
         logger.warning("Macro features unavailable: %s", exc)
         return features

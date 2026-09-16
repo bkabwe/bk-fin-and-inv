@@ -5,6 +5,10 @@ data/notifications.json
 data/*.json
 data/lightgbm_return_models/
 
+# Prediction tracker state is committed by CI so scan/grading runs share
+# history across ephemeral workflow filesystems (not personal/sensitive data).
+!data/predictions.json
+
 # Environment files
 .env
 .env.*

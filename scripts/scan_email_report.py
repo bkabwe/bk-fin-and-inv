@@ -91,7 +91,7 @@ def load_live_scan_inputs(repository: str | None = None) -> tuple[dict[str, Any]
 def fetch_shared_macro_table(lookback_days: int = 365 * 5) -> pd.DataFrame:
     end_date = datetime.now(UTC).date()
     start_date = end_date - timedelta(days=int(lookback_days))
-    macro_table = get_macro_feature_table(start_date, end_date)
+    macro_table = get_macro_feature_table(start_date, end_date, realtime_end=end_date)
     print(f"Loaded shared FRED macro table rows: {len(macro_table)}")
     return macro_table
 

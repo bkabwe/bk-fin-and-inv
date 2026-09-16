@@ -3,10 +3,16 @@ name: Train LightGBM Batch
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 9 * * 1'
+    # Runs first so discover -> train -> reduce/promote finishes with a buffer
+    # before the short-term scan/grading crons read the freshly promoted manifest.
+    - cron: '0 6 * * 1'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: train-lightgbm-batch
+  cancel-in-progress: false
 
 env:
   PYTHON_VERSION: '3.11'
@@ -84,6 +90,8 @@ jobs:
   reduce-promote:
     needs: [discover, train]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:

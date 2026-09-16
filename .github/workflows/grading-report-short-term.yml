@@ -3,7 +3,8 @@ name: Grading Report Short-Term
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 9 * * 1'
+    # 30m after scan-email-short-term to avoid racing on prediction storage.
+    - cron: '30 9 * * 1'
 
 permissions:
   contents: read

@@ -107,7 +107,13 @@ def analyze_fundamentals(info: dict, current_price: float | None = None, risk_fr
     eps_for_dcf = forward_eps if (forward_eps and forward_eps > 0) else eps
     dcf_estimate = None
     if eps_for_dcf and eps_for_dcf > 0 and growth_rate_pct is not None and risk_free_rate and risk_free_rate > 0:
-        dcf_estimate = eps_for_dcf * (8.5 + 2 * growth_rate_pct) * (4.4 / risk_free_rate)
+        # Graham's revised intrinsic-value formula expects Y as a *percentage number*
+        # (e.g. 4.4 meaning 4.4%), but risk_free_rate is a decimal fraction (e.g. 0.045)
+        # everywhere else in this codebase (see modules/macro_regime.py). Multiply by 100
+        # to convert to the percentage-number units the formula expects; otherwise the
+        # 4.4/Y term inflates ~100x and blows past the ensemble's price-target safety cap.
+        risk_free_rate_pct = risk_free_rate * 100.0
+        dcf_estimate = eps_for_dcf * (8.5 + 2 * growth_rate_pct) * (4.4 / risk_free_rate_pct)
 
     if eps and eps > 0:
         score += 6
