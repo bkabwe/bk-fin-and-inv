@@ -1,32 +1,23 @@
 from __future__ import annotations
 
-import concurrent.futures
 import threading
-from datetime import date, timedelta
+import time
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from modules.data_fetcher import get_nasdaq_tickers, get_nyseamerican_tickers, get_otc_tickers, get_sp500_tickers, get_stock_data
+from modules.polygon_client import is_polygon_configured
 from modules.portfolio import get_portfolio
 from modules.prediction_tracker import record_predictions_from_scan
-from modules.polygon_client import is_polygon_configured
-from modules.scoring_engine import analyze_stock, fast_screen_score
-
-try:  # pragma: no cover
-    from statsmodels.tsa.arima.model import ARIMA
-    ARIMA_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    ARIMA_AVAILABLE = False
-
-try:  # pragma: no cover
-    from sklearn.linear_model import LinearRegression
-    SKLEARN_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    SKLEARN_AVAILABLE = False
-
+from modules.profit_opportunities import (
+    DEFAULT_FAST_SCREEN_MARGIN,
+    HORIZON_LABEL_TO_KEY,
+    add_estimated_dates,
+    collect_universe_tickers,
+    filter_by_upside,
+    scan_profit_opportunities,
+)
 
 st.title("💰 Profit Opportunities")
 st.caption("Identifies stocks with the highest projected profit potential based on multi-model predictive analysis.")
@@ -37,6 +28,7 @@ horizon = st.radio(
     "Time Horizon",
     ["Short-Term (1–4 weeks)", "Medium-Term (1–6 months)", "Long-Term (6–24 months)"],
 )
+horizon_key = HORIZON_LABEL_TO_KEY[horizon]
 
 selected_universes = st.multiselect(
     "Universe",
@@ -74,18 +66,6 @@ if _fast_mode:
         ),
     )
 
-# Shared constants matching modules/screener.py defaults
-_MAX_WORKERS = 8
-_FAST_SCREEN_MARGIN = 15
-# Conservative proxy threshold: tickers whose fast technical subscore is below
-# this value are very unlikely to produce a high projected upside, so we skip
-# them.  We use a fixed low-bar proxy base (30 out of 100) with a safety
-# margin rather than the upside % directly, because fast_screen_score() returns
-# a normalized technical subscore (not an upside %) — a score this low makes
-# any meaningful upside projection unlikely.
-_FAST_SCREEN_BASE = 30  # base proxy cutoff (out of 100)
-_FAST_SCREEN_PROXY_THRESHOLD = _FAST_SCREEN_BASE - _FAST_SCREEN_MARGIN  # = 15
-
 st.info(
     "ℹ️ This page analyses **every stock** in your selected universes. "
     "Larger universes will take longer to scan."
@@ -107,371 +87,163 @@ if large:
         )
 
 
-@st.cache_data(ttl=1800)
-def estimate_target_date(ticker: str, target_price: float, horizon_value: str, rsi: float | None = None) -> tuple[str, str]:
-    """Returns (estimated_date_range, confidence) for when ticker may reach target_price."""
-
-    def _format_date_range(center_date: date, confidence: str) -> str:
-        windows = {
-            "Short-Term (1–4 weeks)": {"High": 4, "Medium": 6, "Low": 8},
-            "Medium-Term (1–6 months)": {"High": 14, "Medium": 21, "Low": 30},
-            "Long-Term (6–24 months)": {"High": 30, "Medium": 45, "Low": 60},
-        }
-        span = windows[horizon_value][confidence]
-        start = center_date - timedelta(days=span)
-        end = center_date + timedelta(days=span)
-        return f"~{start.strftime('%b %d, %Y')} – {end.strftime('%b %d, %Y')}"
-
-    today = date.today()
-    if horizon_value == "Short-Term (1–4 weeks)":
-        days = 21
-        if rsi is not None:
-            if rsi < 50:
-                days = 28
-            elif rsi > 60:
-                days = 14
-        est = today + timedelta(days=days)
-        return _format_date_range(est, "Medium"), "Medium"
-
-    fallback_days = 90 if horizon_value == "Medium-Term (1–6 months)" else 365
-    max_days = 180 if horizon_value == "Medium-Term (1–6 months)" else 720
-
-    try:
-        data = get_stock_data(ticker, period="2y", interval="1d")
-    except Exception:
-        data = pd.DataFrame()
-
-    if data.empty or "Close" not in data:
-        est = today + timedelta(days=fallback_days)
-        return _format_date_range(est, "Low"), "Low"
-
-    close = data["Close"].dropna().astype(float)
-    if close.empty:
-        est = today + timedelta(days=fallback_days)
-        return _format_date_range(est, "Low"), "Low"
-
-    arima_day: int | None = None
-    arima_hit = False
-    trend_day: int | None = None
-
-    if ARIMA_AVAILABLE and len(close) >= 60:
-        try:
-            arima_forecast = ARIMA(close.tail(252), order=(5, 1, 0)).fit().forecast(steps=max_days)
-            crossing_idx = np.where(arima_forecast.values.astype(float) >= float(target_price))[0]
-            arima_hit = len(crossing_idx) > 0
-            if arima_hit:
-                arima_day = int(crossing_idx[0]) + 1
-        except Exception:
-            arima_hit = False
-            arima_day = None
-
-    if len(close) >= 30:
-        try:
-            series = close.tail(200).reset_index(drop=True)
-            x = np.arange(len(series)).reshape(-1, 1)
-            if SKLEARN_AVAILABLE:
-                model = LinearRegression()
-                model.fit(x, series.values)
-                slope = float(model.coef_[0])
-                intercept = float(model.intercept_)
-            else:
-                slope, intercept = np.polyfit(np.arange(len(series)), series.values, 1)
-            if slope > 0:
-                day_x = int(round((float(target_price) - intercept) / slope))
-                if day_x > len(series):
-                    trend_day = day_x - len(series)
-        except Exception:
-            trend_day = None
-
-    if arima_day is not None:
-        est = today + timedelta(days=min(max_days, max(1, arima_day)))
-        confidence = "Medium"
-        return _format_date_range(est, confidence), confidence
-
-    if trend_day is not None:
-        est = today + timedelta(days=min(max_days, max(1, trend_day)))
-        confidence = "Medium" if arima_hit else "Low"
-        return _format_date_range(est, confidence), confidence
-
-    est = today + timedelta(days=fallback_days)
-    confidence = "Medium" if arima_hit else "Low"
-    return _format_date_range(est, confidence), confidence
-
-
-def _collect_tickers(universes: list[str]) -> tuple[list[str], dict[str, str]]:
-    universe_fetchers = {
-        "S&P 500": get_sp500_tickers,
-        "NASDAQ": get_nasdaq_tickers,
-        "NYSE American": get_nyseamerican_tickers,
-        "OTC": get_otc_tickers,
-    }
-
-    source_map: dict[str, set[str]] = {}
-    ordered: list[str] = []
-
-    for universe_name in universes:
-        if universe_name == "My Portfolio":
-            holdings = get_portfolio() or []
-            if not holdings:
-                st.info("No portfolio holdings found.")
-                continue
-            values = [str(x.get("ticker", "")).strip().upper() for x in holdings if x.get("ticker")]
-        else:
-            fetcher = universe_fetchers[universe_name]
-            try:
-                values = fetcher()
-            except Exception as exc:
-                st.warning(f"Could not load {universe_name} universe: {exc}")
-                continue
-
-        for ticker in values:
-            clean = str(ticker).strip().upper().replace(".", "-")
-            if not clean:
-                continue
-            if clean not in source_map:
-                source_map[clean] = set()
-                ordered.append(clean)
-            source_map[clean].add(universe_name)
-
-    return ordered, {k: ", ".join(sorted(v)) for k, v in source_map.items() if k in ordered}
-
-
 if st.button("Run Analysis"):
-    tickers, source_labels = _collect_tickers(selected_universes)
+    portfolio_tickers = [str(h.get("ticker", "")).strip().upper() for h in (get_portfolio() or []) if h.get("ticker")]
+    if "My Portfolio" in selected_universes and not portfolio_tickers:
+        st.info("No portfolio holdings found.")
+    tickers, source_labels = collect_universe_tickers(selected_universes, portfolio_tickers=portfolio_tickers)
+
     if not tickers:
         st.warning("No tickers available for analysis.")
     else:
         progress = st.progress(0.0)
-        rows: list[dict] = []
 
+        # IMPORTANT: Streamlit widgets (including st.progress) are only
+        # supported when called from the main script-execution thread, so
+        # scan_profit_opportunities() (which may run its per-ticker work on a
+        # ThreadPoolExecutor) must never touch st.* from its callbacks. The
+        # on_ticker_processed callback below only updates a plain dict; the
+        # actual progress.progress(...) calls happen here, on the main
+        # thread, via a polling loop around the (blocking) scan call.
+        _progress_state = {"screened": 0, "total": len(tickers)}
+        _state_lock = threading.Lock()
+
+        def _on_ticker_processed(ticker: str, counts: dict) -> None:
+            with _state_lock:
+                _progress_state.update(counts)
+
+        _scan_result: dict[str, pd.DataFrame] = {}
+
+        def _run_scan() -> None:
+            _scan_result["df"] = scan_profit_opportunities(
+                tickers,
+                horizon_key,
+                use_fast_screen=use_fast_screen,
+                fast_screen_margin=DEFAULT_FAST_SCREEN_MARGIN,
+                parallel=_fast_mode,
+                source_labels=source_labels,
+                on_ticker_processed=_on_ticker_processed,
+            )
+
+        worker = threading.Thread(target=_run_scan, daemon=True)
+        worker.start()
+        while worker.is_alive():
+            with _state_lock:
+                screened = _progress_state["screened"]
+                total = _progress_state["total"] or 1
+            progress.progress(min(1.0, screened / total))
+            time.sleep(0.2)
+        worker.join()
+        progress.progress(1.0)
+
+        scanned_df = _scan_result.get("df", pd.DataFrame())
+        st.session_state["profit_opportunities_scan"] = scanned_df
+        st.session_state["profit_opportunities_scan_horizon"] = horizon_key
+        st.session_state["profit_opportunities_scanned_total"] = len(tickers)
         if _fast_mode:
-            # ------------------------------------------------------------------
-            # FAST MODE: parallel thread pool + optional fast-screen pre-filter
-            # ------------------------------------------------------------------
-            # IMPORTANT: Streamlit widgets (including st.progress) are only
-            # supported when called from the main script-execution thread.
-            # Calling progress.progress(...) from a ThreadPoolExecutor worker
-            # thread either silently no-ops or fails to trigger a UI re-render
-            # because Streamlit's ScriptRunContext is not attached to worker
-            # threads. To keep the progress bar working correctly, worker
-            # threads below ONLY update shared, thread-safe counters — the
-            # actual `progress.progress(...)` call happens on the main thread,
-            # inside the `as_completed` loop, once per completed future.
-            failed_tickers: list[dict] = []
-            # NOTE: This page executes as top-level Streamlit script code (not
-            # inside a function), so `_process_ticker` below has no enclosing
-            # *function* scope — only module/global scope. `nonlocal` requires
-            # an enclosing function scope and raises SyntaxError here
-            # ("no binding for nonlocal ... found"). Use a mutable dict instead
-            # so counters can be updated in place without `nonlocal`/`global`.
-            _counters = {"fast_filtered": 0, "fully_analyzed": 0, "processed": 0}
-            _lock = threading.Lock()
-            total = len(tickers)
-
-            def _process_ticker(ticker: str) -> None:
-                try:
-                    if use_fast_screen:
-                        fast_score, err = fast_screen_score(ticker)
-                        if err is not None:
-                            with _lock:
-                                failed_tickers.append({"ticker": ticker, "reason": f"fast-screen error: {err}"})
-                            return
-                        # Conservative proxy: skip tickers whose cheap technical
-                        # subscore is well below a low threshold, since a low
-                        # technical subscore makes any meaningful projected upside
-                        # very unlikely.  The margin keeps borderline tickers safe.
-                        if fast_score < _FAST_SCREEN_PROXY_THRESHOLD:
-                            with _lock:
-                                _counters["fast_filtered"] += 1
-                            return
-
-                    analysis = analyze_stock(ticker)
-                    with _lock:
-                        _counters["fully_analyzed"] += 1
-                    projections = analysis.get("projections") or {}
-                    current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
-                    if current_price <= 0:
-                        return
-                    with _lock:
-                        rows.append(
-                            {
-                                "ticker": ticker,
-                                "company": analysis.get("company") or ticker,
-                                "index": source_labels.get(ticker, ""),
-                                "score": int(analysis.get("score") or 0),
-                                "current_price": current_price,
-                                "sector_trend": analysis.get("sector_trend") or "unknown",
-                                "market_cap_tier": analysis.get("market_cap_tier") or "unknown",
-                                "longterm_stage": analysis.get("longterm_stage") or "",
-                                "technical": analysis.get("technical") or {},
-                                "projections": projections,
-                            }
-                        )
-                except Exception as exc:
-                    with _lock:
-                        failed_tickers.append({"ticker": ticker, "reason": str(exc) or type(exc).__name__})
-                finally:
-                    # NOTE: Do NOT call progress.progress(...) here — this runs
-                    # on a worker thread. Only update the shared counter; the
-                    # main thread reads `processed` and updates the widget.
-                    with _lock:
-                        _counters["processed"] += 1
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-                futures = {executor.submit(_process_ticker, t): t for t in tickers}
-                # This loop runs on the main script thread, so it's the correct
-                # place to update Streamlit widgets as each future resolves.
-                for completed, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-                    try:
-                        future.result()
-                    except Exception:
-                        pass
-                    progress.progress(completed / total)
-
-            st.session_state["profit_opportunities_fast_filtered"] = _counters["fast_filtered"]
-            st.session_state["profit_opportunities_fully_analyzed"] = _counters["fully_analyzed"]
-            st.session_state["profit_opportunities_failed"] = failed_tickers
-
+            st.session_state["profit_opportunities_fast_filtered"] = int(scanned_df.attrs.get("fast_filtered_count", 0))
+            st.session_state["profit_opportunities_fully_analyzed"] = int(scanned_df.attrs.get("fully_analyzed_count", 0))
+            st.session_state["profit_opportunities_failed"] = scanned_df.attrs.get("failed_tickers", [])
         else:
-            # ------------------------------------------------------------------
-            # THOROUGH MODE: original sequential loop, no pre-filter (unchanged)
-            # ------------------------------------------------------------------
-            for i, ticker in enumerate(tickers, start=1):
-                try:
-                    analysis = analyze_stock(ticker)
-                    projections = analysis.get("projections") or {}
-                    current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
-                    if current_price <= 0:
-                        continue
-                    rows.append(
-                        {
-                            "ticker": ticker,
-                            "company": analysis.get("company") or ticker,
-                            "index": source_labels.get(ticker, ""),
-                            "score": int(analysis.get("score") or 0),
-                            "current_price": current_price,
-                            "sector_trend": analysis.get("sector_trend") or "unknown",
-                            "market_cap_tier": analysis.get("market_cap_tier") or "unknown",
-                            "longterm_stage": analysis.get("longterm_stage") or "",
-                            "technical": analysis.get("technical") or {},
-                            "projections": projections,
-                        }
-                    )
-                except Exception:
-                    continue
-                progress.progress(i / len(tickers))
             # Clear fast-mode stats when running thorough
             st.session_state.pop("profit_opportunities_fast_filtered", None)
             st.session_state.pop("profit_opportunities_fully_analyzed", None)
             st.session_state.pop("profit_opportunities_failed", None)
 
-        st.session_state["profit_opportunities_scan"] = rows
-        st.session_state["profit_opportunities_scanned_total"] = len(tickers)
-
-scan_rows = st.session_state.get("profit_opportunities_scan", [])
+scanned_df = st.session_state.get("profit_opportunities_scan")
+scan_horizon_key = st.session_state.get("profit_opportunities_scan_horizon")
 total_scanned = st.session_state.get("profit_opportunities_scanned_total", 0)
 
-if scan_rows:
-    max_results = st.slider("Max Results to Display", 5, 200, 25)
-    horizon_map = {
-        "Short-Term (1–4 weeks)": ("short_term_target", "short_term_upside", "short_term_basis"),
-        "Medium-Term (1–6 months)": ("medium_term_target", "medium_term_upside", "medium_term_basis"),
-        "Long-Term (6–24 months)": ("long_term_target", "long_term_upside", "long_term_basis"),
-    }
-    target_key, upside_key, basis_key = horizon_map[horizon]
+_DISPLAY_COLUMNS = [
+    "Ticker",
+    "Company",
+    "Index",
+    "Score",
+    "Sector Trend",
+    "Market Cap Tier",
+    "Long-Term Stage",
+    "Current Price",
+    "Target Price",
+    "Projected Upside %",
+    "Est. Target Date",
+    "Confidence",
+    "Basis",
+]
 
-    display_rows = []
-    for row in scan_rows:
-        projections = row.get("projections") or {}
-        target_price = float(projections.get(target_key) or 0)
-        upside = float(projections.get(upside_key) or 0)
-        if target_price <= 0 or upside < min_upside_pct or upside <= 0:
-            continue
-        rsi = row.get("technical", {}).get("indicators", {}).get("rsi")
-        est_date, confidence = estimate_target_date(row["ticker"], target_price, horizon, rsi)
-        display_rows.append(
-            {
-                "Ticker": row["ticker"],
-                "Company": row["company"],
-                "Index": row["index"],
-                "Score": row["score"],
-                "Sector Trend": str(row.get("sector_trend") or "unknown").replace("_", " ").title(),
-                "Market Cap Tier": row.get("market_cap_tier") or "unknown",
-                "Long-Term Stage": row.get("longterm_stage") or "",
-                "Current Price": row["current_price"],
-                "Target Price": target_price,
-                "Projected Upside %": upside,
-                "Est. Target Date": est_date,
-                "Confidence": confidence,
-                "Basis": projections.get(basis_key, ""),
-            }
-        )
-
-    # Record predictions for the track-record feature.
-    if display_rows:
-        horizon_key_map = {
-            "Short-Term (1–4 weeks)": "short_term",
-            "Medium-Term (1–6 months)": "medium_term",
-            "Long-Term (6–24 months)": "long_term",
-        }
-        _h = horizon_key_map.get(horizon, "short_term")
-        try:
-            _recorded = record_predictions_from_scan(display_rows, horizon=_h, source="profit_opportunities")
-            if _recorded:
-                st.toast(f"📌 Recorded {_recorded} new prediction(s) for tracking.", icon="📌")
-        except Exception:
-            pass  # Never block UI for tracking failures
-
-    if not display_rows:
-        st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside %.")
-        if total_scanned:
-            st.caption(f"✅ Scanned **{total_scanned}** stocks → **0** met the upside threshold")
+if scanned_df is not None and not scanned_df.empty:
+    if scan_horizon_key != horizon_key:
+        st.info("Horizon changed since the last scan — click **Run Analysis** to rescan for the new horizon.")
     else:
-        ranked_rows = pd.DataFrame(display_rows).sort_values("Projected Upside %", ascending=False).reset_index(drop=True)
-        results_df = ranked_rows.head(max_results)
-        _fast_filtered = st.session_state.get("profit_opportunities_fast_filtered")
-        _fully_analyzed = st.session_state.get("profit_opportunities_fully_analyzed")
-        if total_scanned:
-            caption_parts = [f"✅ Scanned **{total_scanned}** stocks"]
-            if _fast_filtered is not None and _fully_analyzed is not None:
+        max_results = st.slider("Max Results to Display", 5, 200, 25)
+
+        # filter_by_upside() applies the min-upside threshold at *display*
+        # time (not scan time) so users can adjust the slider without
+        # triggering a full re-scan.
+        qualifying = filter_by_upside(scanned_df, horizon_key, min_upside_pct=min_upside_pct)
+        top_rows = qualifying.head(max_results)
+        display_rows = add_estimated_dates(top_rows.to_dict("records"), horizon_key) if not top_rows.empty else []
+        for row in display_rows:
+            row.pop("_rsi", None)
+
+        # Record predictions for the track-record feature.
+        if display_rows:
+            try:
+                _recorded = record_predictions_from_scan(display_rows, horizon=horizon_key, source="profit_opportunities")
+                if _recorded:
+                    st.toast(f"📌 Recorded {_recorded} new prediction(s) for tracking.", icon="📌")
+            except Exception:
+                pass  # Never block UI for tracking failures
+
+        if not display_rows:
+            st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside %.")
+            if total_scanned:
+                st.caption(f"✅ Scanned **{total_scanned}** stocks → **0** met the upside threshold")
+        else:
+            results_df = pd.DataFrame(display_rows)
+            results_df = results_df[[c for c in _DISPLAY_COLUMNS if c in results_df.columns]]
+            _fast_filtered = st.session_state.get("profit_opportunities_fast_filtered")
+            _fully_analyzed = st.session_state.get("profit_opportunities_fully_analyzed")
+            if total_scanned:
+                caption_parts = [f"✅ Scanned **{total_scanned}** stocks"]
+                if _fast_filtered is not None and _fully_analyzed is not None:
+                    caption_parts.append(
+                        f"fast-filtered **{_fast_filtered}** · fully analysed **{_fully_analyzed}**"
+                    )
                 caption_parts.append(
-                    f"fast-filtered **{_fast_filtered}** · fully analysed **{_fully_analyzed}**"
+                    f"**{len(qualifying)}** met the upside threshold → Showing top **{len(results_df)}**"
                 )
-            caption_parts.append(
-                f"**{len(display_rows)}** met the upside threshold → Showing top **{len(results_df)}**"
+                st.caption(" → ".join(caption_parts))
+            formatters = {
+                "Current Price": "${:,.2f}",
+                "Target Price": "${:,.2f}",
+                "Projected Upside %": "{:.2f}%",
+            }
+            styled = results_df.style.format({k: v for k, v in formatters.items() if k in results_df.columns})
+            st.dataframe(styled, use_container_width=True)
+
+            chart_df = results_df[["Ticker", "Projected Upside %", "Confidence"]].copy()
+            fig = px.bar(
+                chart_df,
+                x="Ticker",
+                y="Projected Upside %",
+                color="Confidence",
+                color_discrete_map={"High": "#2ca02c", "Medium": "#ffbf00", "Low": "#ff8c00"},
+                title=f"Projected Upside by Stock ({horizon})",
             )
-            st.caption(" → ".join(caption_parts))
-        formatters = {
-            "Current Price": "${:,.2f}",
-            "Target Price": "${:,.2f}",
-            "Projected Upside %": "{:.2f}%",
-        }
-        styled = results_df.style.format({k: v for k, v in formatters.items() if k in results_df.columns})
-        st.dataframe(styled, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
 
-        chart_df = results_df[["Ticker", "Projected Upside %", "Confidence"]].copy()
-        fig = px.bar(
-            chart_df,
-            x="Ticker",
-            y="Projected Upside %",
-            color="Confidence",
-            color_discrete_map={"High": "#2ca02c", "Medium": "#ffbf00", "Low": "#ff8c00"},
-            title=f"Projected Upside by Stock ({horizon})",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+            top = results_df.iloc[0]
+            st.success(
+                f"🏆 Top Pick: **{top['Ticker']}** ({top['Company']}) — "
+                f"Projected {top['Projected Upside %']:.1f}% upside by {top['Est. Target Date']} "
+                f"(Confidence: {top['Confidence']})"
+            )
 
-        top = results_df.iloc[0]
-        st.success(
-            f"🏆 Top Pick: **{top['Ticker']}** ({top['Company']}) — "
-            f"Projected {top['Projected Upside %']:.1f}% upside by {top['Est. Target Date']} "
-            f"(Confidence: {top['Confidence']})"
-        )
-
-        st.download_button(
-            "Export to CSV",
-            results_df.to_csv(index=False),
-            file_name="profit_opportunities.csv",
-            mime="text/csv",
-        )
+            st.download_button(
+                "Export to CSV",
+                results_df.to_csv(index=False),
+                file_name="profit_opportunities.csv",
+                mime="text/csv",
+            )
 
 st.caption("⚠️ Projected dates and upside figures are model estimates based on historical data. They are not guarantees of future performance.")

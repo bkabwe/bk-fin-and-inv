@@ -54,9 +54,13 @@ class ScanEmailReportTests(unittest.TestCase):
                 },
             }
 
-        with patch("scripts.scan_email_report.get_stock_data", return_value=sample_frame):
-            with patch("scripts.scan_email_report.fast_screen_score", return_value=(42, None)):
-                with patch("scripts.scan_email_report.analyze_stock", side_effect=_analysis_for):
+        # run_profit_opportunities_scan() delegates the actual per-ticker
+        # fast-screen/analysis/data-fetch calls to modules.profit_opportunities
+        # (shared with the Streamlit page and the FastAPI route), so patch
+        # targets live there rather than on scripts.scan_email_report.
+        with patch("modules.profit_opportunities.get_stock_data", return_value=sample_frame):
+            with patch("modules.profit_opportunities.fast_screen_score", return_value=(42, None)):
+                with patch("modules.profit_opportunities.analyze_stock", side_effect=_analysis_for):
                     with patch("scripts.scan_email_report.record_predictions_from_scan", return_value=2) as record_mock:
                         results, stats = scan_email_report.run_profit_opportunities_scan(["AAPL", "MSFT"], "short_term")
 
