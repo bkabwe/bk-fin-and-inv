@@ -182,10 +182,12 @@ if scanned_df is not None and not scanned_df.empty:
         qualifying = filter_by_upside(scanned_df, horizon_key, min_upside_pct=min_upside_pct)
         top_rows = qualifying.head(max_results)
         display_rows = add_estimated_dates(top_rows.to_dict("records"), horizon_key) if not top_rows.empty else []
-        for row in display_rows:
-            row.pop("_rsi", None)
 
-        # Record predictions for the track-record feature.
+        # Record predictions for the track-record feature. Must happen before
+        # the internal _rsi field is popped below, since record_predictions_from_scan
+        # reads the _*_score fields (left intact here) to populate sub_scores
+        # for compute_subscore_correlation_stats; they never leak into the
+        # displayed table below because results_df is filtered to _DISPLAY_COLUMNS.
         if display_rows:
             try:
                 _recorded = record_predictions_from_scan(display_rows, horizon=horizon_key, source="profit_opportunities")
@@ -193,6 +195,9 @@ if scanned_df is not None and not scanned_df.empty:
                     st.toast(f"📌 Recorded {_recorded} new prediction(s) for tracking.", icon="📌")
             except Exception:
                 pass  # Never block UI for tracking failures
+
+        for row in display_rows:
+            row.pop("_rsi", None)
 
         if not display_rows:
             st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside %.")

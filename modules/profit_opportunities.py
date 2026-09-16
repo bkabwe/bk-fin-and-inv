@@ -252,6 +252,7 @@ def analyze_ticker_for_horizon(
         target_price = float(projections.get(settings["target_key"]) or 0)
         upside = float(projections.get(settings["upside_key"]) or 0)
         rsi = (analysis.get("technical") or {}).get("indicators", {}).get("rsi")
+        breakdown = analysis.get("score_breakdown") or {}
 
         outcome["row"] = {
             "Ticker": ticker,
@@ -268,6 +269,17 @@ def analyze_ticker_for_horizon(
             "Confidence": str(projections.get("data_quality") or "Limited"),
             "Basis": str(projections.get(settings["basis_key"]) or ""),
             "_rsi": rsi,
+            # Internal-only technical sub-scores (stripped before display/API
+            # response, same as _rsi above), threaded through to
+            # record_predictions_from_scan so modules.prediction_tracker can
+            # empirically measure their inter-correlation over time -- see
+            # modules.prediction_tracker.SUBSCORE_ROW_FIELDS and
+            # compute_subscore_correlation_stats.
+            "_trend_score": breakdown.get("trend"),
+            "_momentum_score": breakdown.get("momentum"),
+            "_rs_score": breakdown.get("relative_strength"),
+            "_breakout_score": breakdown.get("breakout"),
+            "_volume_quality_score": breakdown.get("volume_quality"),
             **({"Index": label} if label else {}),
         }
         return outcome

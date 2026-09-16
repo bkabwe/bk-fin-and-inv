@@ -31,6 +31,21 @@ HORIZON_DAYS: dict[str, int] = {
     "long_term": 365,
 }
 
+# Maps the internal row-dict keys populated by
+# modules.profit_opportunities.analyze_ticker_for_horizon (prefixed with "_"
+# like _rsi, stripped before display/API response) to the field names used
+# in a prediction record's "sub_scores" dict. These are the five technical
+# sub-scores flagged in the architecture review as suspected of being highly
+# correlated (see modules/scoring_engine.py's analyze_stock); recording them
+# here is what makes compute_subscore_correlation_stats() below usable.
+SUBSCORE_ROW_FIELDS: dict[str, str] = {
+    "_trend_score": "trend",
+    "_momentum_score": "momentum",
+    "_rs_score": "relative_strength",
+    "_breakout_score": "breakout",
+    "_volume_quality_score": "volume_quality",
+}
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -88,8 +103,12 @@ def record_prediction(
     data_quality: str,
     models_used: str,
     source: str,  # "profit_opportunities" | "stock_analysis" | "screener"
+    sub_scores: dict[str, float] | None = None,
 ) -> str | None:
     """Persist a prediction if no unresolved record exists for (ticker, horizon) today.
+
+    ``sub_scores`` optionally records the technical sub-score breakdown (see
+    SUBSCORE_ROW_FIELDS) at scan time, enabling compute_subscore_correlation_stats.
 
     Returns the prediction id if recorded, or None if it was deduped.
     """
@@ -126,6 +145,7 @@ def record_prediction(
         "data_quality": data_quality,
         "models_used": models_used,
         "source": source,
+        "sub_scores": dict(sub_scores) if sub_scores else None,
         "status": "pending",
         # resolved fields — filled in later
         "actual_price_at_target_date": None,
@@ -168,6 +188,11 @@ def record_predictions_from_scan(
             # low/high — gracefully fall back to ±5 % of target if missing
             target_low = float(row.get("target_low") or target_price * 0.95)
             target_high = float(row.get("target_high") or target_price * 1.05)
+            sub_scores = {
+                record_key: float(row[row_key])
+                for row_key, record_key in SUBSCORE_ROW_FIELDS.items()
+                if row.get(row_key) is not None
+            }
             pid = record_prediction(
                 ticker=ticker,
                 company=str(row.get("company") or row.get("Company") or ticker),
@@ -181,6 +206,7 @@ def record_predictions_from_scan(
                 data_quality=str(row.get("data_quality") or row.get("Confidence") or "Limited"),
                 models_used=str(row.get("basis") or row.get("Basis") or row.get("models_used") or ""),
                 source=source,
+                sub_scores=sub_scores or None,
             )
             if pid:
                 count += 1
@@ -509,3 +535,52 @@ def compute_score_validation_stats(min_samples: int = 5) -> dict:
         "overall": _score_ic_stats(resolved, min_samples),
         "by_horizon": by_horizon,
     }
+
+
+def compute_subscore_correlation_stats(min_samples: int = 10) -> dict:
+    """Pairwise Pearson correlation among the 5 technical sub-scores recorded
+    at scan time (see SUBSCORE_ROW_FIELDS): trend, momentum, relative_strength,
+    breakout, and volume_quality.
+
+    This is the empirical check flagged in the architecture review and in
+    modules/scoring_engine.py's analyze_stock docstring comment: these
+    sub-scores were suspected of mostly re-deriving the same underlying
+    "uptrend + volume confirmation" signal, over-crediting it several times
+    within the 0-50 technical total, but that was never measured against
+    real scan history.
+
+    Unlike compute_score_validation_stats above, this does **not** require
+    resolved outcomes -- it correlates the sub-scores against each other
+    across every recorded scan (pending or resolved), so it becomes usable
+    as soon as enough scan history exists, without waiting weeks/months for
+    target dates to resolve.
+
+    Returns {"pairs": {"breakout/momentum": {"correlation": float | None,
+    "count": int}, ...}, "total_records_with_subscores": int}. A pair with
+    fewer than `min_samples` records with both fields populated reports
+    correlation=None rather than a misleading statistic from a tiny sample.
+    High positive correlations (e.g. > 0.6-0.7) between a pair would support
+    down-weighting or consolidating them; this function only measures the
+    correlation; deciding what to do about it is a follow-up.
+    """
+    records = _load_all()
+    subscore_rows = [r["sub_scores"] for r in records if isinstance(r.get("sub_scores"), dict)]
+
+    field_names = sorted(set(SUBSCORE_ROW_FIELDS.values()))
+    pairs: dict[str, dict] = {}
+    for i, field_a in enumerate(field_names):
+        for field_b in field_names[i + 1 :]:
+            xs: list[float] = []
+            ys: list[float] = []
+            for row in subscore_rows:
+                a, b = row.get(field_a), row.get(field_b)
+                if a is not None and b is not None:
+                    xs.append(float(a))
+                    ys.append(float(b))
+            correlation = _pearson_correlation(xs, ys) if len(xs) >= min_samples else None
+            pairs[f"{field_a}/{field_b}"] = {
+                "correlation": round(correlation, 4) if correlation is not None else None,
+                "count": len(xs),
+            }
+
+    return {"pairs": pairs, "total_records_with_subscores": len(subscore_rows)}

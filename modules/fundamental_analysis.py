@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
+from functools import lru_cache
+from pathlib import Path
+
 from modules.logger import get_logger
 
 logger = get_logger(__name__)
 
-# KNOWN LIMITATION: static, hardcoded sector P/E benchmarks with no refresh
-# mechanism. Sector multiples drift with rate cycles, so these values can go
-# stale over time. Fix direction (not yet implemented): source benchmarks
-# dynamically (e.g. computed from the current ticker universe) or document/
-# schedule periodic manual updates.
+# Static fallback sector P/E benchmarks, used whenever a fresher value isn't
+# available from data/sector_benchmark_pe.json (see get_sector_benchmark_pe
+# and scripts/refresh_sector_pe.py below). Sector multiples drift with rate
+# cycles, so treat these as a last-resort default, not a source of truth --
+# refresh the JSON file periodically (e.g. quarterly) by re-running
+# `python scripts/refresh_sector_pe.py`.
 SECTOR_BENCHMARK_PE = {
     "Technology": 28,
     "Healthcare": 22,
@@ -22,6 +27,45 @@ SECTOR_BENCHMARK_PE = {
     "Real Estate": 35,
     "Communication Services": 22,
 }
+
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+SECTOR_BENCHMARK_PE_FILE = DATA_DIR / "sector_benchmark_pe.json"
+
+
+@lru_cache(maxsize=4)
+def _load_refreshed_sector_pe(mtime: float) -> dict[str, float]:
+    """Parse data/sector_benchmark_pe.json, keyed by its mtime so edits/refreshes
+    (see scripts/refresh_sector_pe.py) are picked up without a process restart,
+    while repeated calls within the same file version are served from cache."""
+    try:
+        payload = json.loads(SECTOR_BENCHMARK_PE_FILE.read_text(encoding="utf-8"))
+        sectors = payload.get("sectors", {})
+        return {str(name): float(pe) for name, pe in sectors.items() if pe is not None}
+    except Exception as exc:
+        logger.warning("Failed to parse %s: %s", SECTOR_BENCHMARK_PE_FILE, exc)
+        return {}
+
+
+def get_sector_benchmark_pe(sector: str | None, default: float = 20.0) -> float:
+    """Sector P/E benchmark used for sector-relative valuation.
+
+    Prefers a refreshed value computed from the current ticker universe (see
+    scripts/refresh_sector_pe.py, written to data/sector_benchmark_pe.json),
+    falling back to the static SECTOR_BENCHMARK_PE defaults above, and finally
+    to `default` for an unrecognized sector. This is the refresh mechanism
+    for the previously-static-only benchmark: run the script periodically
+    (e.g. quarterly) to keep values current; the app works unmodified if the
+    file is absent or stale.
+    """
+    key = str(sector)
+    try:
+        mtime = SECTOR_BENCHMARK_PE_FILE.stat().st_mtime
+    except OSError:
+        return float(SECTOR_BENCHMARK_PE.get(key, default))
+    refreshed = _load_refreshed_sector_pe(mtime)
+    if key in refreshed:
+        return float(refreshed[key])
+    return float(SECTOR_BENCHMARK_PE.get(key, default))
 
 
 def _safe_float(value):
@@ -88,7 +132,7 @@ def analyze_fundamentals(info: dict, current_price: float | None = None, risk_fr
 
     score, flags = 50, []
 
-    sector_benchmark_pe = float(SECTOR_BENCHMARK_PE.get(str(normalized_sector), 20.0))
+    sector_benchmark_pe = get_sector_benchmark_pe(normalized_sector)
     sector_pe_relative = (pe_used / sector_benchmark_pe) if pe_used and sector_benchmark_pe > 0 else None
     if sector_pe_relative is not None:
         if sector_pe_relative < 0.9:
@@ -127,6 +171,22 @@ def analyze_fundamentals(info: dict, current_price: float | None = None, risk_fr
         risk_free_rate_pct = risk_free_rate * 100.0
         dcf_estimate = eps_for_dcf * (8.5 + 2 * growth_rate_pct) * (4.4 / risk_free_rate_pct)
 
+    # Comparables-based valuation: EPS x current sector peer P/E multiple.
+    # Supplements (rather than replaces) the Graham DCF heuristic above with
+    # an independent cross-check that doesn't depend on the growth-rate input
+    # DCF is most sensitive to, so the two can disagree usefully on
+    # high-growth/negative-earnings names where Graham's formula is weakest.
+    comparable_value_estimate = None
+    if eps_for_dcf and eps_for_dcf > 0 and sector_benchmark_pe > 0:
+        comparable_value_estimate = eps_for_dcf * sector_benchmark_pe
+
+    # Blended valuation_estimate is what the scoring ensemble consumes (see
+    # modules/scoring_engine.py) in place of the raw DCF number, so the
+    # "DCF" ensemble slot now reflects both approaches rather than Graham's
+    # heuristic alone.
+    valuation_inputs = [v for v in (dcf_estimate, comparable_value_estimate) if v is not None]
+    valuation_estimate = (sum(valuation_inputs) / len(valuation_inputs)) if valuation_inputs else None
+
     if eps and eps > 0:
         score += 6
     if growth and growth > 0.1:
@@ -156,7 +216,13 @@ def analyze_fundamentals(info: dict, current_price: float | None = None, risk_fr
     if high and low and current_price and high > low:
         rel = (current_price - low) / (high - low)
 
-    logger.info("Fundamental analysis complete for sector=%s peg=%s dcf=%s", sector, peg_ratio, dcf_estimate)
+    logger.info(
+        "Fundamental analysis complete for sector=%s peg=%s dcf=%s comps=%s",
+        sector,
+        peg_ratio,
+        dcf_estimate,
+        comparable_value_estimate,
+    )
 
     return {
         "fundamental_score": score,
@@ -181,6 +247,10 @@ def analyze_fundamentals(info: dict, current_price: float | None = None, risk_fr
             "analyst_recommendation": rec,
             "peg_ratio": round(float(peg_ratio), 3) if peg_ratio is not None else None,
             "dcf_estimate": round(float(dcf_estimate), 2) if dcf_estimate is not None else None,
+            "comparable_value_estimate": round(float(comparable_value_estimate), 2)
+            if comparable_value_estimate is not None
+            else None,
+            "valuation_estimate": round(float(valuation_estimate), 2) if valuation_estimate is not None else None,
             "sector_benchmark_pe": round(sector_benchmark_pe, 2),
             "sector_pe_relative": round(float(sector_pe_relative), 3) if sector_pe_relative is not None else None,
         },

@@ -22,7 +22,7 @@ from modules.lightgbm_batch import (
     load_return_model_batch_from_urls,
     resolve_release_repository,
 )
-from modules.prediction_tracker import record_predictions_from_scan
+from modules.prediction_tracker import SUBSCORE_ROW_FIELDS, record_predictions_from_scan
 from modules.profit_opportunities import (
     DEFAULT_FAST_SCREEN_MARGIN,
     HORIZON_SETTINGS as _ALL_HORIZON_SETTINGS,
@@ -104,10 +104,13 @@ def run_profit_opportunities_scan(
         prefetch_price_period="1y",
     )
     results = filter_by_upside(scanned, horizon, min_upside_pct=min_upside_pct, max_results=TOP_RESULTS_LIMIT)
-    results = results.drop(columns=["_rsi"], errors="ignore")
+    # Capture rows (with internal _rsi/_*_score fields intact) for recording
+    # before stripping them from the DataFrame used for the CSV/HTML report.
+    recorded_rows = results.to_dict("records")
+    results = results.drop(columns=["_rsi", *SUBSCORE_ROW_FIELDS], errors="ignore")
 
-    if not results.empty:
-        recorded_count = record_predictions_from_scan(results.to_dict("records"), horizon=horizon, source="profit_opportunities")
+    if recorded_rows:
+        recorded_count = record_predictions_from_scan(recorded_rows, horizon=horizon, source="profit_opportunities")
     else:
         recorded_count = 0
 

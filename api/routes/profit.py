@@ -86,7 +86,7 @@ def stop_profit(job_id: str) -> dict:
 @celery_app.task
 def run_profit_task(job_id: str, params: dict):
     from api.deps import redis_client
-    from modules.prediction_tracker import record_predictions_from_scan
+    from modules.prediction_tracker import SUBSCORE_ROW_FIELDS, record_predictions_from_scan
     from modules.profit_opportunities import (
         add_estimated_dates,
         collect_universe_tickers,
@@ -160,8 +160,18 @@ def run_profit_task(job_id: str, params: dict):
 
     filtered = filter_by_upside(scanned, key, min_upside_pct=min_upside_pct, max_results=max_results)
     final_rows = add_estimated_dates(filtered.to_dict("records"), key) if not filtered.empty else []
+
+    # Record predictions for the track-record feature. Must happen before the
+    # internal _rsi/_*_score fields below are stripped, since
+    # record_predictions_from_scan reads the sub-score fields to populate
+    # sub_scores for compute_subscore_correlation_stats.
+    with contextlib.suppress(Exception):  # Never let tracking failures break the task
+        record_predictions_from_scan(final_rows, horizon=key, source="profit_opportunities")
+
     for row in final_rows:
         row.pop("_rsi", None)
+        for field in SUBSCORE_ROW_FIELDS:
+            row.pop(field, None)
 
     stopped = bool(scanned.attrs.get("stopped", False))
     total = int(scanned.attrs.get("source_ticker_count", len(tickers)))
@@ -182,7 +192,3 @@ def run_profit_task(job_id: str, params: dict):
             "created_at": created_at,
         }
     )
-
-    # Record predictions for the track-record feature.
-    with contextlib.suppress(Exception):  # Never let tracking failures break the task
-        record_predictions_from_scan(final_rows, horizon=key, source="profit_opportunities")

@@ -207,22 +207,34 @@ rather than guesswork:
   (RSI+MACD), `rs_score`, `breakout_score`, and `volume_quality_score` largely
   fire off the same underlying "uptrend + volume" signal, potentially
   over-crediting a single pattern several times within the 0–50 technical
-  total. Confirming and correcting for this would require empirically
-  measuring correlation among these sub-scores across a real historical
-  ticker universe.
-- **DCF methodology is dated**: independent of the unit-conversion fix already
-  applied, the DCF estimate is Graham's unmodified 1962 heuristic
-  (`8.5 + 2×growth`), known to be unreliable for high-growth,
-  negative-earnings, or cyclical names. It remains one ensemble input among
-  several rather than a standalone valuation.
-- **Static sector P/E benchmarks**: `SECTOR_BENCHMARK_PE` in
-  `modules/fundamental_analysis.py` is a hardcoded dict with no refresh
-  mechanism, so sector multiples can drift out of date with rate cycles.
+  total. These five sub-scores are now recorded per scan alongside each
+  prediction (see `modules/prediction_tracker.py`'s `SUBSCORE_ROW_FIELDS`),
+  and `compute_subscore_correlation_stats()` empirically measures their
+  pairwise correlation across recorded scan history once enough predictions
+  have accumulated — no down-weighting/consolidation has been applied yet,
+  pending that analysis.
+- **DCF methodology is dated**: the DCF estimate is still Graham's unmodified
+  1962 heuristic (`8.5 + 2×growth`), known to be unreliable for high-growth,
+  negative-earnings, or cyclical names. `analyze_fundamentals()` now blends it
+  with a comparables-based estimate (trailing EPS × sector-benchmark P/E) into
+  a `valuation_estimate` used by the scoring ensemble, so a single dated
+  heuristic no longer drives that ensemble slot alone — but neither input is
+  a modern multi-stage DCF, so this remains a documented simplification.
+- **Sector P/E benchmarks now have a manual refresh path**: `SECTOR_BENCHMARK_PE`
+  in `modules/fundamental_analysis.py` remains a hardcoded static fallback,
+  but `scripts/refresh_sector_pe.py` can be run periodically (manually, or via
+  a scheduled workflow) to compute fresh per-sector median trailing P/Es from
+  live ticker data and write them to `data/sector_benchmark_pe.json`
+  (gitignored, local/derived data); `get_sector_benchmark_pe()` prefers that
+  refreshed file over the static dict whenever it exists.
 - **Survivorship bias in the ticker universe**: `get_sp500_tickers()` scrapes
   the *current* Wikipedia membership table, so LightGBM training and
   walk-forward backtests only ever see tickers still in the index today,
   which can inflate apparent historical accuracy versus a true point-in-time
-  historical membership list.
+  historical membership list. A survivorship-bias-aware ticker universe
+  (e.g. a point-in-time membership snapshot) remains a follow-up data
+  project rather than a quick fix — see the docstring on
+  `modules/data_fetcher.get_sp500_tickers()` for the full caveat.
 - **RMSE-metric geometry favors terminal-point accuracy**: the LightGBM
   walk-forward comparison converts every model's forecast into a smooth
   geometric curve toward one terminal-return guess before computing RMSE,
@@ -487,7 +499,10 @@ Predictions are recorded from three sources:
 Each prediction stores: ticker, company, horizon (`short_term` / `medium_term` /
 `long_term`), scan date, estimated target date, current price at scan, target
 price, target low/high band, projected upside %, score, confidence tier,
-model basis string, and source.
+model basis string, source, and (when available) a `sub_scores` breakdown of
+the five technical sub-scores (`trend`, `momentum`, `relative_strength`,
+`breakout`, `volume_quality`) used to empirically check their correlation —
+see `compute_subscore_correlation_stats()` in `modules/prediction_tracker.py`.
 
 Predictions are deduplicated by `(ticker, horizon, scan_date)` so re-running
 the same scan on the same day does not create duplicate entries.

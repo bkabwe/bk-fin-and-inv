@@ -193,6 +193,113 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         self.assertEqual(overall["precision_at_top_third"], 100.0)
         self.assertEqual(overall["precision_at_bottom_third"], 0.0)
 
+    # -- sub-score recording -----------------------------------------------
+
+    def test_record_prediction_persists_sub_scores_when_provided(self):
+        pid = self._record(
+            sub_scores={
+                "trend": 15.0,
+                "momentum": 8.0,
+                "relative_strength": 5.0,
+                "breakout": 3.0,
+                "volume_quality": 2.0,
+            }
+        )
+        self.assertIsNotNone(pid)
+        record = prediction_tracker.get_all_predictions()[0]
+        self.assertEqual(
+            record["sub_scores"],
+            {"trend": 15.0, "momentum": 8.0, "relative_strength": 5.0, "breakout": 3.0, "volume_quality": 2.0},
+        )
+
+    def test_record_prediction_sub_scores_default_to_none(self):
+        pid = self._record()
+        self.assertIsNotNone(pid)
+        record = prediction_tracker.get_all_predictions()[0]
+        self.assertIsNone(record["sub_scores"])
+
+    def test_record_predictions_from_scan_extracts_subscore_row_fields(self):
+        row = {
+            "ticker": "AAPL",
+            "company": "Apple Inc.",
+            "score": 75,
+            "current_price": 100.0,
+            "target_price": 110.0,
+            "projected_upside_pct": 10.0,
+            "_trend_score": 15.0,
+            "_momentum_score": 8.0,
+            "_rs_score": None,  # missing sub-score should be omitted, not stored as None
+            "_breakout_score": 3.0,
+            "_volume_quality_score": 2.0,
+        }
+
+        count = prediction_tracker.record_predictions_from_scan([row], horizon="short_term", source="profit_opportunities")
+
+        self.assertEqual(count, 1)
+        record = prediction_tracker.get_all_predictions()[0]
+        self.assertEqual(
+            record["sub_scores"],
+            {"trend": 15.0, "momentum": 8.0, "breakout": 3.0, "volume_quality": 2.0},
+        )
+
+    def test_record_predictions_from_scan_without_subscore_fields_stores_none(self):
+        row = {
+            "ticker": "AAPL",
+            "company": "Apple Inc.",
+            "score": 75,
+            "current_price": 100.0,
+            "target_price": 110.0,
+            "projected_upside_pct": 10.0,
+        }
+
+        count = prediction_tracker.record_predictions_from_scan([row], horizon="short_term", source="profit_opportunities")
+
+        self.assertEqual(count, 1)
+        self.assertIsNone(prediction_tracker.get_all_predictions()[0]["sub_scores"])
+
+    # -- sub-score correlation ----------------------------------------------
+
+    def test_compute_subscore_correlation_stats_returns_none_below_min_samples(self):
+        for i in range(3):
+            self._record(
+                ticker=f"T{i}",
+                sub_scores={"trend": float(i), "momentum": float(i), "relative_strength": float(i)},
+            )
+
+        stats = prediction_tracker.compute_subscore_correlation_stats(min_samples=5)
+
+        self.assertEqual(stats["total_records_with_subscores"], 3)
+        self.assertIsNone(stats["pairs"]["momentum/trend"]["correlation"])
+        self.assertEqual(stats["pairs"]["momentum/trend"]["count"], 3)
+
+    def test_compute_subscore_correlation_stats_detects_high_correlation(self):
+        # trend and momentum move in lockstep; breakout is unrelated (constant).
+        for i in range(6):
+            self._record(
+                ticker=f"T{i}",
+                sub_scores={
+                    "trend": float(i),
+                    "momentum": float(i) * 2,
+                    "breakout": 1.0,
+                },
+            )
+
+        stats = prediction_tracker.compute_subscore_correlation_stats(min_samples=5)
+
+        self.assertEqual(stats["total_records_with_subscores"], 6)
+        self.assertGreater(stats["pairs"]["momentum/trend"]["correlation"], 0.99)
+        self.assertEqual(stats["pairs"]["momentum/trend"]["count"], 6)
+        # A constant series has zero variance, so correlation is undefined (None).
+        self.assertIsNone(stats["pairs"]["breakout/trend"]["correlation"])
+
+    def test_compute_subscore_correlation_stats_ignores_records_without_subscores(self):
+        self._record(ticker="A")  # no sub_scores
+
+        stats = prediction_tracker.compute_subscore_correlation_stats(min_samples=1)
+
+        self.assertEqual(stats["total_records_with_subscores"], 0)
+        self.assertEqual(stats["pairs"]["momentum/trend"]["count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

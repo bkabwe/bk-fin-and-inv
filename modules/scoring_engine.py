@@ -673,11 +673,15 @@ def _get_price_projections_core(
     else:
         models_skipped.append("Fundamental Fair Value: no EPS data")
 
-    dcf_estimate = metrics.get("dcf_estimate")
+    # valuation_estimate blends the Graham-DCF heuristic with a sector-P/E
+    # comparables cross-check (see modules/fundamental_analysis.py); this is
+    # what feeds the "DCF" ensemble slot below, so a single-model artifact in
+    # one approach doesn't dominate this weighted-ensemble input.
+    dcf_estimate = metrics.get("valuation_estimate")
     if dcf_estimate:
-        models_used.append("DCF Estimate")
+        models_used.append("DCF+Comps Estimate")
     else:
-        models_skipped.append("DCF Estimate: unavailable")
+        models_skipped.append("DCF+Comps Estimate: unavailable")
 
     resistance_levels = sorted([float(x) for x in technical.get("resistance_levels", []) if x is not None])
     nearest_resistance = next((value for value in resistance_levels if value >= current_price), None)
@@ -708,7 +712,7 @@ def _get_price_projections_core(
             ("Trend", trend_180, medium_model_weights.get("trend", 0.0)),
             ("LightGBM", lightgbm_projections.get(180), medium_model_weights.get("lightgbm", 0.0)),
             ("Fundamental", fair_value, 0.20),
-            ("DCF", dcf_estimate, 0.10),
+            ("DCF+Comps", dcf_estimate, 0.10),
             ("Analyst x0.65", analyst_medium, 0.15),
         ]
     )
@@ -717,7 +721,7 @@ def _get_price_projections_core(
             ("ARIMA", arima_720, long_model_weights.get("arima", 0.0)),
             ("Trend", trend_720, long_model_weights.get("trend", 0.0)),
             ("Fundamental", fair_value, 0.20),
-            ("DCF", dcf_estimate, 0.10),
+            ("DCF+Comps", dcf_estimate, 0.10),
             ("Analyst", analyst_long, 0.20),
         ]
     )
@@ -922,12 +926,15 @@ def analyze_stock(
     # momentum_score, rs_score, breakout_score, and volume_quality_score below
     # largely derive from the same underlying "uptrend + volume confirmation"
     # signal, so a single strong trend can be credited across several of
-    # these sub-scores at once within the 0-50 technical total. Confirming
-    # and correcting for this would require empirically measuring the
-    # correlation among these sub-scores across a real historical ticker
-    # universe (not available in every environment); until that analysis is
-    # run, treat the technical total as directionally useful but not as five
-    # independent signals.
+    # these sub-scores at once within the 0-50 technical total. These five
+    # sub-scores are now recorded per scan (see
+    # modules.profit_opportunities.analyze_ticker_for_horizon's "_*_score"
+    # row fields and modules.prediction_tracker.SUBSCORE_ROW_FIELDS), and
+    # modules.prediction_tracker.compute_subscore_correlation_stats()
+    # empirically measures their pairwise correlation across recorded scan
+    # history once enough predictions have accumulated. Until that analysis
+    # shows otherwise, treat the technical total as directionally useful but
+    # not as five independent signals.
     trend_score = 15 if technical["trend"] == "uptrend" else 8 if technical["trend"] == "sideways" else 2
     rsi, macd, signal = (
         technical["indicators"].get("rsi"),
