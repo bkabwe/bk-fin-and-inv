@@ -10,10 +10,13 @@ pip install -r requirements.txt
 
 `requirements.txt` is the full set needed to run the Streamlit dashboard
 locally (adds `streamlit`, `plotly`, `Pillow` for the UI on top of the core
-analysis stack). The scheduled GitHub Actions workflows (scan/grading email
-reports, LightGBM batch training) never render the Streamlit UI, so they
-install the leaner `requirements-workflows.txt` instead — see
-`.github/workflows/*.yml`. The FastAPI/Celery backend under `api/` uses
+analysis stack). The scheduled GitHub Actions workflows never render the
+Streamlit UI, so they install a leaner file instead — see
+`.github/workflows/*.yml`. Scan/grading email report workflows install
+`requirements-workflows.txt`; `train-lightgbm-batch.yml` installs the even
+leaner `requirements-lightgbm-batch.txt` (same core stack minus
+`torch`/`transformers`, since the batch pipeline never needs FinBERT
+sentiment). The FastAPI/Celery backend under `api/` uses
 `requirements-api.txt` in addition to one of the above (see
 [Optional FastAPI + React frontend](#optional-fastapi--react-frontend)).
 
@@ -274,9 +277,15 @@ Separately, `.github/workflows/train-lightgbm-batch.yml`,
 `scan-email-short-term.yml`, `scan-email-medium-term.yml`,
 `grading-report-short-term.yml`, and `grading-report-medium-term.yml` run on
 schedules to retrain/promote LightGBM models and send scan/grading email
-reports. They install `requirements-workflows.txt` (not the full
-`requirements.txt`, since they only run `scripts/*.py` against `modules/`
-headlessly) and don't touch `api/` or `frontend/`.
+reports. They don't touch `api/` or `frontend/`, and none of them install the
+full `requirements.txt` since they only run `scripts/*.py` against `modules/`
+headlessly. The scan/grading-report workflows install `requirements-workflows.txt`
+(they need FinBERT sentiment via `analyze_stock`); `train-lightgbm-batch.yml`
+installs the leaner `requirements-lightgbm-batch.txt` instead, since
+`scripts/lightgbm_batch_pipeline.py` only calls the technical-only
+`fast_screen_score` and never needs `torch`/`transformers`. Skipping that
+multi-GB FinBERT install leaves more disk headroom for the `reduce-promote`
+job's multi-GB batch merge/promote step.
 
 ## Troubleshooting
 
@@ -321,7 +330,7 @@ Brevo API integration used for scan/grading reports
 (`scripts/notify_workflow_failure.py`, reusing `modules/email_reports.py`'s
 `send_brevo_email`). This surfaces pipeline breaks (e.g. a reduce/promote job
 failure) proactively instead of only being noticed by chance. The notifier only
-installs `requests` (not the full `requirements-workflows.txt`), and any
+installs `requests` (not each workflow's full dependency set), and any
 failure while sending the alert itself is swallowed so it never masks or
 replaces the original job failure it's reporting on.
 

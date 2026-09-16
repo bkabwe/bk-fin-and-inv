@@ -15,8 +15,9 @@ pip install -r requirements-api.txt   # only if touching api/
 ```
 
 See [README.md#installation](README.md#installation) for why there are
-three requirements files (`requirements.txt`, `requirements-workflows.txt`,
-`requirements-api.txt`) and when each applies.
+four requirements files (`requirements.txt`, `requirements-workflows.txt`,
+`requirements-lightgbm-batch.txt`, `requirements-api.txt`) and when each
+applies.
 
 ## Before opening a PR
 
@@ -62,9 +63,10 @@ three requirements files (`requirements.txt`, `requirements-workflows.txt`,
    backend and Celery workers are not supposed to require `streamlit`).
 
 6. **Pin new dependencies.** `requirements.txt`, `requirements-workflows.txt`,
-   and `requirements-api.txt` use exact `==` pins. If you add a new
-   dependency, pin it to the version you tested against and verify the full
-   test suite still passes with that pin installed in a clean virtualenv.
+   `requirements-lightgbm-batch.txt`, and `requirements-api.txt` use exact
+   `==` pins. If you add a new dependency, pin it to the version you tested
+   against and verify the full test suite still passes with that pin
+   installed in a clean virtualenv.
 
 7. **Scan for secrets** before committing if you touched anything that could
    plausibly contain credentials (env files, workflow YAML, API client code).
