@@ -242,8 +242,8 @@ def _cross_history(close: pd.Series, ticker: str) -> tuple[int, int, float | Non
     golden = ((prev <= 0) & (cur > 0))
     death = ((prev >= 0) & (cur < 0))
 
-    golden_idx = list(merged.loc[golden].index)
-    death_idx = list(merged.loc[death].index)
+    golden_idx = list(golden[golden].index)
+    death_idx = list(death[death].index)
     _ = death_idx  # kept for symmetry with golden_idx; not needed beyond the count below
 
     favorable = 0

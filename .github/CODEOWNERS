@@ -1,0 +1,11 @@
+# CODEOWNERS
+#
+# Every change in this repository requires review/approval from the owner
+# below. This exists to reduce single-maintainer bus-factor risk: it makes
+# the review expectation explicit for any future contributor (human or
+# agent) and ensures ownership is documented even while there is one
+# maintainer.
+#
+# See https://docs.github.com/articles/about-code-owners for syntax.
+
+* @bkabwe
