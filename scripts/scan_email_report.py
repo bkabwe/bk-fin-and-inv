@@ -17,7 +17,12 @@ if str(REPO_ROOT) not in sys.path:
 from modules.data_fetcher import get_stock_data
 from modules.email_reports import csv_attachment, render_html_table, render_metric_tiles, render_report_html, send_brevo_email
 from modules.fred_client import get_macro_feature_table
-from modules.lightgbm_batch import fetch_live_manifest, load_return_model_batch_from_url, resolve_release_repository
+from modules.lightgbm_batch import (
+    batch_asset_urls_from_manifest,
+    fetch_live_manifest,
+    load_return_model_batch_from_urls,
+    resolve_release_repository,
+)
 from modules.prediction_tracker import record_predictions_from_scan
 from modules.scoring_engine import analyze_stock, fast_screen_score
 from modules.screener import run_screener
@@ -73,11 +78,11 @@ def load_live_scan_inputs(repository: str | None = None) -> tuple[dict[str, Any]
     if not tickers:
         raise RuntimeError("Live manifest is empty or unreachable; refusing to send an empty scan report")
 
-    asset_url = str((((manifest or {}).get("latest_batch") or {}).get("asset_url") or "")).strip()
-    if not asset_url:
+    asset_urls = batch_asset_urls_from_manifest(manifest)
+    if not asset_urls:
         raise RuntimeError("Live manifest is missing latest batch asset_url")
 
-    batch = load_return_model_batch_from_url(asset_url)
+    batch = load_return_model_batch_from_urls(asset_urls)
     if not ((batch or {}).get("models") or {}):
         raise RuntimeError("Live batch artifact is empty or unreachable")
     return manifest, batch, tickers

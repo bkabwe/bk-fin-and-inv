@@ -206,7 +206,7 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         ):
             models = scoring_engine._load_live_lightgbm_models("AAPL")
 
-        batch_mock.assert_called_once_with("https://example/batch.joblib")
+        batch_mock.assert_called_once_with(("https://example/batch.joblib",))
         legacy_mock.assert_not_called()
         self.assertEqual(models, {30: model_30, 180: model_180})
 

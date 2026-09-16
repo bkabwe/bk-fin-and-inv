@@ -292,5 +292,77 @@ class ReduceAndValidateMemoryTests(unittest.TestCase):
                 pipeline.reduce_and_validate(args)
 
 
+class BatchAssetSplittingTests(unittest.TestCase):
+    """Regression tests for GitHub's 2 GiB per-release-asset limit.
+
+    A full-universe batch file previously failed to promote once it exceeded
+    GitHub's per-asset size limit; these tests confirm large batches are split
+    into parts before upload and reassembled unchanged after download.
+    """
+
+    def test_split_large_file_returns_original_path_when_under_chunk_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "batch.joblib"
+            path.write_bytes(b"x" * 100)
+
+            parts = pipeline._split_large_file(path, chunk_size=1000)
+
+        self.assertEqual(parts, [path])
+
+    def test_split_large_file_splits_into_ordered_parts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "batch.joblib"
+            payload = bytes(range(256)) * 4  # 1024 bytes
+            path.write_bytes(payload)
+
+            parts = pipeline._split_large_file(path, chunk_size=300)
+
+            self.assertEqual([part.name for part in parts], [
+                "batch.joblib.part001of004",
+                "batch.joblib.part002of004",
+                "batch.joblib.part003of004",
+                "batch.joblib.part004of004",
+            ])
+            reassembled = b"".join(part.read_bytes() for part in parts)
+            self.assertEqual(reassembled, payload)
+
+    def test_upload_batch_asset_uploads_single_part_for_small_files(self):
+        client = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            batch_path = Path(tmpdir) / "batch.joblib"
+            batch_path.write_bytes(b"small file")
+
+            pipeline._upload_batch_asset(client, {"id": 1}, batch_path)
+
+            client.upload_asset.assert_called_once_with({"id": 1}, batch_path, pipeline.DEFAULT_BATCH_ASSET_NAME)
+            # The original (un-split) file must still exist and be untouched.
+            self.assertTrue(batch_path.exists())
+
+    def test_upload_batch_asset_splits_and_cleans_up_parts_for_large_files(self):
+        client = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            batch_path = Path(tmpdir) / "batch.joblib"
+            batch_path.write_bytes(b"y" * 1000)
+
+            pipeline._upload_batch_asset(client, {"id": 1}, batch_path, chunk_size=300)
+
+            self.assertEqual(client.upload_asset.call_count, 4)
+            uploaded_names = [call_args.args[2] for call_args in client.upload_asset.call_args_list]
+            self.assertEqual(
+                uploaded_names,
+                [
+                    "lightgbm_return_model_batch.joblib.part001of004",
+                    "lightgbm_return_model_batch.joblib.part002of004",
+                    "lightgbm_return_model_batch.joblib.part003of004",
+                    "lightgbm_return_model_batch.joblib.part004of004",
+                ],
+            )
+            # Part files are temporary and must be cleaned up after upload.
+            for call_args in client.upload_asset.call_args_list:
+                self.assertFalse(call_args.args[1].exists())
+            # The original merged batch file itself must be left untouched.
+            self.assertTrue(batch_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

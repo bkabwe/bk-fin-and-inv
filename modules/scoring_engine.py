@@ -18,9 +18,10 @@ from modules.lightgbm_model import (
 )
 from modules.lightgbm_batch import (
     DEFAULT_BATCH_ASSET_NAME,
+    batch_asset_urls_from_manifest,
     fetch_live_manifest,
     get_batch_models_for_ticker,
-    load_return_model_batch_from_url,
+    load_return_model_batch_from_urls,
 )
 from modules.logger import get_logger
 from modules.longterm_analysis import analyze_longterm_technical_score
@@ -363,11 +364,11 @@ def _load_live_lightgbm_manifest() -> dict:
 
 
 @cache_data(ttl=3600)
-def _load_live_lightgbm_batch(asset_url: str) -> dict:
+def _load_live_lightgbm_batch(asset_urls: tuple[str, ...]) -> dict:
     try:
-        batch = load_return_model_batch_from_url(asset_url)
+        batch = load_return_model_batch_from_urls(list(asset_urls))
     except Exception as exc:
-        logger.warning("Live LightGBM batch unavailable from %s: %s", asset_url, exc)
+        logger.warning("Live LightGBM batch unavailable from %s: %s", asset_urls, exc)
         return {}
     return batch if isinstance(batch, dict) else {}
 
@@ -377,9 +378,9 @@ def _load_live_lightgbm_models(ticker: str) -> dict[int, object]:
     if not LIGHTGBM_AVAILABLE:
         return {}
     manifest = _load_live_lightgbm_manifest()
-    batch_asset_url = (((manifest or {}).get("latest_batch") or {}).get("asset_url") or "").strip()
-    if batch_asset_url:
-        batch = _load_live_lightgbm_batch(batch_asset_url)
+    batch_asset_urls = tuple(batch_asset_urls_from_manifest(manifest))
+    if batch_asset_urls:
+        batch = _load_live_lightgbm_batch(batch_asset_urls)
         models = get_batch_models_for_ticker(batch, ticker, horizons=(30, 180))
         if models:
             return models
