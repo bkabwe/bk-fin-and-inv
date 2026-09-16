@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import threading
-
 import pandas as pd
 
 from modules.fred_client import FredNotConfiguredError, get_vix_observations

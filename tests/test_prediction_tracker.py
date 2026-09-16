@@ -99,7 +99,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
             {"Close": [108.0, 112.0]},
             index=pd.to_datetime(["2020-01-09", "2020-01-11"]),
         )
-        with patch.object(prediction_tracker, "get_stock_data", return_value=frame):
+        with patch("modules.data_fetcher.get_stock_data", return_value=frame):
             summary = prediction_tracker.resolve_pending_predictions()
 
         self.assertEqual(summary["resolved"], 1)
@@ -129,7 +129,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         records[0]["target_date"] = "2020-01-01"
         prediction_tracker._save_all(records)
 
-        with patch.object(prediction_tracker, "get_stock_data", return_value=pd.DataFrame()):
+        with patch("modules.data_fetcher.get_stock_data", return_value=pd.DataFrame()):
             summary = prediction_tracker.resolve_pending_predictions()
 
         self.assertEqual(summary["no_data"], 1)
@@ -143,7 +143,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         records[0]["target_date"] = (date.today() - timedelta(days=2)).isoformat()
         prediction_tracker._save_all(records)
 
-        with patch.object(prediction_tracker, "get_stock_data", return_value=pd.DataFrame()):
+        with patch("modules.data_fetcher.get_stock_data", return_value=pd.DataFrame()):
             summary = prediction_tracker.resolve_pending_predictions()
 
         self.assertEqual(summary["still_pending"], 1)

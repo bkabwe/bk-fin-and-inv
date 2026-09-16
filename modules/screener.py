@@ -50,6 +50,9 @@ def run_screener(
     max_workers: int = _DEFAULT_MAX_WORKERS,
     use_fast_screen: bool = True,
     fast_screen_margin: int = _DEFAULT_FAST_SCREEN_MARGIN,
+    on_ticker_processed: Callable[[str, dict], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
+    on_total_known: Callable[[int], None] | None = None,
 ) -> pd.DataFrame:
     """Run the stock screener across the selected universe.
 
@@ -82,6 +85,24 @@ def run_screener(
         A ticker passes to full analysis if its normalized technical subscore
         ≥ ``min_score - fast_screen_margin``.  Widen this margin to reduce
         false negatives; the default of 15 is deliberately conservative.
+    on_ticker_processed:
+        Optional callable invoked after each ticker finishes processing with
+        ``(ticker, counts)`` where ``counts`` is a dict containing
+        ``screened``, ``total``, ``qualified``, ``fast_filtered``,
+        ``fully_analyzed`` and ``failed_count``. Used by callers (e.g. the
+        FastAPI screener route) that need richer incremental progress than
+        the single-float ``progress_callback``.
+    stop_check:
+        Optional callable returning ``True`` once processing should stop
+        early (e.g. a user-requested cancellation). Checked before each
+        ticker starts and between completed futures; when triggered, the
+        in-progress thread pool is shut down without waiting for pending
+        futures and the function returns the partial results gathered so
+        far with ``results.attrs["stopped"] = True``.
+    on_total_known:
+        Optional callable invoked once with the resolved ticker-universe
+        size as soon as it is known (before any ticker is processed), so
+        callers can surface an accurate progress denominator immediately.
     """
     try:
         tickers = _get_tickers(universe, custom_tickers)
@@ -92,6 +113,8 @@ def run_screener(
 
     total = len(tickers)
     logger.info("Scanning %s tickers in universe '%s' (fast_screen=%s, workers=%s)", total, universe, use_fast_screen, max_workers)
+    if on_total_known:
+        on_total_known(total)
 
     fast_screen_threshold = min_score - fast_screen_margin  # normalized 0-100
 
@@ -105,6 +128,8 @@ def run_screener(
 
     def _process_ticker(ticker: str) -> None:
         nonlocal fast_filtered_count, fully_analyzed_count, processed_count
+        if stop_check is not None and stop_check():
+            return
         try:
             if use_fast_screen:
                 fast_score, err = fast_screen_score(ticker)
@@ -154,12 +179,27 @@ def run_screener(
             with _lock:
                 processed_count += 1
                 pct_done = processed_count / total
+                snapshot = {
+                    "screened": processed_count,
+                    "total": total,
+                    "qualified": len(rows),
+                    "fast_filtered": fast_filtered_count,
+                    "fully_analyzed": fully_analyzed_count,
+                    "failed_count": len(failed_tickers),
+                }
             if progress_callback:
                 progress_callback(pct_done)
+            if on_ticker_processed:
+                on_ticker_processed(ticker, snapshot)
 
+    stopped = False
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_process_ticker, t): t for t in tickers}
         for future in concurrent.futures.as_completed(futures):
+            if stop_check is not None and stop_check():
+                stopped = True
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
             try:
                 future.result()
             except Exception as exc:
@@ -171,6 +211,7 @@ def run_screener(
     else:
         results = pd.DataFrame(rows).sort_values("Score", ascending=False).head(max_results).reset_index(drop=True)
 
+    results.attrs["stopped"] = stopped
     results.attrs["source_ticker_count"] = total
     results.attrs["qualified_count"] = len(rows)
     results.attrs["universe"] = universe

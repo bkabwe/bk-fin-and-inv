@@ -4,7 +4,6 @@ import threading
 import time
 from dataclasses import dataclass
 
-import numpy as np
 import pandas as pd
 
 from modules.data_fetcher import get_stock_data
@@ -245,6 +244,7 @@ def _cross_history(close: pd.Series, ticker: str) -> tuple[int, int, float | Non
 
     golden_idx = list(merged.loc[golden].index)
     death_idx = list(merged.loc[death].index)
+    _ = death_idx  # kept for symmetry with golden_idx; not needed beyond the count below
 
     favorable = 0
     total_eval = 0
