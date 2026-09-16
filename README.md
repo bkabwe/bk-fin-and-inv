@@ -437,5 +437,8 @@ Returns the full predictions list, optionally filtered by `status`
 ### Storage
 Predictions are persisted to `data/predictions.json` using the same
 atomic-write pattern (tempfile + `os.replace`) used by the portfolio and
-watchlist modules.  The file is excluded from git via `.gitignore`
-(`data/*.json`).
+watchlist modules. Unlike other `data/*.json` files (which hold personal
+portfolio/watchlist data and stay untracked), `data/predictions.json` is
+explicitly un-ignored in `.gitignore` and is committed back to the repository
+by the `scan-email-*` and `grading-report-*` GitHub Actions workflows after
+each run, so prediction history survives across ephemeral CI filesystems.

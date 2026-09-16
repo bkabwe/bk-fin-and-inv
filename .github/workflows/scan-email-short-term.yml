@@ -7,7 +7,11 @@ on:
     - cron: '0 9 * * 1'
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: scan-email-short-term
+  cancel-in-progress: false
 
 env:
   PYTHON_VERSION: '3.11'
@@ -36,3 +40,23 @@ jobs:
         run: pip install -r requirements.txt
       - name: Send short-term scan email report
         run: python scripts/scan_email_report.py --horizon short_term
+      - name: Persist prediction tracker state
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain -- data/predictions.json)" ]; then
+            echo "No changes to data/predictions.json"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/predictions.json
+          git commit -m "chore: update prediction tracker state [skip ci]"
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected, rebasing onto latest and retrying ($attempt/3)"
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase "origin/${GITHUB_REF_NAME}"
+          done
+          git push

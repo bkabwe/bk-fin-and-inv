@@ -1,7 +1,10 @@
 """Prediction Tracker — persist price projections and resolve them after their target date.
 
 Uses the same atomic-JSON-write pattern as modules/portfolio.py.
-Storage: data/predictions.json (excluded from git via .gitignore data/*.json).
+Storage: data/predictions.json. Unlike other data/*.json files, this one is
+explicitly un-ignored in .gitignore and committed back by CI (see the
+scan-email-* / grading-report-* workflows) so history survives across
+ephemeral workflow filesystems.
 """
 from __future__ import annotations
 
@@ -417,4 +420,86 @@ def get_summary_stats() -> dict:
         "by_horizon": {h: _stats(v) for h, v in horizons.items()},
         "by_source": {s: _stats(v) for s, v in sources.items()},
         "by_confidence": {c: _stats(v) for c, v in confidences.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API — score-vs-outcome validation
+# ---------------------------------------------------------------------------
+
+def _pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
+    """Pearson correlation coefficient. Returns None if undefined (no variance)."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    denom = (var_x * var_y) ** 0.5
+    if denom <= 1e-12:
+        return None
+    return cov / denom
+
+
+def _score_ic_stats(subset: list[dict], min_samples: int) -> dict:
+    """Information coefficient + top/bottom-third precision for one subset."""
+    n = len(subset)
+    if n < min_samples:
+        return {
+            "count": n,
+            "information_coefficient": None,
+            "precision_at_top_third": None,
+            "precision_at_bottom_third": None,
+        }
+
+    scores = [float(r["score"]) for r in subset]
+    returns = [float(r["actual_return_pct"]) for r in subset]
+    ic = _pearson_correlation(scores, returns)
+
+    ordered = sorted(subset, key=lambda r: float(r["score"]), reverse=True)
+    third = max(1, n // 3)
+    top, bottom = ordered[:third], ordered[-third:]
+
+    def _hit_rate(rows: list[dict]) -> float | None:
+        return round(sum(1 for r in rows if r.get("hit_target")) / len(rows) * 100, 1) if rows else None
+
+    return {
+        "count": n,
+        "information_coefficient": round(ic, 4) if ic is not None else None,
+        "precision_at_top_third": _hit_rate(top),
+        "precision_at_bottom_third": _hit_rate(bottom),
+    }
+
+
+def compute_score_validation_stats(min_samples: int = 5) -> dict:
+    """Correlate recorded composite scores (analyze_stock's 0-100 score) against
+    realized forward returns, once predictions are resolved.
+
+    This closes the validation loop flagged in the architecture review: the
+    composite score is recorded at scan time (see record_prediction) but was
+    never checked against what actually happened afterward. Reports:
+      - information_coefficient: Pearson correlation between the recorded
+        score and the realized return_pct (positive => higher scores tend to
+        precede better outcomes).
+      - precision_at_top_third / precision_at_bottom_third: the price-target
+        hit rate for the highest- and lowest-scored thirds, so a skewed
+        distribution doesn't hide a genuinely useful (or useless) score.
+
+    Returns {"overall": {...}, "by_horizon": {horizon: {...}}}. Any bucket
+    with fewer than `min_samples` resolved predictions returns None values
+    rather than a misleadingly precise statistic from a tiny sample.
+    """
+    records = _load_all()
+    resolved = [
+        r
+        for r in records
+        if r.get("status") == "resolved" and r.get("score") is not None and r.get("actual_return_pct") is not None
+    ]
+
+    by_horizon = {h: _score_ic_stats([r for r in resolved if r.get("horizon") == h], min_samples) for h in HORIZON_DAYS}
+    return {
+        "overall": _score_ic_stats(resolved, min_samples),
+        "by_horizon": by_horizon,
     }
