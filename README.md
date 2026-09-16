@@ -248,6 +248,11 @@ request:
   flake8-bugbear, and flake8-simplify — still not full style/complexity
   linting), then `frontend/`'s `tsc --noEmit` type-check and `npm test`
   (Vitest).
+- **typecheck**: `mypy` (config in `pyproject.toml`), scoped to `modules/`.
+  This job is advisory only (`continue-on-error: true`) and will not fail a
+  PR — it surfaces type issues incrementally as coverage improves. It runs
+  on Python 3.12 (rather than the `PYTHON_VERSION` used by `test`/`lint`)
+  because numpy's bundled type stubs need 3.12+ to parse.
 
 Separately, `.github/workflows/train-lightgbm-batch.yml`,
 `scan-email-short-term.yml`, `scan-email-medium-term.yml`,

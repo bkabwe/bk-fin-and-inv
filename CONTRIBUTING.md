@@ -39,7 +39,17 @@ three requirements files (`requirements.txt`, `requirements-workflows.txt`,
    incrementally, so also skim `ruff check .` output for anything relevant
    to your change even if the CI gate doesn't cover it yet.
 
-3. **If you changed `frontend/`**, also run:
+3. **Type-check `modules/` you touched** (optional but encouraged):
+   ```bash
+   pip install mypy pandas-stubs types-requests
+   mypy
+   ```
+   Uses the `[tool.mypy]` config in `pyproject.toml`. CI runs this as an
+   advisory, non-blocking job (`continue-on-error: true`) — it won't fail
+   your PR, but please don't add new mypy errors on lines you touch, and
+   fixing pre-existing ones nearby is welcome.
+
+4. **If you changed `frontend/`**, also run:
    ```bash
    cd frontend
    npx tsc --noEmit
@@ -47,24 +57,25 @@ three requirements files (`requirements.txt`, `requirements-workflows.txt`,
    npm run build
    ```
 
-4. **If you changed `api/`**, make sure `requirements-api.txt` still installs
+5. **If you changed `api/`**, make sure `requirements-api.txt` still installs
    cleanly and the app imports without the Streamlit UI stack (the FastAPI
    backend and Celery workers are not supposed to require `streamlit`).
 
-5. **Pin new dependencies.** `requirements.txt`, `requirements-workflows.txt`,
+6. **Pin new dependencies.** `requirements.txt`, `requirements-workflows.txt`,
    and `requirements-api.txt` use exact `==` pins. If you add a new
    dependency, pin it to the version you tested against and verify the full
    test suite still passes with that pin installed in a clean virtualenv.
 
-6. **Scan for secrets** before committing if you touched anything that could
+7. **Scan for secrets** before committing if you touched anything that could
    plausibly contain credentials (env files, workflow YAML, API client code).
 
 ## CI
 
 `.github/workflows/ci.yml` runs on every push to `main` and every pull
-request (`test` + `lint` jobs — see
+request (`test`, `lint`, and `typecheck` jobs — see
 [README.md#testing--ci](README.md#testing--ci) for details). PRs are
-expected to pass CI before merge.
+expected to pass the `test` and `lint` jobs before merge; `typecheck` is
+advisory and never blocks merge.
 
 ## Code review
 

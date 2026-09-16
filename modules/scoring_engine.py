@@ -495,7 +495,7 @@ def _garch_confidence_from_returns(current_price: float, log_returns: np.ndarray
     if not ARCH_AVAILABLE or len(log_returns) < 60 or current_price <= 0:
         return None, None
     try:
-        model = arch_model(log_returns * 100, vol="Garch", p=1, q=1, rescale=False)
+        model = arch_model(log_returns * 100, vol="GARCH", p=1, q=1, rescale=False)
         fit = model.fit(disp="off")
         fcast = fit.forecast(horizon=max(horizon_days, 1), reindex=False)
         var = float(fcast.variance.values[-1, min(horizon_days - 1, fcast.variance.shape[1] - 1)])
