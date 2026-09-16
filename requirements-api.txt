@@ -4,3 +4,4 @@ celery[redis]
 redis
 pydantic>=2.0
 python-dotenv
+httpx

@@ -107,5 +107,64 @@ class SentimentAnalysisTests(unittest.TestCase):
         self.assertEqual([row["label"] for row in result["headlines"]], ["Neutral", "Neutral"])
 
 
+class FinbertPipelineLoaderTests(unittest.TestCase):
+    """Exercises `_load_finbert_pipeline` itself (unmocked), rather than
+    stubbing it out as the tests in `SentimentAnalysisTests` do."""
+
+    @classmethod
+    def setUpClass(cls):
+        # `transformers` exposes optional-backend attributes (like `pipeline`)
+        # via a self-replacing lazy module: the *first* real access to
+        # `transformers.pipeline` swaps `sys.modules["transformers"]` for a
+        # new, stabilized module object. If `patch("transformers.pipeline", ...)`
+        # runs before that first access, it patches the soon-to-be-discarded
+        # pre-swap object, so a later `from transformers import pipeline`
+        # (resolved against the new, swapped-in module) never sees the patch.
+        # Force that one-time swap here, before any test below patches it.
+        import transformers
+
+        transformers.pipeline
+
+    def setUp(self):
+        self.sentiment_analysis = _load_sentiment_analysis_module()
+        # `_load_finbert_pipeline` is wrapped in `cache_resource` (a
+        # `st.cache_resource`/`lru_cache(maxsize=1)` singleton), so its result
+        # from an earlier test would otherwise leak into this one. Clear
+        # before and after so this test class doesn't affect, or get affected
+        # by, other tests that exercise `analyze_sentiment`.
+        self._clear_finbert_cache()
+        self.addCleanup(self._clear_finbert_cache)
+
+    def _clear_finbert_cache(self):
+        loader = self.sentiment_analysis._load_finbert_pipeline
+        if hasattr(loader, "clear"):
+            loader.clear()
+        elif hasattr(loader, "cache_clear"):
+            loader.cache_clear()
+
+    def test_real_load_failure_returns_none(self):
+        # Let `_load_finbert_pipeline` run for real; only the underlying
+        # `transformers.pipeline` constructor is forced to fail, exercising
+        # the actual try/except fallback path instead of a mocked loader.
+        with patch("transformers.pipeline", side_effect=RuntimeError("model download failed")) as pipeline_ctor:
+            result = self.sentiment_analysis._load_finbert_pipeline()
+
+        self.assertIsNone(result)
+        pipeline_ctor.assert_called_once()
+
+    def test_successful_load_is_reused_as_a_singleton(self):
+        # A successful load should only construct the pipeline once; the
+        # second call must reuse the cached instance rather than re-invoking
+        # `transformers.pipeline` again.
+        fake_pipeline = Mock(name="finbert_pipeline")
+        with patch("transformers.pipeline", return_value=fake_pipeline) as pipeline_ctor:
+            first = self.sentiment_analysis._load_finbert_pipeline()
+            second = self.sentiment_analysis._load_finbert_pipeline()
+
+        pipeline_ctor.assert_called_once()
+        self.assertIs(first, fake_pipeline)
+        self.assertIs(second, fake_pipeline)
+
+
 if __name__ == "__main__":
     unittest.main()
