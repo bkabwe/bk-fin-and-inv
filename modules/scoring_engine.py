@@ -23,6 +23,7 @@ from modules.lightgbm_batch import (
     fetch_live_manifest,
     get_batch_models_for_ticker,
     load_return_model_batch_from_urls,
+    shard_asset_urls_from_manifest,
 )
 from modules.logger import get_logger
 from modules.longterm_analysis import analyze_longterm_technical_score
@@ -411,14 +412,40 @@ def _load_live_lightgbm_batch(asset_urls: tuple[str, ...]) -> dict:
 
 
 @cache_data(ttl=3600)
+def _load_live_lightgbm_shard_batch(asset_urls: tuple[str, ...]) -> dict:
+    try:
+        batch = load_return_model_batch_from_urls(list(asset_urls))
+    except Exception as exc:
+        logger.warning("Live LightGBM shard batch unavailable from %s: %s", asset_urls, exc)
+        return {}
+    return batch if isinstance(batch, dict) else {}
+
+
+@cache_data(ttl=3600)
 def _load_live_lightgbm_models(ticker: str) -> dict[int, object]:
     if not LIGHTGBM_AVAILABLE:
         return {}
+    clean_ticker = str(ticker or "").strip().upper()
     manifest = _load_live_lightgbm_manifest()
+    # Prefer a ticker-scoped storage shard when the manifest publishes
+    # ticker-partitioned batch assets: this lets a single-ticker lookup (the
+    # common case for interactive app/API scoring) download only its own
+    # ~1/N slice of the trained batch instead of the full combined asset.
+    # Bulk consumers that need every ticker at once (the scheduled scan
+    # scripts) preload and inject the full combined batch via
+    # `_load_live_lightgbm_batch` and patch this shard loader to return {},
+    # so they fall straight through to the already-loaded combined batch
+    # below instead of re-downloading shard-by-shard.
+    shard_asset_urls = tuple(shard_asset_urls_from_manifest(manifest, clean_ticker))
+    if shard_asset_urls:
+        shard_batch = _load_live_lightgbm_shard_batch(shard_asset_urls)
+        models = get_batch_models_for_ticker(shard_batch, clean_ticker, horizons=(30, 180))
+        if models:
+            return models
     batch_asset_urls = tuple(batch_asset_urls_from_manifest(manifest))
     if batch_asset_urls:
         batch = _load_live_lightgbm_batch(batch_asset_urls)
-        models = get_batch_models_for_ticker(batch, ticker, horizons=(30, 180))
+        models = get_batch_models_for_ticker(batch, clean_ticker, horizons=(30, 180))
         if models:
             return models
     if LIGHTGBM_BATCH_LOCAL_PATH.exists():
@@ -426,12 +453,12 @@ def _load_live_lightgbm_models(ticker: str) -> dict[int, object]:
             from modules.lightgbm_batch import load_return_model_batch
 
             batch = load_return_model_batch(LIGHTGBM_BATCH_LOCAL_PATH)
-            models = get_batch_models_for_ticker(batch, ticker, horizons=(30, 180))
+            models = get_batch_models_for_ticker(batch, clean_ticker, horizons=(30, 180))
             if models:
                 return models
         except Exception as exc:
             logger.warning("Local LightGBM batch load failed: %s", exc)
-    return load_return_models(LIGHTGBM_LIVE_MODEL_DIR / str(ticker).upper(), horizons=(30, 180))
+    return load_return_models(LIGHTGBM_LIVE_MODEL_DIR / clean_ticker, horizons=(30, 180))
 
 
 def _live_lightgbm_price_projections(

@@ -305,7 +305,9 @@ def _write_partial_shard(
     joblib.dump(payload, path)
 
 
-def _reduce_args(partial_dir: Path, tmpdir: Path, sanity_tickers: tuple[str, ...]) -> argparse.Namespace:
+def _reduce_args(
+    partial_dir: Path, tmpdir: Path, sanity_tickers: tuple[str, ...], *, scan_shard_count: int = 1
+) -> argparse.Namespace:
     return argparse.Namespace(
         partial_dir=str(partial_dir),
         macro_file=None,
@@ -316,6 +318,7 @@ def _reduce_args(partial_dir: Path, tmpdir: Path, sanity_tickers: tuple[str, ...
         min_rows_per_horizon=50,
         max_stale_cycles=4,
         sanity_tickers=list(sanity_tickers),
+        scan_shard_count=scan_shard_count,
         promote=False,
     )
 
@@ -502,6 +505,135 @@ class ReduceAndValidatePreviousBatchMemoryTests(unittest.TestCase):
             self.assertEqual(set(live_batch["models"].keys()), {"AAA", "BBB", "CCC"})
 
 
+class ScanShardWritingTests(unittest.TestCase):
+    """Tests for the ticker-partitioned scan-shard storage feature.
+
+    `reduce_and_validate` promotes the live batch as usual, but when
+    `scan_shard_count > 1` it additionally writes out ticker-partitioned
+    "scan shard" files so a scan/scoring consumer can download only the
+    slice of tickers it needs instead of the full combined batch.
+    """
+
+    def test_write_scan_shards_returns_no_files_when_shard_count_is_one(self):
+        with tempfile.TemporaryDirectory() as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            live_models = {"AAA": {30: object(), 180: object()}, "BBB": {30: object(), 180: object()}}
+            live_meta = {"AAA": {"exchange": "XNAS"}, "BBB": {"exchange": "XNAS"}}
+
+            ticker_shards, shard_files = pipeline._write_scan_shards(
+                live_models,
+                live_meta,
+                batch_id="20260915T172900Z",
+                created_at="2026-09-15T17:29:00Z",
+                scan_shard_count=1,
+                output_dir=tmpdir / "scan_shards",
+            )
+
+            self.assertEqual(ticker_shards, {"AAA": 0, "BBB": 0})
+            self.assertEqual(shard_files, [])
+            self.assertFalse((tmpdir / "scan_shards").exists())
+
+    def test_write_scan_shards_partitions_tickers_across_shard_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            live_models = {
+                "AAA": {30: object(), 180: object()},
+                "BBB": {30: object(), 180: object()},
+                "CCC": {30: object(), 180: object()},
+            }
+            live_meta = {ticker: {"exchange": "XNAS"} for ticker in live_models}
+            output_dir = tmpdir / "scan_shards"
+
+            ticker_shards, shard_files = pipeline._write_scan_shards(
+                live_models,
+                live_meta,
+                batch_id="20260915T172900Z",
+                created_at="2026-09-15T17:29:00Z",
+                scan_shard_count=2,
+                output_dir=output_dir,
+            )
+
+            self.assertEqual(len(shard_files), 2)
+            self.assertEqual({index for index, _ in shard_files}, {0, 1})
+            all_shard_tickers: set[str] = set()
+            for shard_index, shard_path in shard_files:
+                self.assertTrue(shard_path.exists())
+                shard_batch = pipeline.load_return_model_batch(shard_path)
+                shard_tickers = set(shard_batch["models"].keys())
+                all_shard_tickers |= shard_tickers
+                for ticker in shard_tickers:
+                    self.assertEqual(ticker_shards[ticker], shard_index)
+            self.assertEqual(all_shard_tickers, set(live_models.keys()))
+
+    def test_promote_outputs_uploads_each_shard_under_its_own_asset_name_and_cleans_up(self):
+        client = MagicMock()
+        client.ensure_release.return_value = {"id": 99}
+        with tempfile.TemporaryDirectory() as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            batch_path = tmpdir / "batch.joblib"
+            batch_path.write_bytes(b"combined batch")
+            manifest_path = tmpdir / "manifest.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            shard0_path = tmpdir / "scan_shard_000.joblib"
+            shard0_path.write_bytes(b"shard 0")
+            shard1_path = tmpdir / "scan_shard_001.joblib"
+            shard1_path.write_bytes(b"shard 1")
+
+            args = argparse.Namespace(repository="bkabwe/bk-fin-and-inv")
+            with patch.object(pipeline, "GitHubReleaseClient", return_value=client), patch.dict(
+                "os.environ", {"GITHUB_TOKEN": "token"}
+            ):
+                pipeline._promote_outputs(
+                    args,
+                    batch_path,
+                    manifest_path,
+                    "lightgbm-batch-20260915T172900Z",
+                    shard_files=[(0, shard0_path), (1, shard1_path)],
+                    scan_shard_count=2,
+                )
+
+            uploaded_names = [call_args.args[2] for call_args in client.upload_asset.call_args_list]
+            self.assertIn(pipeline.DEFAULT_BATCH_ASSET_NAME, uploaded_names)
+            self.assertIn("lightgbm_return_model_batch.shard000of002.joblib", uploaded_names)
+            self.assertIn("lightgbm_return_model_batch.shard001of002.joblib", uploaded_names)
+            self.assertIn(pipeline.DEFAULT_LIVE_MANIFEST_ASSET_NAME, uploaded_names)
+            # Shard files are temporary local artifacts and must be cleaned up
+            # after their upload, same as the byte-range split parts.
+            self.assertFalse(shard0_path.exists())
+            self.assertFalse(shard1_path.exists())
+            # The combined batch and manifest files are not shard-specific
+            # temporary files and must be left untouched.
+            self.assertTrue(batch_path.exists())
+            self.assertTrue(manifest_path.exists())
+
+    def test_reduce_and_validate_writes_shard_manifest_when_scan_shard_count_greater_than_one(self):
+        with tempfile.TemporaryDirectory() as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            partial_dir = tmpdir / "partials"
+            partial_dir.mkdir()
+            _write_partial_shard(partial_dir / "shard-0.joblib", ticker="AAA")
+            _write_partial_shard(partial_dir / "shard-1.joblib", ticker="BBB")
+
+            args = _reduce_args(partial_dir, tmpdir, sanity_tickers=("AAA",), scan_shard_count=2)
+
+            with (
+                patch.object(pipeline, "_smoke_test_predictions"),
+                patch.object(pipeline, "fetch_live_manifest", return_value={}),
+            ):
+                result = pipeline.reduce_and_validate(args)
+
+            self.assertEqual(result, 0)
+            manifest = json.loads(Path(args.output_manifest).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["latest_batch"]["shard_count"], 2)
+            self.assertEqual(len(manifest["latest_batch"]["shards"]), 2)
+            self.assertIn("shard_index", manifest["tickers"]["AAA"])
+            self.assertIn("shard_index", manifest["tickers"]["BBB"])
+
+            scan_shards_dir = tmpdir / "scan_shards"
+            shard_files = sorted(scan_shards_dir.glob("*.joblib"))
+            self.assertEqual(len(shard_files), 2)
+
+
 class BatchAssetSplittingTests(unittest.TestCase):
     """Regression tests for GitHub's 2 GiB per-release-asset limit.
 
@@ -547,6 +679,20 @@ class BatchAssetSplittingTests(unittest.TestCase):
             client.upload_asset.assert_called_once_with({"id": 1}, batch_path, pipeline.DEFAULT_BATCH_ASSET_NAME)
             # The original (un-split) file must still exist and be untouched.
             self.assertTrue(batch_path.exists())
+
+    def test_upload_batch_asset_uses_custom_base_asset_name_for_shards(self):
+        client = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shard_path = Path(tmpdir) / "scan_shard_000.joblib"
+            shard_path.write_bytes(b"shard contents")
+
+            pipeline._upload_batch_asset(
+                client, {"id": 1}, shard_path, base_asset_name="lightgbm_return_model_batch.shard000of002.joblib"
+            )
+
+            client.upload_asset.assert_called_once_with(
+                {"id": 1}, shard_path, "lightgbm_return_model_batch.shard000of002.joblib"
+            )
 
     def test_upload_batch_asset_splits_and_cleans_up_parts_for_large_files(self):
         client = MagicMock()

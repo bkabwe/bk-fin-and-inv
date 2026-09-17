@@ -46,6 +46,62 @@ def batch_asset_part_count(size_bytes: int, *, chunk_size: int = BATCH_ASSET_SPL
     return max(1, -(-size_bytes // chunk_size))
 
 
+def batch_shard_asset_name(base_name: str, shard_index: int, shard_count: int) -> str:
+    """Filename for one ticker-partitioned storage shard of the combined batch.
+
+    Ticker-partitioned shards let a scan/scoring consumer download only the
+    slice of tickers it needs instead of the full combined batch asset (see
+    `assign_ticker_shards`/`partition_batch_by_shard`). This is a distinct,
+    orthogonal split from `batch_asset_part_name`'s byte-range parts, which
+    exist solely to stay under GitHub's 2 GiB per-asset limit -- a shard can
+    itself still be split into byte-range parts if it happens to exceed that
+    limit. Returns `base_name` unchanged when there is only one shard.
+    """
+    clean_name = str(base_name).strip()
+    if int(shard_count) <= 1:
+        return clean_name
+    path = Path(clean_name)
+    return f"{path.stem}.shard{int(shard_index):03d}of{int(shard_count):03d}{path.suffix}"
+
+
+def assign_ticker_shards(tickers: list[str] | set[str], shard_count: int) -> dict[str, int]:
+    """Deterministically assign each ticker to a storage shard index.
+
+    Tickers are sorted alphabetically before distributing round-robin
+    (`idx % shard_count`) so the assignment depends only on the final live
+    ticker set -- not discovery/training order -- and stays evenly balanced
+    as tickers are added or dropped between promotions.
+    """
+    shard_count = max(1, int(shard_count))
+    ordered = sorted({str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()})
+    return {ticker: idx % shard_count for idx, ticker in enumerate(ordered)}
+
+
+def partition_batch_by_shard(
+    models: dict[str, dict[int, object]],
+    metadata: dict[str, dict[str, Any]],
+    ticker_shards: dict[str, int],
+    shard_count: int,
+) -> dict[int, tuple[dict[str, dict[int, object]], dict[str, dict[str, Any]]]]:
+    """Split a combined model/metadata set into per-shard subsets.
+
+    Each shard's dicts reference the same model/metadata objects as the
+    combined set (no copying), so partitioning a multi-GB batch does not
+    meaningfully increase peak memory.
+    """
+    shard_count = max(1, int(shard_count))
+    shards: dict[int, tuple[dict[str, dict[int, object]], dict[str, dict[str, Any]]]] = {
+        index: ({}, {}) for index in range(shard_count)
+    }
+    for ticker, ticker_models in models.items():
+        shard_index = int(ticker_shards.get(ticker, 0)) % shard_count
+        shard_models, shard_meta = shards[shard_index]
+        shard_models[ticker] = ticker_models
+        if ticker in metadata:
+            shard_meta[ticker] = metadata[ticker]
+    return shards
+
+
 def resolve_release_repository(repository: str | None = None) -> str:
     return str(
         repository
@@ -275,17 +331,50 @@ def build_live_manifest(
     created_at: str,
     training_metadata: dict[str, dict[str, Any]],
     asset_part_count: int = 1,
+    scan_shard_count: int = 1,
+    ticker_shards: dict[str, int] | None = None,
+    shard_asset_part_counts: dict[int, int] | None = None,
 ) -> dict[str, Any]:
     part_count = max(1, int(asset_part_count))
     batch_asset_urls = [
         build_release_asset_url(repository, batch_release_tag, batch_asset_part_name(batch_asset_name, index, part_count))
         for index in range(1, part_count + 1)
     ]
+
+    # Ticker-partitioned storage shards (distinct from the byte-range parts
+    # above) let a scan/scoring consumer download only the slice of tickers
+    # it needs instead of the full combined batch asset. `shards` is only
+    # populated when the caller actually promoted more than one shard;
+    # otherwise the manifest looks exactly as it did before this feature.
+    shard_count = max(1, int(scan_shard_count))
+    ticker_shards = ticker_shards or {}
+    shard_asset_part_counts = shard_asset_part_counts or {}
+    shards: list[dict[str, Any]] = []
+    if shard_count > 1:
+        for shard_index in range(shard_count):
+            shard_asset_name = batch_shard_asset_name(batch_asset_name, shard_index, shard_count)
+            shard_part_count = max(1, int(shard_asset_part_counts.get(shard_index, 1)))
+            shard_urls = [
+                build_release_asset_url(
+                    repository, batch_release_tag, batch_asset_part_name(shard_asset_name, index, shard_part_count)
+                )
+                for index in range(1, shard_part_count + 1)
+            ]
+            shards.append(
+                {
+                    "shard_index": shard_index,
+                    "asset_name": shard_asset_name,
+                    "asset_count": shard_part_count,
+                    "asset_urls": shard_urls,
+                }
+            )
+
     tickers: dict[str, dict[str, Any]] = {}
     for ticker, meta in sorted(training_metadata.items()):
         row_counts = {str(horizon): int(value) for horizon, value in dict(meta.get("row_counts") or {}).items()}
         trained_horizons = sorted(int(value) for value in (meta.get("trained_horizons") or LIVE_RETURN_HORIZONS))
-        tickers[str(ticker).strip().upper()] = {
+        clean_ticker = str(ticker).strip().upper()
+        entry: dict[str, Any] = {
             "exchange": meta.get("exchange"),
             "last_trained": meta.get("last_trained"),
             "cycles_since_training": int(meta.get("cycles_since_training") or 0),
@@ -293,17 +382,26 @@ def build_live_manifest(
             "row_counts": row_counts,
             "batch_id": str(batch_id).strip(),
         }
+        if shards and clean_ticker in ticker_shards:
+            entry["shard_index"] = int(ticker_shards[clean_ticker])
+        tickers[clean_ticker] = entry
+
+    latest_batch: dict[str, Any] = {
+        "batch_id": str(batch_id).strip(),
+        "release_tag": str(batch_release_tag).strip(),
+        "asset_name": str(batch_asset_name).strip(),
+        "asset_url": batch_asset_urls[0],
+        "asset_count": part_count,
+        "asset_urls": batch_asset_urls,
+    }
+    if shards:
+        latest_batch["shard_count"] = shard_count
+        latest_batch["shards"] = shards
+
     return {
         "schema_version": LIGHTGBM_BATCH_SCHEMA_VERSION,
         "generated_at": str(created_at).strip(),
-        "latest_batch": {
-            "batch_id": str(batch_id).strip(),
-            "release_tag": str(batch_release_tag).strip(),
-            "asset_name": str(batch_asset_name).strip(),
-            "asset_url": batch_asset_urls[0],
-            "asset_count": part_count,
-            "asset_urls": batch_asset_urls,
-        },
+        "latest_batch": latest_batch,
         "tickers": tickers,
     }
 
@@ -323,3 +421,61 @@ def batch_asset_urls_from_manifest(manifest: dict[str, Any] | None) -> list[str]
             return cleaned
     single = str(latest_batch.get("asset_url") or "").strip()
     return [single] if single else []
+
+
+def shard_asset_urls_from_manifest(manifest: dict[str, Any] | None, ticker: str) -> list[str]:
+    """Return the release asset URL(s) for the ticker-partitioned shard holding `ticker`.
+
+    Returns an empty list when the manifest predates shard partitioning, was
+    promoted with a single shard, or does not list the requested ticker --
+    callers should fall back to `batch_asset_urls_from_manifest()` (the full
+    combined batch) in that case.
+    """
+    if not isinstance(manifest, dict):
+        return []
+    clean_ticker = str(ticker or "").strip().upper()
+    if not clean_ticker:
+        return []
+    ticker_entry = (manifest.get("tickers") or {}).get(clean_ticker) or {}
+    shard_index = ticker_entry.get("shard_index")
+    if shard_index is None:
+        return []
+    shards = ((manifest.get("latest_batch") or {}).get("shards")) or []
+    for shard in shards:
+        if not isinstance(shard, dict):
+            continue
+        if int(shard.get("shard_index", -1)) != int(shard_index):
+            continue
+        urls = shard.get("asset_urls")
+        if isinstance(urls, list) and urls:
+            cleaned = [str(url).strip() for url in urls if str(url).strip()]
+            if cleaned:
+                return cleaned
+    return []
+
+
+def shard_asset_urls_by_index(manifest: dict[str, Any] | None, shard_index: int) -> list[str]:
+    """Return the release asset URL(s) for the ticker-partitioned shard at `shard_index`.
+
+    Unlike `shard_asset_urls_from_manifest`, this looks up a shard directly by
+    its index rather than via a specific ticker's assignment, which is useful
+    for consumers (e.g. a scan-shard job) that already know which shard they
+    own and want to fetch its batch asset without iterating tickers first.
+    Returns an empty list when the manifest predates shard partitioning or
+    does not contain the requested shard index -- callers should fall back to
+    `batch_asset_urls_from_manifest()` (the full combined batch) in that case.
+    """
+    if not isinstance(manifest, dict):
+        return []
+    shards = ((manifest.get("latest_batch") or {}).get("shards")) or []
+    for shard in shards:
+        if not isinstance(shard, dict):
+            continue
+        if int(shard.get("shard_index", -1)) != int(shard_index):
+            continue
+        urls = shard.get("asset_urls")
+        if isinstance(urls, list) and urls:
+            cleaned = [str(url).strip() for url in urls if str(url).strip()]
+            if cleaned:
+                return cleaned
+    return []

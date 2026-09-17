@@ -123,6 +123,125 @@ class LightGBMBatchTests(unittest.TestCase):
 
         self.assertEqual(lightgbm_batch.batch_asset_urls_from_manifest(manifest), ["https://example/one"])
 
+    def test_batch_shard_asset_name_returns_base_name_when_single_shard(self):
+        self.assertEqual(
+            lightgbm_batch.batch_shard_asset_name("lightgbm_return_model_batch.joblib", 0, 1),
+            "lightgbm_return_model_batch.joblib",
+        )
+
+    def test_batch_shard_asset_name_inserts_shard_suffix_before_extension(self):
+        self.assertEqual(
+            lightgbm_batch.batch_shard_asset_name("lightgbm_return_model_batch.joblib", 2, 8),
+            "lightgbm_return_model_batch.shard002of008.joblib",
+        )
+
+    def test_assign_ticker_shards_is_deterministic_and_round_robin(self):
+        shards = lightgbm_batch.assign_ticker_shards(["msft", "aapl", "goog", "tsla"], shard_count=2)
+
+        self.assertEqual(shards, {"AAPL": 0, "GOOG": 1, "MSFT": 0, "TSLA": 1})
+
+    def test_assign_ticker_shards_deduplicates_and_ignores_blank_tickers(self):
+        shards = lightgbm_batch.assign_ticker_shards(["AAPL", "aapl", "  ", ""], shard_count=3)
+
+        self.assertEqual(shards, {"AAPL": 0})
+
+    def test_assign_ticker_shards_with_single_shard_maps_everything_to_zero(self):
+        shards = lightgbm_batch.assign_ticker_shards(["AAPL", "MSFT"], shard_count=1)
+
+        self.assertEqual(shards, {"AAPL": 0, "MSFT": 0})
+
+    def test_partition_batch_by_shard_groups_models_without_copying(self):
+        aapl_models = {30: object(), 180: object()}
+        msft_models = {30: object(), 180: object()}
+        models = {"AAPL": aapl_models, "MSFT": msft_models}
+        metadata = {"AAPL": {"exchange": "XNAS"}, "MSFT": {"exchange": "XNAS"}}
+        ticker_shards = {"AAPL": 0, "MSFT": 1}
+
+        shards = lightgbm_batch.partition_batch_by_shard(models, metadata, ticker_shards, shard_count=2)
+
+        self.assertEqual(set(shards.keys()), {0, 1})
+        shard0_models, shard0_meta = shards[0]
+        shard1_models, shard1_meta = shards[1]
+        self.assertIs(shard0_models["AAPL"], aapl_models)
+        self.assertIs(shard1_models["MSFT"], msft_models)
+        self.assertEqual(set(shard0_models.keys()), {"AAPL"})
+        self.assertEqual(set(shard1_models.keys()), {"MSFT"})
+        self.assertEqual(shard0_meta, {"AAPL": {"exchange": "XNAS"}})
+        self.assertEqual(shard1_meta, {"MSFT": {"exchange": "XNAS"}})
+
+    def test_build_live_manifest_omits_shards_by_default(self):
+        manifest = lightgbm_batch.build_live_manifest(
+            repository="bkabwe/bk-fin-and-inv",
+            batch_id="20260914T000000Z",
+            batch_release_tag="lightgbm-batch-20260914T000000Z",
+            batch_asset_name="lightgbm_return_model_batch.joblib",
+            created_at="2026-09-14T00:00:00Z",
+            training_metadata={"AAPL": {"exchange": "XNAS", "last_trained": "2026-09-14T00:00:00Z"}},
+        )
+
+        self.assertNotIn("shards", manifest["latest_batch"])
+        self.assertNotIn("shard_count", manifest["latest_batch"])
+        self.assertNotIn("shard_index", manifest["tickers"]["AAPL"])
+
+    def test_build_live_manifest_includes_shards_when_scan_shard_count_greater_than_one(self):
+        manifest = lightgbm_batch.build_live_manifest(
+            repository="bkabwe/bk-fin-and-inv",
+            batch_id="20260914T000000Z",
+            batch_release_tag="lightgbm-batch-20260914T000000Z",
+            batch_asset_name="lightgbm_return_model_batch.joblib",
+            created_at="2026-09-14T00:00:00Z",
+            training_metadata={
+                "AAPL": {"exchange": "XNAS", "last_trained": "2026-09-14T00:00:00Z"},
+                "MSFT": {"exchange": "XNAS", "last_trained": "2026-09-14T00:00:00Z"},
+            },
+            scan_shard_count=2,
+            ticker_shards={"AAPL": 0, "MSFT": 1},
+            shard_asset_part_counts={0: 1, 1: 2},
+        )
+
+        latest_batch = manifest["latest_batch"]
+        self.assertEqual(latest_batch["shard_count"], 2)
+        self.assertEqual(len(latest_batch["shards"]), 2)
+        shard0, shard1 = latest_batch["shards"]
+        self.assertEqual(shard0["shard_index"], 0)
+        self.assertEqual(shard0["asset_name"], "lightgbm_return_model_batch.shard000of002.joblib")
+        self.assertEqual(shard0["asset_count"], 1)
+        self.assertEqual(len(shard0["asset_urls"]), 1)
+        self.assertEqual(shard1["shard_index"], 1)
+        self.assertEqual(shard1["asset_count"], 2)
+        self.assertEqual(len(shard1["asset_urls"]), 2)
+        self.assertEqual(manifest["tickers"]["AAPL"]["shard_index"], 0)
+        self.assertEqual(manifest["tickers"]["MSFT"]["shard_index"], 1)
+
+    def test_shard_asset_urls_from_manifest_returns_matching_shard_urls(self):
+        manifest = {
+            "tickers": {"AAPL": {"shard_index": 1}},
+            "latest_batch": {
+                "shards": [
+                    {"shard_index": 0, "asset_urls": ["https://example/shard0"]},
+                    {"shard_index": 1, "asset_urls": ["https://example/shard1"]},
+                ]
+            },
+        }
+
+        self.assertEqual(
+            lightgbm_batch.shard_asset_urls_from_manifest(manifest, "aapl"),
+            ["https://example/shard1"],
+        )
+
+    def test_shard_asset_urls_from_manifest_returns_empty_for_manifest_without_shards(self):
+        manifest = {"latest_batch": {"asset_url": "https://example/batch.joblib"}, "tickers": {}}
+
+        self.assertEqual(lightgbm_batch.shard_asset_urls_from_manifest(manifest, "AAPL"), [])
+
+    def test_shard_asset_urls_from_manifest_returns_empty_for_unknown_ticker(self):
+        manifest = {
+            "tickers": {"AAPL": {"shard_index": 0}},
+            "latest_batch": {"shards": [{"shard_index": 0, "asset_urls": ["https://example/shard0"]}]},
+        }
+
+        self.assertEqual(lightgbm_batch.shard_asset_urls_from_manifest(manifest, "MSFT"), [])
+
     def test_batch_asset_part_count_uses_ceil_division(self):
         self.assertEqual(lightgbm_batch.batch_asset_part_count(0, chunk_size=100), 1)
         self.assertEqual(lightgbm_batch.batch_asset_part_count(100, chunk_size=100), 1)
