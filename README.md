@@ -331,6 +331,21 @@ workflows run `scripts/grading_report.py` to evaluate the exact prior recorded
 scan batch using both point-in-time resolution and max-price-since-scan
 excursion checks.
 
+Shard count is manifest-driven, set by `--scan-shard-count` at promote time
+(`scripts/lightgbm_batch_pipeline.py`'s `DEFAULT_SCAN_SHARD_COUNT`, currently
+16) — a separate concept from `train-lightgbm-batch.yml`'s own `MATRIX_JOBS`
+training-compute parallelism. FRED is fetched once in `discover` and shared
+via artifact, so it's unaffected by shard count. SEC EDGAR fundamentals,
+however, are fetched per-ticker inside every `scan-shard` job, and
+`modules/sec_edgar_client.py` only self-throttles each job's own process to
+`SEC_EDGAR_MAX_REQUESTS_PER_SECOND` (default/max 10 req/s) — it can't
+coordinate across the parallel shards on its own. Each scan workflow's "Scan
+shard" step divides that per-shard cap by the live shard count
+(`10.0 / needs.discover.outputs.shard_count`), the same pattern
+`train-lightgbm-batch.yml`'s `train` job already uses for its own
+`MATRIX_JOBS`, so the *aggregate* SEC EDGAR call rate across all shards stays
+bounded at ~10 req/s regardless of how many shards run concurrently.
+
 ### Workflow-failure alerts
 
 All 5 scheduled workflows (`train-lightgbm-batch.yml`, `scan-email-short-term.yml`,
@@ -399,19 +414,33 @@ The app now includes `modules/lightgbm_model.py` as an explicit Phase 2 candidat
 model module. It predicts **forward return** (not raw price) for the existing
 30/180/720-day horizons using the shared engineered feature table and historical
 close prices. Training/inference are intentionally decoupled via save/load helpers
-so scan-time inference does not require retraining.
+so scan-time inference does not require retraining. LightGBM's own features
+(`modules/feature_engineering.build_feature_table`) already include forward-filled
+SEC EDGAR fundamentals alongside technical indicators and shared FRED macro
+features, so it is not a purely technical model.
 
-Live scoring now uses saved per-ticker LightGBM models in the ensemble for:
-- **30d** with `LIGHTGBM_WEIGHT_30D = 0.15`
-- **180d** with `LIGHTGBM_WEIGHT_180D = 0.08`
-
-Both weights are intentionally below ARIMA/trend parity as a conservative rollout:
-30d has the strongest validation evidence (89 tickers across two disjoint random
-samples, 6 windows/ticker, 100% LightGBM win rate vs ARIMA/trend/naive), while
-180d also won 100% of tickers but on only 30 tickers with 4 windows/ticker and
-higher observed prediction variance. **720d remains intentionally excluded from the
-live ensemble for now** because current validation has only one non-overlapping
+Live scoring now runs a dedicated per-ticker walk-forward backtest at scan time
+for each in-scope horizon (`run_walk_forward(..., horizon=30, evaluate_lightgbm=True)`
+and the same at `horizon=180`) and derives LightGBM's ensemble weight **adaptively**
+from that evidence: `_inverse_rmse_weights()` splits each horizon's weight budget
+across ARIMA/trend/LightGBM in proportion to their inverse walk-forward RMSE,
+instead of reserving a fixed percentage for LightGBM. `LIGHTGBM_MAX_ADAPTIVE_SHARE`
+(50%) caps LightGBM's share of that split so a noisy, small-sample per-ticker
+backtest (a handful of windows) can't crowd out ARIMA/trend entirely; any excess
+above the cap is redistributed back to ARIMA/trend proportionally. When a
+ticker's backtest can't produce a valid `lightgbm_rmse` (e.g. too little
+history), live scoring falls back to the previous fixed weights,
+`LIGHTGBM_WEIGHT_30D = 0.15` and `LIGHTGBM_WEIGHT_180D = 0.08`, which remain in
+the code as that fallback. **720d remains intentionally excluded from the live
+ensemble for now** because current validation has only one non-overlapping
 window per ticker, which is promising but not yet actionable.
+
+Because the 180d backtest needs at least 540 rows of history (a 360-row train
+window + 180-row test window), the live price-projection path now fetches 5
+years of daily history by default (up from 2y) so that backtest can actually
+run instead of silently reporting zero windows; every downstream consumer of
+that history already truncates to its own required window, so the larger
+fetch is safe.
 
 To train and persist the live 30d/180d models for a ticker before scoring:
 
@@ -427,7 +456,8 @@ ensemble behavior for that ticker/horizon.
 `modules/backtester.run_walk_forward()` now supports optional LightGBM RMSE
 evaluation alongside ARIMA and trend over the same rolling windows, for
 validation/decision-gate analysis. The live ensemble now consumes that evidence
-conservatively at 30d/180d only; 720d remains gated off until more natural history
+at 30d/180d only, via its own per-horizon backtest call at each of those two
+horizons (see above); 720d remains gated off until more natural history
 accrues and yields more than one non-overlapping validation window per ticker.
 Because LightGBM is trained as fixed-horizon return models (`30/180/720` days),
 the walk-forward path maps each test window to the closest available horizon

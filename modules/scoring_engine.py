@@ -46,15 +46,27 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 LIGHTGBM_LIVE_MODEL_DIR = _REPO_ROOT / "data" / "lightgbm_return_models"
 LIGHTGBM_BATCH_LOCAL_PATH = _REPO_ROOT / "data" / DEFAULT_BATCH_ASSET_NAME
 
-# Conservative live rollout based on honestly-reported walk-forward evidence:
+# Fixed-weight fallback used only when a per-ticker walk-forward backtest can't
+# produce a valid lightgbm_rmse (e.g. too little history, or the backtest call
+# failed). When real backtest evidence IS available, _projection_model_weights
+# instead derives LightGBM's share adaptively (see LIGHTGBM_MAX_ADAPTIVE_SHARE
+# below) from the same inverse-RMSE evidence used for ARIMA/trend, rather than
+# reserving one of these fixed percentages off the top.
+#
+# Based on honestly-reported walk-forward evidence:
 # - 30d: 89 tickers across two disjoint random samples, 6 windows/ticker, LightGBM beat
-#   ARIMA, trend, and naive on 100% of tickers. Give it a real weight, but still below
-#   ARIMA/trend parity while the model's production track record remains newer.
+#   ARIMA, trend, and naive on 100% of tickers.
 # - 180d: 30 tickers, 4 windows/ticker, LightGBM again beat ARIMA, trend, and naive on
 #   100% of tickers, but with thinner replication and higher prediction variance for some
-#   tickers. Keep the live weight real but smaller than 30d.
+#   tickers.
 LIGHTGBM_WEIGHT_30D = 0.15
 LIGHTGBM_WEIGHT_180D = 0.08
+
+# Even when a live per-ticker backtest shows LightGBM with the lowest RMSE of the
+# triad, cap its adaptive share so a noisy small-sample backtest (a handful of
+# windows per ticker) can't crowd out ARIMA/trend entirely and collapse ensemble
+# diversity onto a single model.
+LIGHTGBM_MAX_ADAPTIVE_SHARE = 0.50
 
 # Fundamental+sentiment point pool in the composite 0-100 score is fixed at 50
 # points, but the split between them shifts as the requested investment
@@ -62,8 +74,9 @@ LIGHTGBM_WEIGHT_180D = 0.08
 # horizons while fundamentals (valuation/balance-sheet/growth quality, which
 # matter more over longer holding periods) pick up the freed-up weight. This
 # mirrors how price-projection ensemble weights already shrink LightGBM's
-# influence from 30d (LIGHTGBM_WEIGHT_30D) to 180d (LIGHTGBM_WEIGHT_180D) to
-# 0 at 720d. ``investment_horizon`` uses the same canonical keys as
+# influence from 30d to 180d to 0 at 720d (see LIGHTGBM_MAX_ADAPTIVE_SHARE and
+# the horizon weight budgets in _projection_model_weights below).
+# ``investment_horizon`` uses the same canonical keys as
 # ``modules.profit_opportunities.HORIZON_SETTINGS``
 # (short_term/medium_term/long_term); omitting it (None) preserves the
 # original flat 30/20 split for backward compatibility with callers that
@@ -312,19 +325,35 @@ def _cap_target(value: float, current_price: float, cap_value: float | None) -> 
     return round(target, 2)
 
 
-def _inverse_rmse_weights(backtest: dict) -> dict[str, float] | None:
+def _inverse_rmse_weights(backtest: dict, *, include_lightgbm: bool = False) -> dict[str, float] | None:
     try:
+        if int(backtest.get("n_windows") or 0) <= 0:
+            return None
         rmses = {
             "arima": float(backtest.get("arima_rmse") or 0),
             "trend": float(backtest.get("trend_rmse") or 0),
         }
-        if int(backtest.get("n_windows") or 0) <= 0:
-            return None
+        if include_lightgbm and _has_lightgbm_backtest_support(backtest):
+            rmses["lightgbm"] = float(backtest.get("lightgbm_rmse") or 0)
         inv = {k: (1.0 / max(v, 1e-9)) for k, v in rmses.items() if v > 0}
         total = sum(inv.values())
         if total <= 0:
             return None
-        return {k: inv[k] / total for k in inv}
+        weights = {k: inv[k] / total for k in inv}
+        if "lightgbm" in weights and weights["lightgbm"] > LIGHTGBM_MAX_ADAPTIVE_SHARE:
+            # Clip LightGBM's share and redistribute the freed weight back to
+            # arima/trend proportionally to their relative inverse-RMSE ratio,
+            # so the excess doesn't just vanish or collapse to a 50/50 split.
+            excess = weights["lightgbm"] - LIGHTGBM_MAX_ADAPTIVE_SHARE
+            weights["lightgbm"] = LIGHTGBM_MAX_ADAPTIVE_SHARE
+            others_total = weights.get("arima", 0.0) + weights.get("trend", 0.0)
+            if others_total > 0:
+                for name in ("arima", "trend"):
+                    if name in weights:
+                        weights[name] += excess * (weights[name] / others_total)
+            else:
+                weights["lightgbm"] = 1.0
+        return weights
     except Exception:
         return None
 
@@ -350,25 +379,38 @@ def _projection_model_weights(
     include_lightgbm: bool,
 ) -> dict[str, float]:
     if int(horizon_days) == 30:
+        budget = 0.80
+        if include_lightgbm and backtest:
+            adaptive_weights = _inverse_rmse_weights(backtest, include_lightgbm=True)
+            if adaptive_weights and "lightgbm" in adaptive_weights:
+                # Real per-ticker backtest evidence exists for all three models:
+                # split the horizon's weight budget by evidence instead of
+                # reserving a fixed percentage for LightGBM off the top.
+                return {name: budget * weight for name, weight in adaptive_weights.items()}
         base_weights = _inverse_rmse_weights(backtest or {}) if backtest else {"arima": 0.55, "trend": 0.45}
         scaled = {
-            "arima": 0.80 * float((base_weights or {}).get("arima", 0.55)),
-            "trend": 0.80 * float((base_weights or {}).get("trend", 0.45)),
+            "arima": budget * float((base_weights or {}).get("arima", 0.55)),
+            "trend": budget * float((base_weights or {}).get("trend", 0.45)),
         }
         return _blend_lightgbm_weight(scaled, LIGHTGBM_WEIGHT_30D if include_lightgbm else 0.0)
 
     if int(horizon_days) == 180:
+        budget = 0.55
+        if include_lightgbm and backtest:
+            adaptive_weights = _inverse_rmse_weights(backtest, include_lightgbm=True)
+            if adaptive_weights and "lightgbm" in adaptive_weights:
+                return {name: budget * weight for name, weight in adaptive_weights.items()}
         if backtest:
             base_weights = _inverse_rmse_weights(backtest)
             if base_weights:
                 scaled = {
-                    "arima": 0.55 * float(base_weights.get("arima", 0.0)),
-                    "trend": 0.55 * float(base_weights.get("trend", 0.0)),
+                    "arima": budget * float(base_weights.get("arima", 0.0)),
+                    "trend": budget * float(base_weights.get("trend", 0.0)),
                 }
             else:
-                scaled = {"arima": 0.0, "trend": 0.55}
+                scaled = {"arima": 0.0, "trend": budget}
         else:
-            scaled = {"arima": 0.0, "trend": 0.55}
+            scaled = {"arima": 0.0, "trend": budget}
         return _blend_lightgbm_weight(scaled, LIGHTGBM_WEIGHT_180D if include_lightgbm else 0.0)
 
     # Keep 720d LightGBM weight at zero for now. The current validation has only one
@@ -544,7 +586,11 @@ def _get_price_projections_core(
     avg_cost: float | None = None,
 ) -> dict:
     info = info or get_stock_info(ticker)
-    data = data if data is not None else get_stock_data(ticker, period="2y", interval="1d")
+    # 5y is fetched (not just 2y) so a genuine 180d walk-forward backtest has
+    # enough history to run (it needs >=540 rows); all downstream consumers of
+    # `data` already truncate defensively to their own required window, so the
+    # extra history is safe to pass through everywhere else.
+    data = data if data is not None else get_stock_data(ticker, period="5y", interval="1d")
     technical = analyze_technical(data)
     macro = get_macro_regime()
     risk_free_rate = float(macro.get("risk_free_rate") or 0.045)
@@ -595,11 +641,16 @@ def _get_price_projections_core(
     models_used.extend(lightgbm_models_used)
     models_skipped.extend(lightgbm_models_skipped)
 
-    # adaptive model weights from walk-forward
+    # Adaptive model weights from walk-forward backtests. Short (30d) and medium
+    # (180d) each run their own per-horizon backtest with LightGBM included in
+    # the evaluation, so their ensemble weights reflect real evidence at that
+    # horizon rather than reusing a single 30d-window backtest as a proxy for
+    # every horizon. Long-term (720d) LightGBM support is out of scope for now
+    # and continues to reuse the 30d backtest's ARIMA/trend evidence unchanged.
     backtest = None
     model_weights = None
     try:
-        backtest = run_walk_forward(ticker, data)
+        backtest = run_walk_forward(ticker, data, horizon=30, evaluate_lightgbm=True)
         model_weights = _inverse_rmse_weights(backtest)
         if model_weights:
             models_used.append("Adaptive Weights")
@@ -607,6 +658,12 @@ def _get_price_projections_core(
             models_skipped.append("Adaptive Weights: backtest unavailable")
     except Exception as exc:
         models_skipped.append(f"Adaptive Weights: {exc}")
+
+    medium_backtest = None
+    try:
+        medium_backtest = run_walk_forward(ticker, data, horizon=180, evaluate_lightgbm=True)
+    except Exception as exc:
+        models_skipped.append(f"Medium-term adaptive weights: {exc}")
 
     short_backtest = backtest if model_weights else None
     short_model_weights = _projection_model_weights(
@@ -616,8 +673,8 @@ def _get_price_projections_core(
     )
     medium_model_weights = _projection_model_weights(
         180,
-        backtest if model_weights else None,
-        include_lightgbm=180 in lightgbm_projections,
+        medium_backtest,
+        include_lightgbm=180 in lightgbm_projections and _has_lightgbm_backtest_support(medium_backtest),
     )
     long_model_weights = _projection_model_weights(720, backtest if model_weights else None, include_lightgbm=False)
 

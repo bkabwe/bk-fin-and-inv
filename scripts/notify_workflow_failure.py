@@ -67,14 +67,23 @@ def build_alert_html(workflow_name: str) -> str:
     repo = os.getenv("GITHUB_REPOSITORY", "unknown/unknown")
     ref = os.getenv("GITHUB_REF_NAME", "unknown")
     run_url = build_run_url()
-    link_html = f'<p><a href="{run_url}">View the failed run</a></p>' if run_url else ""
+    link_html = (
+        f'<p style="margin:18px 0 0 0;"><a href="{run_url}" style="color:#5ab8ff;font-weight:600;">View the failed run &rarr;</a></p>'
+        if run_url
+        else ""
+    )
     return (
-        "<html><body style=\"font-family:Arial,Helvetica,sans-serif;background:#06111d;color:#ecf5ff;padding:20px;\">"
-        "<div style=\"max-width:640px;margin:0 auto;background:#0f1f33;border:1px solid #1f4f46;border-radius:14px;padding:24px;\">"
-        f"<h2 style=\"color:#ff6b6b;margin-top:0;\">&#9888; Workflow failed: {workflow_name}</h2>"
-        f"<p>Repository: <strong>{repo}</strong><br>Branch/ref: <strong>{ref}</strong></p>"
+        "<html><head><meta charset=\"utf-8\">"
+        '<meta name="viewport" content="width=device-width, initial-scale=1"></head>'
+        "<body style=\"font-family:Arial,Helvetica,sans-serif;background:#06111d;color:#ecf5ff;margin:0;padding:24px;\">"
+        '<div style="max-width:640px;margin:0 auto;background:#0f1f33;border:1px solid #1f4f46;border-radius:18px;padding:28px;">'
+        '<span style="display:inline-block;padding:3px 10px;border-radius:999px;background:#3a1414;color:#ff6b6b;'
+        'font-size:12px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;">&#9888; Workflow failed</span>'
+        f'<h2 style="color:#f4fff8;margin:14px 0 6px 0;">{workflow_name}</h2>'
+        f'<p style="color:#9eb3cf;margin:0;">Repository: <strong style="color:#ecf5ff;">{repo}</strong><br>'
+        f'Branch/ref: <strong style="color:#ecf5ff;">{ref}</strong></p>'
         f"{link_html}"
-        "<p>One or more jobs in this scheduled workflow failed. Check the run logs for details.</p>"
+        '<p style="color:#9eb3cf;margin:18px 0 0 0;">One or more jobs in this scheduled workflow failed. Check the run logs for details.</p>'
         "</div></body></html>"
     )
 
