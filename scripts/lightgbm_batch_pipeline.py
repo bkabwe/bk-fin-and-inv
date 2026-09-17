@@ -28,9 +28,11 @@ from modules.lightgbm_batch import (
     DEFAULT_BATCH_RELEASE_PREFIX,
     DEFAULT_LIVE_MANIFEST_ASSET_NAME,
     DEFAULT_LIVE_RELEASE_TAG,
+    assign_ticker_shards,
     batch_asset_part_count,
     batch_asset_part_name,
     batch_asset_urls_from_manifest,
+    batch_shard_asset_name,
     build_live_manifest,
     combine_current_and_carried_forward,
     create_return_model_batch,
@@ -39,6 +41,7 @@ from modules.lightgbm_batch import (
     get_batch_training_metadata,
     load_return_model_batch,
     load_return_model_batch_from_urls,
+    partition_batch_by_shard,
     resolve_release_repository,
 )
 from modules.lightgbm_model import (
@@ -58,6 +61,11 @@ DEFAULT_FAST_SCREEN_MIN_SCORE = 50
 DEFAULT_FAST_SCREEN_MARGIN = 15
 DEFAULT_SANITY_TICKERS = ("AAPL", "MSFT")
 DEFAULT_BATCH_RETENTION = 4
+# Ticker-partitioned storage shards let scan/scoring consumers download only
+# the slice of tickers they need instead of the full combined batch asset.
+# This is unrelated to `MATRIX_JOBS`/training compute sharding above -- it
+# only affects how the already-merged live batch is stored for consumption.
+DEFAULT_SCAN_SHARD_COUNT = 8
 # I/O-bound per-ticker Polygon fetches in discover() benefit from the same
 # thread-pool concurrency used by modules/screener.py::run_screener().
 DEFAULT_DISCOVER_WORKERS = 8
@@ -526,13 +534,14 @@ def _upload_batch_asset(
     release: dict[str, Any],
     batch_path: Path,
     *,
+    base_asset_name: str = DEFAULT_BATCH_ASSET_NAME,
     chunk_size: int = BATCH_ASSET_SPLIT_CHUNK_BYTES,
 ) -> None:
     part_paths = _split_large_file(batch_path, chunk_size=chunk_size)
     total_parts = len(part_paths)
     try:
         for index, part_path in enumerate(part_paths, start=1):
-            asset_name = batch_asset_part_name(DEFAULT_BATCH_ASSET_NAME, index, total_parts)
+            asset_name = batch_asset_part_name(base_asset_name, index, total_parts)
             client.upload_asset(release, part_path, asset_name)
     finally:
         if total_parts > 1:
@@ -540,7 +549,56 @@ def _upload_batch_asset(
                 part_path.unlink(missing_ok=True)
 
 
-def _promote_outputs(args: argparse.Namespace, batch_path: Path, manifest_path: Path, release_tag: str) -> None:
+def _write_scan_shards(
+    live_models: dict[str, dict[int, object]],
+    live_meta: dict[str, dict[str, Any]],
+    *,
+    batch_id: str,
+    created_at: str,
+    scan_shard_count: int,
+    output_dir: Path,
+) -> tuple[dict[str, int], list[tuple[int, Path]]]:
+    """Partition the live batch into ticker-based shards and persist each to disk.
+
+    Returns the ticker->shard_index assignment (for the manifest) plus the
+    ordered list of (shard_index, path) pairs for the shard files written, so
+    the promote step can upload each shard as its own (possibly multi-part)
+    release asset. Shards are dumped and dropped one at a time rather than
+    all held in memory together, though since each shard's dict only
+    references the same model objects as `live_models` (no copying), this
+    does not meaningfully raise the peak memory already required to hold the
+    full merged live batch.
+    """
+    scan_shard_count = max(1, int(scan_shard_count))
+    ticker_shards = assign_ticker_shards(list(live_models.keys()), scan_shard_count)
+    if scan_shard_count <= 1:
+        return ticker_shards, []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    partitions = partition_batch_by_shard(live_models, live_meta, ticker_shards, scan_shard_count)
+    shard_paths: list[tuple[int, Path]] = []
+    for shard_index in range(scan_shard_count):
+        shard_models, shard_meta = partitions[shard_index]
+        shard_batch = create_return_model_batch(
+            batch_id=batch_id,
+            models=shard_models,
+            training_metadata=shard_meta,
+            created_at=created_at,
+        )
+        shard_path = output_dir / f"scan_shard_{shard_index:03d}.joblib"
+        joblib.dump(shard_batch, shard_path)
+        shard_paths.append((shard_index, shard_path))
+        del shard_batch, shard_models, shard_meta
+    return ticker_shards, shard_paths
+
+
+def _promote_outputs(
+    args: argparse.Namespace,
+    batch_path: Path,
+    manifest_path: Path,
+    release_tag: str,
+    shard_files: list[tuple[int, Path]] | None = None,
+    scan_shard_count: int = 1,
+) -> None:
     repository = resolve_release_repository(args.repository)
     token = str(os.getenv("GITHUB_TOKEN") or "").strip()
     if not repository or not token:
@@ -554,6 +612,10 @@ def _promote_outputs(args: argparse.Namespace, batch_path: Path, manifest_path: 
         target_commitish=os.getenv("GITHUB_SHA"),
     )
     _upload_batch_asset(client, batch_release, batch_path)
+    for shard_index, shard_path in shard_files or []:
+        shard_asset_name = batch_shard_asset_name(DEFAULT_BATCH_ASSET_NAME, shard_index, scan_shard_count)
+        _upload_batch_asset(client, batch_release, shard_path, base_asset_name=shard_asset_name)
+        shard_path.unlink(missing_ok=True)
     live_release = client.ensure_release(
         tag=DEFAULT_LIVE_RELEASE_TAG,
         name=DEFAULT_LIVE_RELEASE_TAG,
@@ -643,6 +705,19 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
     joblib.dump(live_batch, merged_batch_path)
     live_batch_size_bytes = merged_batch_path.stat().st_size
     logger.info("Persisted live batch (current + carried-forward) to %s (%d bytes)", merged_batch_path, live_batch_size_bytes)
+
+    scan_shard_count = max(1, int(getattr(args, "scan_shard_count", 1) or 1))
+    ticker_shards, shard_files = _write_scan_shards(
+        live_models,
+        live_meta,
+        batch_id=batch_id,
+        created_at=created_at,
+        scan_shard_count=scan_shard_count,
+        output_dir=merged_batch_path.parent / "scan_shards",
+    )
+    if shard_files:
+        logger.info("Persisted %d ticker-partitioned scan shard(s) alongside the combined live batch", len(shard_files))
+
     manifest = build_live_manifest(
         repository=repository,
         batch_id=batch_id,
@@ -651,6 +726,11 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
         created_at=created_at,
         training_metadata=live_meta,
         asset_part_count=batch_asset_part_count(live_batch_size_bytes),
+        scan_shard_count=scan_shard_count,
+        ticker_shards=ticker_shards,
+        shard_asset_part_counts={
+            shard_index: batch_asset_part_count(int(shard_path.stat().st_size)) for shard_index, shard_path in shard_files
+        },
     )
     manifest["current_run"] = {
         "expected_tickers": expected_tickers,
@@ -665,7 +745,7 @@ def reduce_and_validate(args: argparse.Namespace) -> int:
         f"Merged current={len(trained_tickers)} live={len(live_models)} carried_forward={len(carried_forward)} dropped_stale={len(dropped_stale)}"
     )
     if args.promote:
-        _promote_outputs(args, merged_batch_path, manifest_path, release_tag)
+        _promote_outputs(args, merged_batch_path, manifest_path, release_tag, shard_files=shard_files, scan_shard_count=scan_shard_count)
         print(f"Promoted release tag {release_tag}")
     return 0
 
@@ -732,6 +812,7 @@ def build_parser() -> argparse.ArgumentParser:
     reduce_parser.add_argument("--min-rows-per-horizon", type=int, default=50)
     reduce_parser.add_argument("--max-stale-cycles", type=int, default=4)
     reduce_parser.add_argument("--sanity-tickers", nargs="+", default=list(DEFAULT_SANITY_TICKERS))
+    reduce_parser.add_argument("--scan-shard-count", type=int, default=DEFAULT_SCAN_SHARD_COUNT)
     reduce_parser.add_argument("--promote", action="store_true")
     reduce_parser.set_defaults(func=reduce_and_validate)
 

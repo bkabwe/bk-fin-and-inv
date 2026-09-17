@@ -54,6 +54,8 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
             scoring_engine._load_live_lightgbm_manifest.clear()
         if hasattr(scoring_engine._load_live_lightgbm_batch, "clear"):
             scoring_engine._load_live_lightgbm_batch.clear()
+        if hasattr(scoring_engine._load_live_lightgbm_shard_batch, "clear"):
+            scoring_engine._load_live_lightgbm_shard_batch.clear()
 
     def test_short_horizon_weights_include_lightgbm_component(self):
         backtest = {"arima_rmse": 2.0, "trend_rmse": 1.0, "n_windows": 4}
@@ -211,6 +213,63 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         ):
             models = scoring_engine._load_live_lightgbm_models("AAPL")
 
+        batch_mock.assert_called_once_with(("https://example/batch.joblib",))
+        legacy_mock.assert_not_called()
+        self.assertEqual(models, {30: model_30, 180: model_180})
+
+    def test_live_model_loader_prefers_ticker_shard_over_combined_batch(self):
+        model_30 = object()
+        model_180 = object()
+        manifest = {
+            "tickers": {"AAPL": {"shard_index": 1}},
+            "latest_batch": {
+                "asset_url": "https://example/batch.joblib",
+                "shards": [
+                    {"shard_index": 0, "asset_urls": ["https://example/shard0.joblib"]},
+                    {"shard_index": 1, "asset_urls": ["https://example/shard1.joblib"]},
+                ],
+            },
+        }
+        with (
+            patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value=manifest),
+            patch(
+                "modules.scoring_engine._load_live_lightgbm_shard_batch",
+                return_value={"models": {"AAPL": {30: model_30, 180: model_180}}},
+            ) as shard_mock,
+            patch("modules.scoring_engine._load_live_lightgbm_batch") as batch_mock,
+            patch("modules.scoring_engine.load_return_models") as legacy_mock,
+        ):
+            models = scoring_engine._load_live_lightgbm_models("AAPL")
+
+        shard_mock.assert_called_once_with(("https://example/shard1.joblib",))
+        batch_mock.assert_not_called()
+        legacy_mock.assert_not_called()
+        self.assertEqual(models, {30: model_30, 180: model_180})
+
+    def test_live_model_loader_falls_back_to_combined_batch_when_shard_lookup_misses(self):
+        model_30 = object()
+        model_180 = object()
+        manifest = {
+            "tickers": {"AAPL": {"shard_index": 0}},
+            "latest_batch": {
+                "asset_url": "https://example/batch.joblib",
+                "shards": [{"shard_index": 0, "asset_urls": ["https://example/shard0.joblib"]}],
+            },
+        }
+        with (
+            patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value=manifest),
+            patch("modules.scoring_engine._load_live_lightgbm_shard_batch", return_value={}) as shard_mock,
+            patch(
+                "modules.scoring_engine._load_live_lightgbm_batch",
+                return_value={"models": {"AAPL": {30: model_30, 180: model_180}}},
+            ) as batch_mock,
+            patch("modules.scoring_engine.load_return_models") as legacy_mock,
+        ):
+            models = scoring_engine._load_live_lightgbm_models("AAPL")
+
+        shard_mock.assert_called_once_with(("https://example/shard0.joblib",))
         batch_mock.assert_called_once_with(("https://example/batch.joblib",))
         legacy_mock.assert_not_called()
         self.assertEqual(models, {30: model_30, 180: model_180})

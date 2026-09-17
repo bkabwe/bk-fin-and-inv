@@ -55,6 +55,12 @@ def live_scoring_context(manifest: dict[str, Any], batch: dict[str, Any], shared
     with (
         patch.object(scoring_engine, "_load_live_lightgbm_manifest", return_value=manifest),
         patch.object(scoring_engine, "_load_live_lightgbm_batch", return_value=batch),
+        # The scan scripts preload the full combined batch above (`batch`)
+        # once for every ticker in the manifest, so a per-ticker shard
+        # download here would be pure redundant network I/O. Force shard
+        # lookups to report "not found" so `_load_live_lightgbm_models`
+        # always falls through to the already-loaded combined batch instead.
+        patch.object(scoring_engine, "_load_live_lightgbm_shard_batch", return_value={}),
         patch.object(scoring_engine, "build_feature_table", side_effect=_build_feature_table_with_shared_macro),
     ):
         yield
