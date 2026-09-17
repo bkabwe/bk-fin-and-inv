@@ -25,8 +25,43 @@ env:
   WORKFLOW_ALERT_RECIPIENTS: ${{ secrets.WORKFLOW_ALERT_RECIPIENTS }}
 
 jobs:
-  scan-email-report:
+  discover:
     runs-on: ubuntu-latest
+    outputs:
+      run_date: ${{ steps.discover.outputs.run_date }}
+      shard_count: ${{ steps.discover.outputs.shard_count }}
+      shard_matrix: ${{ steps.discover.outputs.shard_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements-lightgbm-batch.txt
+      - name: Discover live manifest and shared macro inputs
+        id: discover
+        run: |
+          mkdir -p /tmp/scan
+          python scripts/scan_email_report.py discover \
+            --output-manifest /tmp/scan/manifest.json \
+            --output-macro /tmp/scan/macro.joblib \
+            | tee /tmp/scan/discover.log \
+            | grep -E '^(run_date|shard_count|shard_matrix)=' >> "$GITHUB_OUTPUT"
+      - name: Upload scan inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-inputs
+          path: |
+            /tmp/scan/manifest.json
+            /tmp/scan/macro.joblib
+
+  scan-shard:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.discover.outputs.shard_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,8 +74,57 @@ jobs:
           key: ${{ runner.os }}-huggingface-ProsusAI-finbert
       - name: Install dependencies
         run: pip install -r requirements-workflows.txt
-      - name: Send short-term scan email report
-        run: python scripts/scan_email_report.py --horizon short_term
+      - name: Download scan inputs
+        uses: actions/download-artifact@v4.1.3
+        with:
+          name: scan-inputs
+          path: /tmp/scan/inputs
+      - name: Scan shard
+        run: |
+          mkdir -p /tmp/scan/partials
+          python scripts/scan_email_report.py scan-shard \
+            --horizon short_term \
+            --manifest-file /tmp/scan/inputs/manifest.json \
+            --macro-file /tmp/scan/inputs/macro.joblib \
+            --shard-index '${{ matrix.shard }}' \
+            --shard-count '${{ needs.discover.outputs.shard_count }}' \
+            --output /tmp/scan/partials/shard-${{ matrix.shard }}.joblib
+      - name: Upload shard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-partial-${{ matrix.shard }}
+          path: /tmp/scan/partials/shard-${{ matrix.shard }}.joblib
+
+  reduce:
+    needs: [discover, scan-shard]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements-lightgbm-batch.txt
+      - name: Download scan inputs
+        uses: actions/download-artifact@v4.1.3
+        with:
+          name: scan-inputs
+          path: /tmp/scan/inputs
+      - name: Download shard partials
+        uses: actions/download-artifact@v4
+        with:
+          pattern: scan-partial-*
+          path: /tmp/scan/partials
+          merge-multiple: true
+      - name: Merge shard results and send short-term scan email report
+        run: |
+          python scripts/scan_email_report.py reduce \
+            --horizon short_term \
+            --manifest-file /tmp/scan/inputs/manifest.json \
+            --partial-dir /tmp/scan/partials \
+            --run-date '${{ needs.discover.outputs.run_date }}'
       - name: Persist prediction tracker state
         if: always()
         run: |
@@ -63,7 +147,7 @@ jobs:
           git push
 
   notify-on-failure:
-    needs: scan-email-report
+    needs: [discover, scan-shard, reduce]
     if: failure()
     runs-on: ubuntu-latest
     steps:

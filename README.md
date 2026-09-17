@@ -279,13 +279,19 @@ Separately, `.github/workflows/train-lightgbm-batch.yml`,
 schedules to retrain/promote LightGBM models and send scan/grading email
 reports. They don't touch `api/` or `frontend/`, and none of them install the
 full `requirements.txt` since they only run `scripts/*.py` against `modules/`
-headlessly. The scan/grading-report workflows install `requirements-workflows.txt`
-(they need FinBERT sentiment via `analyze_stock`); `train-lightgbm-batch.yml`
-installs the leaner `requirements-lightgbm-batch.txt` instead, since
-`scripts/lightgbm_batch_pipeline.py` only calls the technical-only
-`fast_screen_score` and never needs `torch`/`transformers`. Skipping that
-multi-GB FinBERT install leaves more disk headroom for the `reduce-promote`
-job's multi-GB batch merge/promote step.
+headlessly. `train-lightgbm-batch.yml` and the scan workflows
+(`scan-email-short-term.yml`/`scan-email-medium-term.yml`) share the same
+discover -> shard (matrix) -> reduce job structure so a single run can process
+the full trained-ticker universe without any one job loading everything into
+memory at once or exceeding the 6-hour per-job limit. Only each scan
+workflow's `scan-shard` job — which calls `analyze_stock` and therefore needs
+FinBERT sentiment — installs `requirements-workflows.txt`; every other job
+(`discover`, `reduce`, and all of `train-lightgbm-batch.yml`'s jobs) installs
+the leaner `requirements-lightgbm-batch.txt`, since those steps never call
+`analyze_sentiment` and skipping the multi-GB `torch`/`transformers` install
+leaves more disk headroom for the batch-artifact merge steps. The
+grading-report workflows remain single-job and still install
+`requirements-workflows.txt` directly.
 
 ## Troubleshooting
 
@@ -313,11 +319,17 @@ HTML reports via Brevo:
 - `.github/workflows/grading-report-medium-term.yml`
 
 The scan workflows run `scripts/scan_email_report.py` for short-term or
-medium-term profit-opportunity horizons, attach screener/profit-opportunity top
-75 CSVs, and record the profit-opportunity picks into `data/predictions.json`
-for later grading. The grading workflows run `scripts/grading_report.py` to
-evaluate the exact prior recorded scan batch using both point-in-time resolution
-and max-price-since-scan excursion checks.
+medium-term profit-opportunity horizons, split across `discover` (fetches the
+promoted manifest and shared FRED macro table once), `scan-shard` (a matrix
+job — one per ticker-partitioned shard declared in the manifest, or a single
+job for older/unsharded manifests — that scans/filters its slice of tickers
+without truncating or recording), and `reduce` (merges every shard's partial
+results, truncates to the final top 75, records the profit-opportunity picks
+into `data/predictions.json` for later grading exactly once, attaches
+screener/profit-opportunity top 75 CSVs, and emails the report). The grading
+workflows run `scripts/grading_report.py` to evaluate the exact prior recorded
+scan batch using both point-in-time resolution and max-price-since-scan
+excursion checks.
 
 ### Workflow-failure alerts
 
