@@ -452,3 +452,30 @@ def shard_asset_urls_from_manifest(manifest: dict[str, Any] | None, ticker: str)
             if cleaned:
                 return cleaned
     return []
+
+
+def shard_asset_urls_by_index(manifest: dict[str, Any] | None, shard_index: int) -> list[str]:
+    """Return the release asset URL(s) for the ticker-partitioned shard at `shard_index`.
+
+    Unlike `shard_asset_urls_from_manifest`, this looks up a shard directly by
+    its index rather than via a specific ticker's assignment, which is useful
+    for consumers (e.g. a scan-shard job) that already know which shard they
+    own and want to fetch its batch asset without iterating tickers first.
+    Returns an empty list when the manifest predates shard partitioning or
+    does not contain the requested shard index -- callers should fall back to
+    `batch_asset_urls_from_manifest()` (the full combined batch) in that case.
+    """
+    if not isinstance(manifest, dict):
+        return []
+    shards = ((manifest.get("latest_batch") or {}).get("shards")) or []
+    for shard in shards:
+        if not isinstance(shard, dict):
+            continue
+        if int(shard.get("shard_index", -1)) != int(shard_index):
+            continue
+        urls = shard.get("asset_urls")
+        if isinstance(urls, list) and urls:
+            cleaned = [str(url).strip() for url in urls if str(url).strip()]
+            if cleaned:
+                return cleaned
+    return []
