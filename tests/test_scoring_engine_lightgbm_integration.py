@@ -113,7 +113,11 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(projection), expected, places=6)
 
-    def test_short_and_medium_basis_preserve_configured_lightgbm_percent_when_other_models_missing(self):
+    def test_short_and_medium_basis_derive_adaptive_lightgbm_percent_from_backtest_evidence(self):
+        # arima_rmse=2.0, trend_rmse=1.0, lightgbm_rmse=0.9 -> LightGBM has the
+        # lowest RMSE of the triad, so its evidence-based share of each
+        # horizon's weight budget is now larger than the old fixed 15%/8%
+        # constants (well under the 50% adaptive cap, so no clipping applies).
         backtest = {
             "arima_rmse": 2.0,
             "trend_rmse": 1.0,
@@ -124,6 +128,10 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
 
         short_weights = scoring_engine._projection_model_weights(30, backtest, include_lightgbm=True)
         medium_weights = scoring_engine._projection_model_weights(180, backtest, include_lightgbm=True)
+        self.assertAlmostEqual(sum(short_weights.values()), 0.80, places=6)
+        self.assertAlmostEqual(sum(medium_weights.values()), 0.55, places=6)
+        self.assertGreater(short_weights["lightgbm"], scoring_engine.LIGHTGBM_WEIGHT_30D)
+        self.assertGreater(medium_weights["lightgbm"], scoring_engine.LIGHTGBM_WEIGHT_180D)
         _, short_basis, _ = scoring_engine._weighted_ensemble(
             [
                 ("ARIMA", 100.0, short_weights["arima"]),
@@ -139,8 +147,28 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
             ]
         )
 
-        self.assertIn("LightGBM(15%)", short_basis)
-        self.assertIn("LightGBM(8%)", medium_basis)
+        self.assertIn("LightGBM(34%)", short_basis)
+        self.assertIn("LightGBM(23%)", medium_basis)
+
+    def test_adaptive_lightgbm_share_is_capped_and_excess_redistributed(self):
+        # LightGBM's raw inverse-RMSE share here would be ~97% of the triad
+        # (rmse of 0.1 vs. 4.0/4.0), but LIGHTGBM_MAX_ADAPTIVE_SHARE caps it at
+        # 50%, with the freed weight redistributed back to arima/trend
+        # proportionally (here they're tied, so the split is even).
+        backtest = {
+            "arima_rmse": 4.0,
+            "trend_rmse": 4.0,
+            "lightgbm_rmse": 0.1,
+            "n_windows": 4,
+            "lightgbm_windows": 4,
+        }
+
+        weights = scoring_engine._inverse_rmse_weights(backtest, include_lightgbm=True)
+
+        self.assertIsNotNone(weights)
+        self.assertAlmostEqual(weights["lightgbm"], scoring_engine.LIGHTGBM_MAX_ADAPTIVE_SHARE, places=6)
+        self.assertAlmostEqual(weights["arima"], weights["trend"], places=6)
+        self.assertAlmostEqual(sum(weights.values()), 1.0, places=6)
 
     def test_long_horizon_weights_explicitly_exclude_lightgbm(self):
         weights = scoring_engine._projection_model_weights(
@@ -331,7 +359,7 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         self.assertIn("LightGBM", result["medium_term_basis"])
         self.assertNotIn("LightGBM", result["long_term_basis"])
 
-    def test_live_projection_excludes_30d_lightgbm_when_no_lightgbm_backtest_windows(self):
+    def test_live_projection_gates_lightgbm_per_horizon_on_its_own_backtest_windows(self):
         data = _sample_projection_data()
         info = {"exchange": "NASDAQ", "marketCap": 5_000_000_000, "currentPrice": float(data["Close"].iloc[-1])}
         technical = {
@@ -344,15 +372,12 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         def _predict(model, _row):
             return 0.10 if model is model_30 else 0.20
 
-        with (
-            patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
-            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value={}),
-            patch("modules.scoring_engine.load_return_models", return_value={30: model_30, 180: model_180}),
-            patch("modules.scoring_engine.predict_forward_return", side_effect=_predict),
-            patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),
-            patch(
-                "modules.scoring_engine.run_walk_forward",
-                return_value={
+        def _walk_forward(_ticker, _data, horizon=30, **_kwargs):
+            # 30d backtest has no LightGBM windows (e.g. too little history for
+            # that window count); 180d's separate backtest does. Each horizon's
+            # gate must reflect its own backtest, not a shared/reused one.
+            if int(horizon) == 30:
+                return {
                     "arima_rmse": 2.0,
                     "trend_rmse": 1.0,
                     "lightgbm_rmse": None,
@@ -360,8 +385,24 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
                     "arima_windows": 4,
                     "trend_windows": 4,
                     "lightgbm_windows": 0,
-                },
-            ),
+                }
+            return {
+                "arima_rmse": 2.0,
+                "trend_rmse": 1.0,
+                "lightgbm_rmse": 0.9,
+                "n_windows": 4,
+                "arima_windows": 4,
+                "trend_windows": 4,
+                "lightgbm_windows": 4,
+            }
+
+        with (
+            patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value={}),
+            patch("modules.scoring_engine.load_return_models", return_value={30: model_30, 180: model_180}),
+            patch("modules.scoring_engine.predict_forward_return", side_effect=_predict),
+            patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),
+            patch("modules.scoring_engine.run_walk_forward", side_effect=_walk_forward),
             patch("modules.scoring_engine._select_arima_order", return_value=(1, 1, 0)),
             patch("modules.scoring_engine.fit_arima_with_hardening", return_value=_FakeArimaFit()),
             patch("modules.scoring_engine.LinearRegression", _FakeLinearRegression),

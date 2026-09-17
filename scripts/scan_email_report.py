@@ -16,7 +16,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from modules.email_reports import csv_attachment, render_html_table, render_metric_tiles, render_report_html, send_brevo_email
+from modules.email_reports import (
+    csv_attachment,
+    render_html_table,
+    render_legend,
+    render_metric_tiles,
+    render_report_html,
+    send_brevo_email,
+)
 from modules.fred_client import get_macro_feature_table
 from modules.lightgbm_batch import (
     batch_asset_urls_from_manifest,
@@ -160,7 +167,10 @@ def scan_and_filter_profit_opportunities(
         fast_screen_base=DEFAULT_FAST_SCREEN_PROXY_THRESHOLD + DEFAULT_FAST_SCREEN_MARGIN,
         fast_screen_margin=DEFAULT_FAST_SCREEN_MARGIN,
         parallel=False,
-        prefetch_price_period="1y",
+        # 5y (not just 1y) so a genuine 180d LightGBM walk-forward backtest has
+        # enough history to run inside analyze_stock; it's still a single
+        # Polygon fetch per ticker, just a larger payload.
+        prefetch_price_period="5y",
     )
     filtered = filter_by_upside(scanned, horizon, min_upside_pct=min_upside_pct, max_results=max_results)
     stats_base = {
@@ -273,8 +283,11 @@ def build_scan_report(
         (
             f"<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Profit opportunities top 75</h2>"
             f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Projected-upside scan for {HORIZON_SETTINGS[horizon]['label']}. Top 10 preview below; full top 75 is attached as CSV.</p>"
-            f"{render_metric_tiles([{'label': 'Passed fast-screen', 'value': str(int(profit_stats.get('passed_fast_screen_count') or 0))}, {'label': 'Recorded predictions', 'value': str(int(profit_stats.get('recorded_count') or 0))}, {'label': 'Top ticker', 'value': str(profit_top['Ticker']) if profit_top is not None else '—'}, {'label': 'Avg / median upside', 'value': ('—' if profit_avg_upside is None else f'{profit_avg_upside:.2f}% / {profit_median_upside:.2f}%')}, {'label': 'High-confidence picks', 'value': str(int((profit_results['Confidence'] == 'High').sum())) if not profit_results.empty else '0'}])}"
+            f"{render_metric_tiles([{'label': 'Passed fast-screen', 'value': str(int(profit_stats.get('passed_fast_screen_count') or 0))}, {'label': 'Recorded predictions', 'value': str(int(profit_stats.get('recorded_count') or 0))}, {'label': 'Top ticker', 'value': str(profit_top['Ticker']) if profit_top is not None else '—'}, {'label': 'Avg / median upside', 'value': ('—' if profit_avg_upside is None else f'{profit_avg_upside:.2f}% / {profit_median_upside:.2f}%')}, {'label': 'High-confidence picks', 'value': str(int((profit_results['Confidence'] == 'Full').sum())) if not profit_results.empty else '0'}])}"
             f"<div style=\"margin-top:18px;\">{render_html_table(['Ticker', 'Company', 'Score', 'Current Price', 'Target Price', 'Projected Upside %', 'Confidence'], _preview_rows(profit_results, ['Ticker', 'Company', 'Score', 'Current Price', 'Target Price', 'Projected Upside %', 'Confidence']))}</div>"
+            f"<div style=\"margin-top:14px;\"><div style=\"color:#a9bdd7;font-size:12px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;\">Confidence legend</div>"
+            f"{render_legend([{'label': 'Full', 'description': 'ARIMA, trend, and fundamental/DCF models all contributed to the projection — highest-confidence tier.'}, {'label': 'Limited', 'description': 'Partial model coverage (e.g. missing fundamentals or a fitted trend) — treat with more caution.'}, {'label': 'Technical Only', 'description': 'Speculative/OTC ticker with no fundamental EPS data — projection is technical-trend only, higher risk.'}])}"
+            "</div>"
         ),
     ]
 

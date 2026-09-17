@@ -64,8 +64,15 @@ DEFAULT_BATCH_RETENTION = 4
 # Ticker-partitioned storage shards let scan/scoring consumers download only
 # the slice of tickers they need instead of the full combined batch asset.
 # This is unrelated to `MATRIX_JOBS`/training compute sharding above -- it
-# only affects how the already-merged live batch is stored for consumption.
-DEFAULT_SCAN_SHARD_COUNT = 8
+# only affects how the already-merged live batch is stored for consumption,
+# and how many parallel scan-email-*.yml "scan-shard" matrix jobs run.
+# Bumped 8 -> 16 to absorb the added per-ticker cost of the now-enabled
+# LightGBM walk-forward backtests (evaluate_lightgbm=True at 30d/180d) without
+# materially increasing per-shard wall-clock time. The scan-email workflows'
+# "Scan shard" step divides SEC_EDGAR_MAX_REQUESTS_PER_SECOND by this shard
+# count, so aggregate SEC EDGAR call volume across shards stays bounded
+# regardless of how high this is set.
+DEFAULT_SCAN_SHARD_COUNT = 16
 # I/O-bound per-ticker Polygon fetches in discover() benefit from the same
 # thread-pool concurrency used by modules/screener.py::run_screener().
 DEFAULT_DISCOVER_WORKERS = 8

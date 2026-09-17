@@ -82,6 +82,7 @@ jobs:
       - name: Scan shard
         run: |
           mkdir -p /tmp/scan/partials
+          export SEC_EDGAR_MAX_REQUESTS_PER_SECOND="$(python -c "import os; print(10.0 / max(float(os.environ.get('SHARD_COUNT', '1')), 1.0))")"
           python scripts/scan_email_report.py scan-shard \
             --horizon short_term \
             --manifest-file /tmp/scan/inputs/manifest.json \
@@ -89,6 +90,8 @@ jobs:
             --shard-index '${{ matrix.shard }}' \
             --shard-count '${{ needs.discover.outputs.shard_count }}' \
             --output /tmp/scan/partials/shard-${{ matrix.shard }}.joblib
+        env:
+          SHARD_COUNT: ${{ needs.discover.outputs.shard_count }}
       - name: Upload shard output
         uses: actions/upload-artifact@v4
         with:

@@ -10,6 +10,7 @@ from modules.email_reports import (
     csv_attachment,
     parse_recipients,
     render_html_table,
+    render_legend,
     render_metric_tiles,
     render_report_html,
     send_brevo_email,
@@ -65,20 +66,22 @@ class CsvAttachmentTests(unittest.TestCase):
 
 
 class RenderMetricTilesTests(unittest.TestCase):
-    def test_renders_table_with_labels_and_values(self):
+    def test_renders_wrapping_tiles_with_labels_and_values(self):
         html_out = render_metric_tiles([{"label": "Score", "value": "87"}])
         self.assertIn("Score", html_out)
         self.assertIn("87", html_out)
-        self.assertIn("<table", html_out)
+        # Tiles use wrapping inline-block divs (not a non-wrapping <table>/<td>
+        # row) so they don't overflow the container on desktop Gmail web.
+        self.assertIn("display:inline-block", html_out)
+        self.assertNotIn("<table", html_out)
 
     def test_missing_value_defaults_to_dash(self):
         html_out = render_metric_tiles([{"label": "Score"}])
         self.assertIn("—", html_out)
 
-    def test_empty_iterable_returns_empty_table(self):
+    def test_empty_iterable_returns_empty_wrapper(self):
         html_out = render_metric_tiles([])
-        self.assertIn("<table", html_out)
-        self.assertNotIn("<td", html_out)
+        self.assertNotIn("display:inline-block", html_out)
 
 
 class RenderHtmlTableTests(unittest.TestCase):
@@ -100,6 +103,43 @@ class RenderHtmlTableTests(unittest.TestCase):
         html_out = render_html_table(["Ticker"], [{"Ticker": "<script>alert(1)</script>"}])
         self.assertNotIn("<script>alert(1)</script>", html_out)
         self.assertIn("&lt;script&gt;", html_out)
+
+    def test_boolean_cell_renders_yes_no_badge(self):
+        html_out = render_html_table(["Point Hit"], [{"Point Hit": True}, {"Point Hit": False}])
+        self.assertIn(">Yes<", html_out)
+        self.assertIn(">No<", html_out)
+
+    def test_confidence_column_renders_badge(self):
+        html_out = render_html_table(["Confidence"], [{"Confidence": "Full"}])
+        self.assertIn("border-radius:999px", html_out)
+        self.assertIn("Full", html_out)
+
+    def test_score_column_renders_bar_cell_scaled_to_fixed_domain(self):
+        html_out = render_html_table(["Score"], [{"Score": 50}])
+        # Score's domain is fixed at 0-100, so a value of 50 fills half the bar.
+        self.assertIn("width:50.0%", html_out)
+
+    def test_dynamic_bar_column_scales_to_max_value_in_table(self):
+        html_out = render_html_table(
+            ["Projected Upside %"],
+            [{"Projected Upside %": 10.0}, {"Projected Upside %": 20.0}],
+        )
+        self.assertIn("width:50.0%", html_out)
+        self.assertIn("width:100.0%", html_out)
+
+
+class RenderLegendTests(unittest.TestCase):
+    def test_renders_badge_and_description_for_each_item(self):
+        html_out = render_legend(
+            [
+                {"label": "Full", "description": "All models available."},
+                {"label": "Limited", "description": "Partial model coverage."},
+            ]
+        )
+        self.assertIn("Full", html_out)
+        self.assertIn("All models available.", html_out)
+        self.assertIn("Limited", html_out)
+        self.assertIn("Partial model coverage.", html_out)
 
 
 class RenderReportHtmlTests(unittest.TestCase):
