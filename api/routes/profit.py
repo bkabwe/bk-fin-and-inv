@@ -170,6 +170,7 @@ def run_profit_task(job_id: str, params: dict):
 
     for row in final_rows:
         row.pop("_rsi", None)
+        row.pop("_lightgbm_backtested", None)
         for field in SUBSCORE_ROW_FIELDS:
             row.pop(field, None)
 

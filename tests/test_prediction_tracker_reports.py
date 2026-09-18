@@ -51,6 +51,7 @@ class ScanEmailReportTests(unittest.TestCase):
                     "short_term_upside": upside,
                     "short_term_basis": "ARIMA, Trend",
                     "data_quality": "High" if ticker == "MSFT" else "Medium",
+                    "short_term_lightgbm_backtested": True,
                 },
             }
 

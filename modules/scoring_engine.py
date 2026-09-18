@@ -68,6 +68,26 @@ LIGHTGBM_WEIGHT_180D = 0.08
 # diversity onto a single model.
 LIGHTGBM_MAX_ADAPTIVE_SHARE = 0.50
 
+# Fixed fundamentals-model weight budgets for the medium/long-term price
+# projection ensembles in _get_price_projections_core. These used to be
+# 0.20/0.10 (medium) and 0.20/0.10 (long), with the remaining share reserved
+# for an "Analyst Target" slot fed by info.get("targetMeanPrice"). That field
+# is permanently hardcoded to None by the Polygon+SEC EDGAR data adapter (see
+# modules/polygon_client.py: no analyst-consensus source is wired up), so the
+# slot could never contribute -- and _weighted_ensemble() only normalizes over
+# components that DO have a value, so its "reserved" share was silently
+# redistributed back onto ARIMA/Trend/Fundamental/DCF in proportion to their
+# own weights, disproportionately inflating ARIMA (typically the largest of
+# the remaining raw weights). The dead Analyst slot has been removed and its
+# budget reassigned explicitly here instead, consistent with fundamentals
+# mattering more over longer holding periods (see _FUNDAMENTAL_SENTIMENT_WEIGHTS
+# below). The corresponding ARIMA/Trend "budget" in _projection_model_weights
+# has been reduced by the same amount so each horizon's weights still sum to 1.0.
+MEDIUM_TERM_FUNDAMENTAL_WEIGHT = 0.30
+MEDIUM_TERM_DCF_WEIGHT = 0.20
+LONG_TERM_FUNDAMENTAL_WEIGHT = 0.35
+LONG_TERM_DCF_WEIGHT = 0.25
+
 # Fundamental+sentiment point pool in the composite 0-100 score is fixed at 50
 # points, but the split between them shifts as the requested investment
 # horizon lengthens: sentiment (recent news tone) decays toward longer
@@ -395,7 +415,10 @@ def _projection_model_weights(
         return _blend_lightgbm_weight(scaled, LIGHTGBM_WEIGHT_30D if include_lightgbm else 0.0)
 
     if int(horizon_days) == 180:
-        budget = 0.55
+        # budget + MEDIUM_TERM_FUNDAMENTAL_WEIGHT + MEDIUM_TERM_DCF_WEIGHT must
+        # sum to 1.0 (see the ensemble components built in
+        # _get_price_projections_core).
+        budget = 1.0 - MEDIUM_TERM_FUNDAMENTAL_WEIGHT - MEDIUM_TERM_DCF_WEIGHT
         if include_lightgbm and backtest:
             adaptive_weights = _inverse_rmse_weights(backtest, include_lightgbm=True)
             if adaptive_weights and "lightgbm" in adaptive_weights:
@@ -417,14 +440,17 @@ def _projection_model_weights(
     # non-overlapping backtest window per ticker at this horizon, so the 20/30 vs.
     # ARIMA/trend and 22/30 vs. naive win rates are promising but not yet actionable.
     # Revisit once more historical data accrues naturally and yields additional 720d windows.
+    # budget + LONG_TERM_FUNDAMENTAL_WEIGHT + LONG_TERM_DCF_WEIGHT must sum to
+    # 1.0 (see the ensemble components built in _get_price_projections_core).
+    long_budget = 1.0 - LONG_TERM_FUNDAMENTAL_WEIGHT - LONG_TERM_DCF_WEIGHT
     if backtest:
         base_weights = _inverse_rmse_weights(backtest)
         if base_weights:
             return {
-                "arima": 0.50 * float(base_weights.get("arima", 0.0)),
-                "trend": 0.50 * float(base_weights.get("trend", 0.0)),
+                "arima": long_budget * float(base_weights.get("arima", 0.0)),
+                "trend": long_budget * float(base_weights.get("trend", 0.0)),
             }
-    return {"arima": 0.0, "trend": 0.50}
+    return {"arima": 0.0, "trend": long_budget}
 
 
 def _has_lightgbm_backtest_support(backtest: dict | None) -> bool:
@@ -624,6 +650,8 @@ def _get_price_projections_core(
             "outlook": "Neutral",
             "recommendation_to_sell_at": "Insufficient data to build projections.",
             "data_quality": "Limited",
+            "short_term_lightgbm_backtested": False,
+            "medium_term_lightgbm_backtested": False,
         }
 
     models_used: list[str] = []
@@ -666,17 +694,35 @@ def _get_price_projections_core(
         models_skipped.append(f"Medium-term adaptive weights: {exc}")
 
     short_backtest = backtest if model_weights else None
+    # Gate solely on "do we have a live per-ticker LightGBM prediction for this
+    # horizon" here. Whether that prediction gets an evidence-derived adaptive
+    # weight or the small fixed fallback weight (LIGHTGBM_WEIGHT_30D/180D) is
+    # decided inside _projection_model_weights depending on whether *this
+    # horizon's own* backtest produced lightgbm_rmse evidence. Previously this
+    # also required _has_lightgbm_backtest_support(...) here, which made the
+    # fixed-fallback branch unreachable: a live model with no per-ticker
+    # backtest evidence was dropped from the ensemble/basis entirely instead
+    # of contributing at the documented fallback weight.
     short_model_weights = _projection_model_weights(
         30,
         short_backtest,
-        include_lightgbm=30 in lightgbm_projections and _has_lightgbm_backtest_support(short_backtest),
+        include_lightgbm=30 in lightgbm_projections,
     )
     medium_model_weights = _projection_model_weights(
         180,
         medium_backtest,
-        include_lightgbm=180 in lightgbm_projections and _has_lightgbm_backtest_support(medium_backtest),
+        include_lightgbm=180 in lightgbm_projections,
     )
     long_model_weights = _projection_model_weights(720, backtest if model_weights else None, include_lightgbm=False)
+
+    # Whether LightGBM's contribution to this horizon's ensemble was actually
+    # backed by real per-ticker walk-forward evidence (vs. the small fixed
+    # fallback weight assigned above whenever a live model exists but this
+    # horizon's own backtest has no lightgbm_rmse). Consumers that only want
+    # to surface genuinely-validated LightGBM picks (e.g. the scheduled
+    # profit-opportunities report) can filter on these flags.
+    short_term_lightgbm_backtested = bool(30 in lightgbm_projections and _has_lightgbm_backtest_support(short_backtest))
+    medium_term_lightgbm_backtested = bool(180 in lightgbm_projections and _has_lightgbm_backtest_support(medium_backtest))
 
     arima_30 = arima_180 = arima_720 = None
     if STATSMODELS_AVAILABLE:
@@ -773,14 +819,22 @@ def _get_price_projections_core(
     technical_resistance = max([x for x in [nearest_resistance, bb_upper, current_price] if x is not None])
     models_used.append("Technical Resistance")
 
-    analyst_target = info.get("targetMeanPrice")
-    analyst_medium = analyst_long = None
-    if analyst_target and analyst_target > 0:
-        analyst_medium = float(analyst_target) * 0.65
-        analyst_long = float(analyst_target)
-        models_used.append("Analyst Target")
-    else:
-        models_skipped.append("Analyst Target: unavailable")
+    # NOTE: an "Analyst Target" ensemble slot used to live here (fed by
+    # info.get("targetMeanPrice")). Since the migration to the Polygon+SEC
+    # EDGAR data adapter, build_info_adapter() *always* hardcodes
+    # targetMeanPrice to None (see modules/polygon_client.py) because no
+    # analyst-consensus data source is wired up anymore, so that slot could
+    # never actually produce a value. Its reserved weight wasn't simply
+    # dropped, though: _weighted_ensemble() only normalizes over components
+    # with a non-None value, so the "missing" analyst share was silently
+    # redistributed *proportionally* back onto whichever other components
+    # were present -- disproportionately inflating ARIMA's effective share
+    # (it typically carries the largest raw weight of the remaining
+    # components) rather than benefiting fundamentals. The weight has been
+    # removed here and its budget reassigned explicitly to Fundamental Fair
+    # Value / DCF+Comps below instead of leaking into ARIMA. If an
+    # analyst-consensus data source is ever reintroduced, re-add this slot
+    # deliberately rather than relying on info.get("targetMeanPrice").
 
     short_projection, short_basis, short_values = _weighted_ensemble(
         [
@@ -795,18 +849,16 @@ def _get_price_projections_core(
             ("ARIMA", arima_180, medium_model_weights.get("arima", 0.0)),
             ("Trend", trend_180, medium_model_weights.get("trend", 0.0)),
             ("LightGBM", lightgbm_projections.get(180), medium_model_weights.get("lightgbm", 0.0)),
-            ("Fundamental", fair_value, 0.20),
-            ("DCF+Comps", dcf_estimate, 0.10),
-            ("Analyst x0.65", analyst_medium, 0.15),
+            ("Fundamental", fair_value, MEDIUM_TERM_FUNDAMENTAL_WEIGHT),
+            ("DCF+Comps", dcf_estimate, MEDIUM_TERM_DCF_WEIGHT),
         ]
     )
     long_projection, long_basis, long_values = _weighted_ensemble(
         [
             ("ARIMA", arima_720, long_model_weights.get("arima", 0.0)),
             ("Trend", trend_720, long_model_weights.get("trend", 0.0)),
-            ("Fundamental", fair_value, 0.20),
-            ("DCF+Comps", dcf_estimate, 0.10),
-            ("Analyst", analyst_long, 0.20),
+            ("Fundamental", fair_value, LONG_TERM_FUNDAMENTAL_WEIGHT),
+            ("DCF+Comps", dcf_estimate, LONG_TERM_DCF_WEIGHT),
         ]
     )
 
@@ -936,6 +988,8 @@ def _get_price_projections_core(
         "outlook": outlook,
         "recommendation_to_sell_at": recommendation_to_sell_at,
         "data_quality": data_quality,
+        "short_term_lightgbm_backtested": short_term_lightgbm_backtested,
+        "medium_term_lightgbm_backtested": medium_term_lightgbm_backtested,
     }
 
 

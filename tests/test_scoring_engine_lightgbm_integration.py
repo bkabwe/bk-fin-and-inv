@@ -93,23 +93,25 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
                 ("ARIMA", 150.0, model_weights["arima"]),
                 ("Trend", 180.0, model_weights["trend"]),
                 ("LightGBM", 210.0, model_weights["lightgbm"]),
-                ("Fundamental", 200.0, 0.20),
-                ("DCF", 205.0, 0.10),
-                ("Analyst x0.65", 195.0, 0.15),
+                ("Fundamental", 200.0, scoring_engine.MEDIUM_TERM_FUNDAMENTAL_WEIGHT),
+                ("DCF", 205.0, scoring_engine.MEDIUM_TERM_DCF_WEIGHT),
             ]
         )
 
         self.assertLess(scoring_engine.LIGHTGBM_WEIGHT_180D, scoring_engine.LIGHTGBM_WEIGHT_30D)
         self.assertAlmostEqual(model_weights["lightgbm"], scoring_engine.LIGHTGBM_WEIGHT_180D, places=6)
-        self.assertAlmostEqual(sum(model_weights.values()), 0.55, places=6)
+        self.assertAlmostEqual(
+            sum(model_weights.values()),
+            1.0 - scoring_engine.MEDIUM_TERM_FUNDAMENTAL_WEIGHT - scoring_engine.MEDIUM_TERM_DCF_WEIGHT,
+            places=6,
+        )
         self.assertIn("LightGBM(8%)", basis)
         expected = (
             (150.0 * model_weights["arima"])
             + (180.0 * model_weights["trend"])
             + (210.0 * model_weights["lightgbm"])
-            + (200.0 * 0.20)
-            + (205.0 * 0.10)
-            + (195.0 * 0.15)
+            + (200.0 * scoring_engine.MEDIUM_TERM_FUNDAMENTAL_WEIGHT)
+            + (205.0 * scoring_engine.MEDIUM_TERM_DCF_WEIGHT)
         )
         self.assertAlmostEqual(float(projection), expected, places=6)
 
@@ -128,8 +130,9 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
 
         short_weights = scoring_engine._projection_model_weights(30, backtest, include_lightgbm=True)
         medium_weights = scoring_engine._projection_model_weights(180, backtest, include_lightgbm=True)
+        medium_budget = 1.0 - scoring_engine.MEDIUM_TERM_FUNDAMENTAL_WEIGHT - scoring_engine.MEDIUM_TERM_DCF_WEIGHT
         self.assertAlmostEqual(sum(short_weights.values()), 0.80, places=6)
-        self.assertAlmostEqual(sum(medium_weights.values()), 0.55, places=6)
+        self.assertAlmostEqual(sum(medium_weights.values()), medium_budget, places=6)
         self.assertGreater(short_weights["lightgbm"], scoring_engine.LIGHTGBM_WEIGHT_30D)
         self.assertGreater(medium_weights["lightgbm"], scoring_engine.LIGHTGBM_WEIGHT_180D)
         _, short_basis, _ = scoring_engine._weighted_ensemble(
@@ -148,7 +151,9 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         )
 
         self.assertIn("LightGBM(34%)", short_basis)
-        self.assertIn("LightGBM(23%)", medium_basis)
+        # medium_budget (0.50) * lightgbm's inverse-RMSE share of the triad
+        # (~0.4255, computed from rmses 2.0/1.0/0.9) ~= 0.2128 -> "21%".
+        self.assertIn("LightGBM(21%)", medium_basis)
 
     def test_adaptive_lightgbm_share_is_capped_and_excess_redistributed(self):
         # LightGBM's raw inverse-RMSE share here would be ~97% of the triad
@@ -178,7 +183,11 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         )
         self.assertNotIn("lightgbm", weights)
         self.assertEqual(set(weights.keys()), {"arima", "trend"})
-        self.assertAlmostEqual(sum(weights.values()), 0.50, places=6)
+        self.assertAlmostEqual(
+            sum(weights.values()),
+            1.0 - scoring_engine.LONG_TERM_FUNDAMENTAL_WEIGHT - scoring_engine.LONG_TERM_DCF_WEIGHT,
+            places=6,
+        )
 
     def test_live_projection_falls_back_when_no_saved_lightgbm_model_exists(self):
         data = _sample_projection_data()
@@ -358,8 +367,12 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         self.assertIn("LightGBM", result["short_term_basis"])
         self.assertIn("LightGBM", result["medium_term_basis"])
         self.assertNotIn("LightGBM", result["long_term_basis"])
+        # Both horizons have a live model AND real backtest evidence
+        # (lightgbm_windows=4, lightgbm_rmse=0.9) in this fixture.
+        self.assertTrue(result["short_term_lightgbm_backtested"])
+        self.assertTrue(result["medium_term_lightgbm_backtested"])
 
-    def test_live_projection_gates_lightgbm_per_horizon_on_its_own_backtest_windows(self):
+    def test_live_projection_uses_fixed_fallback_weight_when_only_one_horizon_has_backtest_evidence(self):
         data = _sample_projection_data()
         info = {"exchange": "NASDAQ", "marketCap": 5_000_000_000, "currentPrice": float(data["Close"].iloc[-1])}
         technical = {
@@ -375,7 +388,10 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         def _walk_forward(_ticker, _data, horizon=30, **_kwargs):
             # 30d backtest has no LightGBM windows (e.g. too little history for
             # that window count); 180d's separate backtest does. Each horizon's
-            # gate must reflect its own backtest, not a shared/reused one.
+            # gate must reflect its own backtest, not a shared/reused one: 30d
+            # falls back to the small fixed LIGHTGBM_WEIGHT_30D weight (a live
+            # model exists but this horizon has no evidence for it), while
+            # 180d derives an evidence-based adaptive weight.
             if int(horizon) == 30:
                 return {
                     "arima_rmse": 2.0,
@@ -416,8 +432,61 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         ):
             result = scoring_engine._get_price_projections_core("AAPL", info=info, data=data)
 
-        self.assertNotIn("LightGBM", result["short_term_basis"])
+        # A live model exists for both horizons, so both should now contribute
+        # to the basis even though only 180d has per-horizon backtest evidence:
+        # 30d falls back to the fixed LIGHTGBM_WEIGHT_30D share instead of
+        # being dropped from the ensemble entirely.
+        self.assertIn(f"LightGBM({scoring_engine.LIGHTGBM_WEIGHT_30D * 100:.0f}%)", result["short_term_basis"])
         self.assertIn("LightGBM", result["medium_term_basis"])
+        # The "backtested" flag distinguishes real per-horizon evidence from
+        # the fixed-fallback weight above: 30d has no lightgbm_windows so it's
+        # False despite LightGBM still appearing in the basis; 180d has real
+        # evidence so it's True.
+        self.assertFalse(result["short_term_lightgbm_backtested"])
+        self.assertTrue(result["medium_term_lightgbm_backtested"])
+
+    def test_lightgbm_backtested_flag_is_false_without_a_live_model_even_with_backtest_evidence(self):
+        # Backtest evidence alone isn't enough: if there's no live per-ticker
+        # LightGBM model for a horizon (so it never enters the ensemble at
+        # all), the "backtested" flag must stay False for that horizon.
+        data = _sample_projection_data()
+        info = {"exchange": "NASDAQ", "marketCap": 5_000_000_000, "currentPrice": float(data["Close"].iloc[-1])}
+        technical = {"resistance_levels": [135.0], "indicators": {"bb_high": 134.0}}
+        model_180 = object()
+
+        with (
+            patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value={}),
+            patch("modules.scoring_engine.load_return_models", return_value={180: model_180}),
+            patch("modules.scoring_engine.predict_forward_return", return_value=0.20),
+            patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)),
+            patch(
+                "modules.scoring_engine.run_walk_forward",
+                return_value={
+                    "arima_rmse": 2.0,
+                    "trend_rmse": 1.0,
+                    "lightgbm_rmse": 0.9,
+                    "n_windows": 4,
+                    "arima_windows": 4,
+                    "trend_windows": 4,
+                    "lightgbm_windows": 4,
+                },
+            ),
+            patch("modules.scoring_engine._select_arima_order", return_value=(1, 1, 0)),
+            patch("modules.scoring_engine.fit_arima_with_hardening", return_value=_FakeArimaFit()),
+            patch("modules.scoring_engine.LinearRegression", _FakeLinearRegression),
+            patch("modules.scoring_engine._garch_confidence_from_returns", return_value=(None, None)),
+            patch("modules.scoring_engine.analyze_technical", return_value=technical),
+            patch(
+                "modules.scoring_engine.get_macro_regime",
+                return_value={"risk_free_rate": 0.045, "bullish_sectors": [], "bearish_sectors": [], "market_regime": "neutral"},
+            ),
+            patch("modules.scoring_engine.analyze_fundamentals", return_value={"metrics": {}, "fundamental_score": 50}),
+        ):
+            result = scoring_engine._get_price_projections_core("AAPL", info=info, data=data)
+
+        self.assertFalse(result["short_term_lightgbm_backtested"])
+        self.assertTrue(result["medium_term_lightgbm_backtested"])
 
 
 if __name__ == "__main__":

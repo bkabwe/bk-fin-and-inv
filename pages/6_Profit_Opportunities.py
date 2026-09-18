@@ -198,6 +198,7 @@ if scanned_df is not None and not scanned_df.empty:
 
         for row in display_rows:
             row.pop("_rsi", None)
+            row.pop("_lightgbm_backtested", None)
 
         if not display_rows:
             st.warning("No stocks met the minimum upside threshold. Try lowering the Min Upside %.")

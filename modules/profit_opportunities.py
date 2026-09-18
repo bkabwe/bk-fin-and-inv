@@ -110,6 +110,7 @@ HORIZON_SETTINGS: dict[str, dict[str, Any]] = {
         "target_high_key": "short_term_high",
         "upside_key": "short_term_upside",
         "basis_key": "short_term_basis",
+        "lightgbm_backtested_key": "short_term_lightgbm_backtested",
         "date_windows": {"High": 4, "Medium": 6, "Low": 8},
     },
     "medium_term": {
@@ -119,6 +120,7 @@ HORIZON_SETTINGS: dict[str, dict[str, Any]] = {
         "target_high_key": "medium_term_high",
         "upside_key": "medium_term_upside",
         "basis_key": "medium_term_basis",
+        "lightgbm_backtested_key": "medium_term_lightgbm_backtested",
         "date_windows": {"High": 14, "Medium": 21, "Low": 30},
     },
     "long_term": {
@@ -128,6 +130,9 @@ HORIZON_SETTINGS: dict[str, dict[str, Any]] = {
         "target_high_key": "long_term_high",
         "upside_key": "long_term_upside",
         "basis_key": "long_term_basis",
+        # No LightGBM at 720d (see modules.scoring_engine), so there's no
+        # backtested flag to key off here; analyze_ticker_for_horizon leaves
+        # the row field as None rather than filtering long-term results.
         "date_windows": {"High": 30, "Medium": 45, "Low": 60},
     },
 }
@@ -253,6 +258,8 @@ def analyze_ticker_for_horizon(
         upside = float(projections.get(settings["upside_key"]) or 0)
         rsi = (analysis.get("technical") or {}).get("indicators", {}).get("rsi")
         breakdown = analysis.get("score_breakdown") or {}
+        lightgbm_backtested_key = settings.get("lightgbm_backtested_key")
+        lightgbm_backtested = bool(projections.get(lightgbm_backtested_key)) if lightgbm_backtested_key else None
 
         outcome["row"] = {
             "Ticker": ticker,
@@ -280,6 +287,14 @@ def analyze_ticker_for_horizon(
             "_rs_score": breakdown.get("relative_strength"),
             "_breakout_score": breakdown.get("breakout"),
             "_volume_quality_score": breakdown.get("volume_quality"),
+            # Internal-only: whether this horizon's LightGBM ensemble
+            # component (if any) was backed by genuine per-ticker backtest
+            # evidence rather than the small fixed fallback weight. None for
+            # horizons without a LightGBM component (long-term). Callers that
+            # only want to surface backtest-confirmed LightGBM picks (e.g. the
+            # scheduled profit-opportunities report) filter on this before
+            # stripping it from the displayed/attached results.
+            "_lightgbm_backtested": lightgbm_backtested,
             **({"Index": label} if label else {}),
         }
         return outcome
