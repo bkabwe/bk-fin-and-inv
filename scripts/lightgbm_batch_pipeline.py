@@ -66,17 +66,24 @@ DEFAULT_BATCH_RETENTION = 4
 # This is unrelated to `MATRIX_JOBS`/training compute sharding above -- it
 # only affects how the already-merged live batch is stored for consumption,
 # and how many parallel scan-email-*.yml "scan-shard" matrix jobs run.
-# Bumped 16 -> 128 (PR #59 Phase 3): PR #59's Phase 1+2 (real cache + one
-# analyze_stock() call per ticker instead of two) cut per-ticker cost roughly
-# in half but did *not* fit within the 340-minute timeout-minutes guardrail --
-# a post-merge measurement of the live 16-shard run showed ~100-200s/ticker
-# still projects 7.8h-15h per shard at ~277 tickers/shard. 128 shards brings
-# that down to ~35 tickers/shard (~2-2.5h worst case), comfortably under the
-# guardrail with headroom for per-ticker slowdowns. The scan-email workflows'
-# "Scan shard" step divides SEC_EDGAR_MAX_REQUESTS_PER_SECOND by this shard
-# count, so aggregate SEC EDGAR call volume across shards stays bounded
-# regardless of how high this is set.
-DEFAULT_SCAN_SHARD_COUNT = 128
+# Reverted 128 -> 16 (was bumped in PR #59 Phase 3, reverted after confirming
+# the account's GitHub Actions plan only runs 20 jobs concurrently). Shard
+# count beyond the concurrency cap doesn't reduce wall-clock time -- the
+# matrix just runs in extra sequential "waves" (e.g. 128 shards / 20
+# concurrent =~ 7 waves) while adding overhead (more redundant per-job
+# `pip install`s of the heavy torch/transformers stack, more sequential
+# shard-asset uploads in the weekly promote job, and an over-throttled
+# per-shard SEC_EDGAR_MAX_REQUESTS_PER_SECOND, see below). 16 already fits in
+# a single wave (16 < 20 concurrent), so it doesn't need to grow beyond the
+# cap. The real per-ticker cost fix is the ARIMA order-search reuse in
+# modules/backtester.py::run_walk_forward -- selecting the (p,d,q) order once
+# per horizon instead of once per walk-forward window cut a synthetic
+# 30d+180d per-ticker benchmark from ~92s to ~20s (measured in this repo).
+# The scan-email workflows' "Scan shard" step divides
+# SEC_EDGAR_MAX_REQUESTS_PER_SECOND by this shard count, so aggregate SEC
+# EDGAR call volume across shards stays bounded regardless of how high this
+# is set.
+DEFAULT_SCAN_SHARD_COUNT = 16
 # I/O-bound per-ticker Polygon fetches in discover() benefit from the same
 # thread-pool concurrency used by modules/screener.py::run_screener().
 DEFAULT_DISCOVER_WORKERS = 8
