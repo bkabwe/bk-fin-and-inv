@@ -333,7 +333,7 @@ excursion checks.
 
 Shard count is manifest-driven, set by `--scan-shard-count` at promote time
 (`scripts/lightgbm_batch_pipeline.py`'s `DEFAULT_SCAN_SHARD_COUNT`, currently
-16) — a separate concept from `train-lightgbm-batch.yml`'s own `MATRIX_JOBS`
+128) — a separate concept from `train-lightgbm-batch.yml`'s own `MATRIX_JOBS`
 training-compute parallelism. FRED is fetched once in `discover` and shared
 via artifact, so it's unaffected by shard count. SEC EDGAR fundamentals,
 however, are fetched per-ticker inside every `scan-shard` job, and

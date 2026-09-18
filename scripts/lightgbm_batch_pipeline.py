@@ -66,13 +66,17 @@ DEFAULT_BATCH_RETENTION = 4
 # This is unrelated to `MATRIX_JOBS`/training compute sharding above -- it
 # only affects how the already-merged live batch is stored for consumption,
 # and how many parallel scan-email-*.yml "scan-shard" matrix jobs run.
-# Bumped 8 -> 16 to absorb the added per-ticker cost of the now-enabled
-# LightGBM walk-forward backtests (evaluate_lightgbm=True at 30d/180d) without
-# materially increasing per-shard wall-clock time. The scan-email workflows'
+# Bumped 16 -> 128 (PR #59 Phase 3): PR #59's Phase 1+2 (real cache + one
+# analyze_stock() call per ticker instead of two) cut per-ticker cost roughly
+# in half but did *not* fit within the 340-minute timeout-minutes guardrail --
+# a post-merge measurement of the live 16-shard run showed ~100-200s/ticker
+# still projects 7.8h-15h per shard at ~277 tickers/shard. 128 shards brings
+# that down to ~35 tickers/shard (~2-2.5h worst case), comfortably under the
+# guardrail with headroom for per-ticker slowdowns. The scan-email workflows'
 # "Scan shard" step divides SEC_EDGAR_MAX_REQUESTS_PER_SECOND by this shard
 # count, so aggregate SEC EDGAR call volume across shards stays bounded
 # regardless of how high this is set.
-DEFAULT_SCAN_SHARD_COUNT = 16
+DEFAULT_SCAN_SHARD_COUNT = 128
 # I/O-bound per-ticker Polygon fetches in discover() benefit from the same
 # thread-pool concurrency used by modules/screener.py::run_screener().
 DEFAULT_DISCOVER_WORKERS = 8
