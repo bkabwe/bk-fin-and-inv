@@ -489,5 +489,40 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         self.assertTrue(result["medium_term_lightgbm_backtested"])
 
 
+class GarchSharedForecastTests(unittest.TestCase):
+    @unittest.skipUnless(scoring_engine.ARCH_AVAILABLE, "arch not installed")
+    def test_shared_forecast_matches_independent_per_horizon_fits(self):
+        # `_get_price_projections_core` fits GARCH(1,1) once (at the longest
+        # 720d horizon) and reuses that forecast for the 30d/180d/720d
+        # confidence intervals instead of refitting per horizon. GARCH
+        # multi-step variance forecasts are a deterministic recursion from
+        # the fitted parameters, so this must produce bit-identical results
+        # to the old independent-fit-per-horizon behavior.
+        rng = np.random.default_rng(7)
+        log_returns = rng.normal(0, 0.01, 400)
+        current_price = 100.0
+
+        independent = {
+            horizon: scoring_engine._garch_confidence_from_returns(current_price, log_returns, horizon)
+            for horizon in (30, 180, 720)
+        }
+
+        shared_forecast = scoring_engine._fit_garch_forecast(log_returns, max_horizon=720)
+        shared = {
+            horizon: scoring_engine._garch_confidence_from_returns(current_price, log_returns, horizon, forecast=shared_forecast)
+            for horizon in (30, 180, 720)
+        }
+
+        for horizon in (30, 180, 720):
+            self.assertAlmostEqual(independent[horizon][0], shared[horizon][0], places=9)
+            self.assertAlmostEqual(independent[horizon][1], shared[horizon][1], places=9)
+
+    def test_falls_back_to_independent_fit_when_no_shared_forecast_given(self):
+        with patch.object(scoring_engine, "ARCH_AVAILABLE", False):
+            low, high = scoring_engine._garch_confidence_from_returns(100.0, np.zeros(100), 30)
+        self.assertIsNone(low)
+        self.assertIsNone(high)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -190,6 +190,30 @@ def run_walk_forward(
         lightgbm_diagnostic_rows: list[dict[str, float | int]] = []
         lightgbm_horizon = int(config.horizon)
 
+        # Select the ARIMA (p,d,q) order once per horizon from the earliest
+        # window's training slice and reuse it across all windows, instead of
+        # re-running the full 36-combo AIC grid search inside every window.
+        # This is the dominant per-ticker cost (order search alone was
+        # measured at several minutes per ticker across 30d+180d windows) and
+        # order stability across a ticker's rolling windows is high, so this
+        # trades a small amount of per-window order specificity for a large,
+        # low-risk reduction in redundant statsmodels fits. Falls back to
+        # per-window selection only if the shared selection itself fails.
+        shared_arima_order: tuple[int, int, int] | None = None
+        if ARIMA_AVAILABLE and starts:
+            first_start = starts[0]
+            first_train = close.iloc[first_start : first_start + int(config.train_len)]
+            try:
+                shared_arima_order = _select_arima_order(first_train)
+            except Exception as exc:
+                logger.warning(
+                    "Shared ARIMA order selection failed for %s; falling back to per-window selection: %s: %s",
+                    ticker.upper(),
+                    type(exc).__name__,
+                    exc,
+                )
+                shared_arima_order = None
+
         for start in starts:
             train = close.iloc[start : start + int(config.train_len)]
             test = close.iloc[start + int(config.train_len) : start + int(config.train_len) + int(config.test_len)]
@@ -200,7 +224,7 @@ def run_walk_forward(
 
             if ARIMA_AVAILABLE:
                 try:
-                    order = _select_arima_order(train)
+                    order = shared_arima_order if shared_arima_order is not None else _select_arima_order(train)
                     pred = fit_arima_with_hardening(train, order=order, logger=logger).forecast(steps=int(config.test_len))
                     arima_errors.append(_rmse(test_vals, np.array(pred.values, dtype=float)))
                 except Exception as exc:

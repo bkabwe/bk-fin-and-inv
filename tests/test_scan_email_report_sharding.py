@@ -236,6 +236,37 @@ def _fake_analysis(
     }
 
 
+class LiveScoringContextTests(unittest.TestCase):
+    def test_patches_backtester_build_feature_table_with_shared_macro_too(self):
+        # `modules.backtester` imports its own `build_feature_table` reference
+        # (rather than calling through `scoring_engine`), so
+        # `run_walk_forward`'s per-window LightGBM feature building needs the
+        # shared macro table injected there too -- otherwise every
+        # walk-forward window re-fetches macro data live from FRED for its
+        # own date slice instead of reusing the already-fetched shared table.
+        import modules.backtester as backtester
+        import modules.scoring_engine as scoring_engine
+
+        shared_macro_table = pd.DataFrame({"macro_x": [1.0]})
+        seen_kwargs = []
+
+        def fake_build_feature_table(*args, **kwargs):
+            seen_kwargs.append(kwargs)
+            return pd.DataFrame()
+
+        with (
+            patch.object(scoring_engine, "build_feature_table", side_effect=fake_build_feature_table),
+            patch.object(backtester, "build_feature_table", side_effect=fake_build_feature_table),
+            scan_email_report.live_scoring_context({}, {}, shared_macro_table),
+        ):
+            scoring_engine.build_feature_table("AAPL", pd.DataFrame())
+            backtester.build_feature_table("AAPL", pd.DataFrame())
+
+        self.assertEqual(len(seen_kwargs), 2)
+        for kwargs in seen_kwargs:
+            self.assertIs(kwargs.get("shared_macro_table"), shared_macro_table)
+
+
 class RunScanShardTests(unittest.TestCase):
     def test_empty_shard_skips_batch_download_and_scan(self):
         manifest = _manifest_with_shards(2, {"AAPL": 1})
@@ -343,6 +374,53 @@ class RunScanShardTests(unittest.TestCase):
             self.assertRaises(RuntimeError),
         ):
             scan_email_report.run_scan_shard("short_term", manifest, pd.DataFrame(), 0, 2)
+
+    def test_tickers_are_processed_concurrently_and_results_are_thread_safe(self):
+        # Regression test for the intra-shard ThreadPoolExecutor refactor:
+        # every ticker's outcome must still be aggregated correctly (no lost
+        # or duplicated rows/counters from concurrent `_process_ticker` calls)
+        # and multiple tickers must genuinely overlap in wall-clock time
+        # rather than run strictly sequentially.
+        import time
+
+        tickers = [f"T{i}" for i in range(12)]
+        manifest = _manifest_with_shards(2, {t: 0 for t in tickers})
+
+        def fake_run_shard_ticker(ticker, horizon):
+            time.sleep(0.05)
+            return {
+                "screener_row": {"Ticker": ticker, "Score": 1},
+                "profit_row": {"Ticker": ticker, "Score": 1, "_lightgbm_backtested": True, "Projected Upside %": 20.0},
+                "screener_fast_filtered": False,
+                "profit_fast_filtered": False,
+                "screener_fully_analyzed": True,
+                "profit_fully_analyzed": True,
+                "failed": False,
+                "reason": None,
+            }
+
+        with (
+            patch(
+                "scripts.scan_email_report.load_return_model_batch_from_urls",
+                return_value={"models": {t: {} for t in tickers}},
+            ),
+            patch("scripts.scan_email_report.live_scoring_context") as mock_context,
+            patch("scripts.scan_email_report._run_shard_ticker", side_effect=fake_run_shard_ticker),
+        ):
+            mock_context.return_value.__enter__ = lambda self: None
+            mock_context.return_value.__exit__ = lambda self, *exc: None
+            start = time.monotonic()
+            partial = scan_email_report.run_scan_shard("short_term", manifest, pd.DataFrame(), 0, 2, max_workers=8)
+            elapsed = time.monotonic() - start
+
+        self.assertEqual(sorted(partial["screener"]["Ticker"]), sorted(tickers))
+        self.assertEqual(sorted(partial["profit"]["Ticker"]), sorted(tickers))
+        self.assertEqual(partial["screener_attrs"]["fully_analyzed_count"], len(tickers))
+        self.assertEqual(partial["screener_attrs"]["failed_count"], 0)
+        self.assertEqual(partial["profit_stats_base"]["passed_fast_screen_count"], len(tickers))
+        # 12 tickers x 0.05s would take ~0.6s run sequentially; overlapping
+        # across 8 workers should finish well under that.
+        self.assertLess(elapsed, 0.4)
 
 
 class MergeShardOutputsTests(unittest.TestCase):

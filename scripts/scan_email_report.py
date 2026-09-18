@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -54,6 +56,12 @@ DEFAULT_MIN_UPSIDE_PCT = 15.0
 DEFAULT_FAST_SCREEN_PROXY_THRESHOLD = 15
 TOP_RESULTS_LIMIT = 75
 PREVIEW_LIMIT = 10
+# Each ticker's `_run_shard_ticker` call is independent (no shared mutable
+# state) and is I/O-bound (network fetches, live FRED/SEC calls) far more
+# than CPU-bound, matching `modules.screener.run_screener`'s existing
+# ThreadPoolExecutor pattern -- mirrored here so a shard's ~tickers-per-shard
+# analyses overlap their I/O wait instead of running strictly sequentially.
+DEFAULT_SCAN_SHARD_MAX_WORKERS = 8
 
 # The two fast-screen thresholds `run_screener` and
 # `scan_and_filter_profit_opportunities` each applied independently before
@@ -66,6 +74,7 @@ PROFIT_FAST_SCREEN_THRESHOLD = DEFAULT_FAST_SCREEN_PROXY_THRESHOLD  # matches sc
 
 @contextmanager
 def live_scoring_context(manifest: dict[str, Any], batch: dict[str, Any], shared_macro_table: pd.DataFrame):
+    import modules.backtester as backtester
     import modules.scoring_engine as scoring_engine
 
     original_build_feature_table = scoring_engine.build_feature_table
@@ -84,6 +93,16 @@ def live_scoring_context(manifest: dict[str, Any], batch: dict[str, Any], shared
         # always falls through to the already-loaded combined batch instead.
         patch.object(scoring_engine, "_load_live_lightgbm_shard_batch", return_value={}),
         patch.object(scoring_engine, "build_feature_table", side_effect=_build_feature_table_with_shared_macro),
+        # `modules.backtester` imports its own `build_feature_table` reference
+        # (rather than calling through `scoring_engine`), so `run_walk_forward`'s
+        # per-window LightGBM feature building needs this patched separately --
+        # otherwise every walk-forward window re-fetches macro data live from
+        # FRED for its own date slice instead of reusing the shared table
+        # already fetched once for the whole scan (up to ~33 redundant FRED
+        # HTTP calls per ticker: 3 series x up to 11 windows across the 30d/180d
+        # horizons). Same underlying function, same resulting feature values --
+        # this only removes redundant network I/O, not a modeling change.
+        patch.object(backtester, "build_feature_table", side_effect=_build_feature_table_with_shared_macro),
     ):
         yield
 
@@ -497,6 +516,7 @@ def run_scan_shard(
     macro_table: pd.DataFrame,
     shard_index: int,
     shard_count: int,
+    max_workers: int = DEFAULT_SCAN_SHARD_MAX_WORKERS,
 ) -> dict[str, Any]:
     """Run the screener + profit-opportunities analysis for one ticker shard.
 
@@ -505,6 +525,14 @@ def run_scan_shard(
     profit-opportunities row from a single `analyze_stock()` call (see its
     docstring for why this eliminates the duplicate-backtest root cause of
     shard timeouts).
+
+    Tickers within the shard are processed concurrently via a
+    `ThreadPoolExecutor` (mirroring `modules.screener.run_screener`'s
+    existing pattern): `_run_shard_ticker` is a pure, side-effect-free
+    function per ticker (no shared mutable state passed in), and its cost is
+    dominated by I/O-bound work (Polygon/SEC/FRED HTTP fetches) rather than
+    CPU, so overlapping tickers' I/O wait materially shortens shard wall-clock
+    time without changing what is computed for any individual ticker.
 
     Returns unrecorded, untruncated partial results (internal scoring fields
     intact) plus raw per-shard stats, ready to be merged with other shards'
@@ -551,11 +579,18 @@ def run_scan_shard(
     # calls, there's no longer a scenario where one path fails and the other
     # succeeds for the same ticker.
     failed_count = 0
+    processed_count = 0
+    _lock = threading.Lock()
 
     start_time = time.monotonic()
-    with live_scoring_context(manifest, batch, macro_table):
-        for i, ticker in enumerate(shard_tickers, start=1):
-            result = _run_shard_ticker(ticker, horizon)
+
+    def _process_ticker(ticker: str) -> None:
+        nonlocal screener_fast_filtered_count, screener_fully_analyzed_count
+        nonlocal profit_fast_filtered_count, profit_fully_analyzed_count
+        nonlocal failed_count, processed_count
+
+        result = _run_shard_ticker(ticker, horizon)
+        with _lock:
             if result["failed"]:
                 failed_count += 1
             if result["screener_fast_filtered"]:
@@ -571,6 +606,8 @@ def run_scan_shard(
             if result["profit_row"] is not None:
                 profit_rows.append(result["profit_row"])
 
+            processed_count += 1
+            i = processed_count
             # ETA log line: cheap, run-log-only visibility so a future
             # per-ticker slowdown shows up long before it turns into a full
             # 6h job timeout (see notify-on-failure's timeout messaging).
@@ -583,6 +620,22 @@ def run_scan_shard(
                     f"| projected shard total ~{(per_ticker * total) / 60:.1f}m",
                     flush=True,
                 )
+
+    with (
+        live_scoring_context(manifest, batch, macro_table),
+        concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor,
+    ):
+        futures = {executor.submit(_process_ticker, ticker): ticker for ticker in shard_tickers}
+        for future in concurrent.futures.as_completed(futures):
+            ticker = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                # `_run_shard_ticker` already catches and reports its own
+                # per-ticker failures in its returned outcome dict, so
+                # this is a defensive backstop for a truly unexpected
+                # error escaping that boundary -- not the normal failure path.
+                print(f"Shard {shard_index}/{shard_count}: unexpected error for {ticker}: {exc}", flush=True)
 
     screener_partial = pd.DataFrame(screener_rows) if screener_rows else pd.DataFrame()
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -586,13 +587,36 @@ def _live_lightgbm_price_projections(
     return projections, used_models, skipped_models
 
 
-def _garch_confidence_from_returns(current_price: float, log_returns: np.ndarray, horizon_days: int) -> tuple[float | None, float | None]:
+def _fit_garch_forecast(log_returns: np.ndarray, max_horizon: int):
+    """Fit a single GARCH(1,1) model and forecast variance out to
+    ``max_horizon`` once.
+
+    GARCH(1,1) multi-step variance forecasts are a deterministic recursion
+    from the fitted parameters, so a single ``forecast(horizon=max_horizon)``
+    call yields the exact same per-step variance at step ``h`` as separately
+    forecasting a shorter horizon ending at ``h``. This lets one fit+forecast
+    be shared across the 30/180/720d confidence-interval calls below instead
+    of refitting the identical model on the identical ``log_returns`` three
+    times per ticker, with no change to any resulting value.
+    """
+    model = arch_model(log_returns * 100, vol="GARCH", p=1, q=1, rescale=False)
+    fit = model.fit(disp="off")
+    return fit.forecast(horizon=max(int(max_horizon), 1), reindex=False)
+
+
+def _garch_confidence_from_returns(
+    current_price: float,
+    log_returns: np.ndarray,
+    horizon_days: int,
+    *,
+    forecast: Any | None = None,
+) -> tuple[float | None, float | None]:
     if not ARCH_AVAILABLE or len(log_returns) < 60 or current_price <= 0:
         return None, None
     try:
-        model = arch_model(log_returns * 100, vol="GARCH", p=1, q=1, rescale=False)
-        fit = model.fit(disp="off")
-        fcast = fit.forecast(horizon=max(horizon_days, 1), reindex=False)
+        fcast = forecast
+        if fcast is None:
+            fcast = _fit_garch_forecast(log_returns, max_horizon=horizon_days)
         var = float(fcast.variance.values[-1, min(horizon_days - 1, fcast.variance.shape[1] - 1)])
         sigma = np.sqrt(max(var, 1e-9)) / 100.0
         z = 1.96
@@ -888,9 +912,21 @@ def _get_price_projections_core(
     garch_low_30 = garch_high_30 = garch_low_180 = garch_high_180 = garch_low_720 = garch_high_720 = None
     if close is not None and len(close) > 80:
         log_returns = np.log(close / close.shift(1)).dropna().values.astype(float)
-        garch_low_30, garch_high_30 = _garch_confidence_from_returns(current_price, log_returns, 30)
-        garch_low_180, garch_high_180 = _garch_confidence_from_returns(current_price, log_returns, 180)
-        garch_low_720, garch_high_720 = _garch_confidence_from_returns(current_price, log_returns, 720)
+        # Fit the GARCH(1,1) model once (the expensive step) and share its
+        # 720d-horizon forecast across all three confidence-interval calls
+        # below instead of refitting the identical model on the identical
+        # returns three times per ticker; falls back to independent per-call
+        # fitting if the shared fit fails.
+        shared_garch_forecast = None
+        if ARCH_AVAILABLE and len(log_returns) >= 60:
+            try:
+                shared_garch_forecast = _fit_garch_forecast(log_returns, max_horizon=720)
+            except Exception as exc:
+                logger.warning("Shared GARCH fit failed; falling back to per-horizon fits: %s", exc)
+                shared_garch_forecast = None
+        garch_low_30, garch_high_30 = _garch_confidence_from_returns(current_price, log_returns, 30, forecast=shared_garch_forecast)
+        garch_low_180, garch_high_180 = _garch_confidence_from_returns(current_price, log_returns, 180, forecast=shared_garch_forecast)
+        garch_low_720, garch_high_720 = _garch_confidence_from_returns(current_price, log_returns, 720, forecast=shared_garch_forecast)
         if garch_low_30 is not None:
             models_used.append("GARCH(1,1) Confidence")
 

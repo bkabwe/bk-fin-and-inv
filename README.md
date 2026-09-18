@@ -333,10 +333,14 @@ excursion checks.
 
 Shard count is manifest-driven, set by `--scan-shard-count` at promote time
 (`scripts/lightgbm_batch_pipeline.py`'s `DEFAULT_SCAN_SHARD_COUNT`, currently
-16) — a separate concept from `train-lightgbm-batch.yml`'s own `MATRIX_JOBS`
+16, chosen to fit within a single wave under the account's GitHub Actions
+concurrent-job cap) — a separate concept from `train-lightgbm-batch.yml`'s own `MATRIX_JOBS`
 training-compute parallelism. FRED is fetched once in `discover` and shared
-via artifact, so it's unaffected by shard count. SEC EDGAR fundamentals,
-however, are fetched per-ticker inside every `scan-shard` job, and
+via artifact with every live scoring call inside a shard job — including each
+ticker's walk-forward backtest windows in `modules/backtester.py`, not just
+the live LightGBM projection path — so per-ticker analysis never re-fetches
+macro data live from FRED. SEC EDGAR fundamentals, however, are fetched
+per-ticker inside every `scan-shard` job, and
 `modules/sec_edgar_client.py` only self-throttles each job's own process to
 `SEC_EDGAR_MAX_REQUESTS_PER_SECOND` (default/max 10 req/s) — it can't
 coordinate across the parallel shards on its own. Each scan workflow's "Scan
@@ -344,7 +348,11 @@ shard" step divides that per-shard cap by the live shard count
 (`10.0 / needs.discover.outputs.shard_count`), the same pattern
 `train-lightgbm-batch.yml`'s `train` job already uses for its own
 `MATRIX_JOBS`, so the *aggregate* SEC EDGAR call rate across all shards stays
-bounded at ~10 req/s regardless of how many shards run concurrently.
+bounded at ~10 req/s regardless of how many shards run concurrently. Within
+each shard job, tickers are analyzed concurrently via a `ThreadPoolExecutor`
+(`scripts/scan_email_report.py::run_scan_shard`, `DEFAULT_SCAN_SHARD_MAX_WORKERS = 8`,
+mirroring `modules/screener.py::run_screener`'s existing pattern), since each
+ticker's analysis is independent and I/O-bound.
 
 ### Workflow-failure alerts
 
