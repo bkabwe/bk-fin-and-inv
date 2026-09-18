@@ -41,7 +41,18 @@ except Exception:  # pragma: no cover
             _lock = _threading.Lock()
 
             def wrapper(*args, **kwargs):
-                key = (args, tuple(sorted(kwargs.items())))
+                try:
+                    key = (args, tuple(sorted(kwargs.items())))
+                    hash(key)
+                except TypeError:
+                    # An argument (e.g. run_walk_forward's `data` DataFrame)
+                    # isn't hashable, so this call can't be cache-keyed here.
+                    # Run it directly rather than crashing -- Streamlit's real
+                    # st.cache_data (used whenever it's installed) already
+                    # handles DataFrame args via its own content hashing, so
+                    # this fallback path is only reachable in headless
+                    # (non-Streamlit) deployments.
+                    return func(*args, **kwargs)
                 while True:
                     now = _time.monotonic()
                     with _lock:
