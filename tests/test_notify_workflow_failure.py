@@ -129,7 +129,7 @@ class MainTests(unittest.TestCase):
             exit_code = notify_workflow_failure.main()
 
         self.assertEqual(exit_code, 0)
-        mock_alert.assert_called_once_with("Train LightGBM Batch")
+        mock_alert.assert_called_once_with("Train LightGBM Batch", job_results_json=None)
 
     @patch("scripts.notify_workflow_failure.send_failure_alert", return_value=False)
     def test_main_always_returns_zero_even_when_alert_fails(self, mock_alert):
@@ -137,6 +137,75 @@ class MainTests(unittest.TestCase):
             exit_code = notify_workflow_failure.main()
 
         self.assertEqual(exit_code, 0)
+
+    @patch("scripts.notify_workflow_failure.send_failure_alert", return_value=True)
+    def test_main_forwards_job_results(self, mock_alert):
+        argv = [
+            "notify_workflow_failure.py",
+            "--workflow",
+            "Scan Email Short-Term",
+            "--job-results",
+            '{"scan-shard": {"result": "cancelled"}}',
+        ]
+        with patch("sys.argv", argv):
+            exit_code = notify_workflow_failure.main()
+
+        self.assertEqual(exit_code, 0)
+        mock_alert.assert_called_once_with(
+            "Scan Email Short-Term", job_results_json='{"scan-shard": {"result": "cancelled"}}'
+        )
+
+
+class AnyJobCancelledTests(unittest.TestCase):
+    def test_returns_false_when_no_job_results_given(self):
+        self.assertFalse(notify_workflow_failure.any_job_cancelled(None))
+        self.assertFalse(notify_workflow_failure.any_job_cancelled(""))
+
+    def test_returns_false_when_json_is_malformed(self):
+        self.assertFalse(notify_workflow_failure.any_job_cancelled("{not valid json"))
+
+    def test_returns_false_when_json_is_not_an_object(self):
+        self.assertFalse(notify_workflow_failure.any_job_cancelled("[1, 2, 3]"))
+
+    def test_returns_false_when_all_jobs_succeeded_or_skipped(self):
+        job_results = '{"discover": {"result": "success"}, "reduce": {"result": "skipped"}}'
+        self.assertFalse(notify_workflow_failure.any_job_cancelled(job_results))
+
+    def test_returns_true_when_any_job_cancelled(self):
+        job_results = '{"discover": {"result": "success"}, "scan-shard": {"result": "cancelled"}}'
+        self.assertTrue(notify_workflow_failure.any_job_cancelled(job_results))
+
+
+class BuildAlertHtmlCancelledTests(unittest.TestCase):
+    def test_cancelled_alert_mentions_timeout_and_data_gap(self):
+        html_content = notify_workflow_failure.build_alert_html("Scan Email Short-Term", cancelled=True)
+
+        self.assertIn("cancelled", html_content)
+        self.assertIn("timeout-minutes", html_content)
+        self.assertNotIn("Workflow failed<", html_content)
+
+    def test_non_cancelled_alert_keeps_original_wording(self):
+        html_content = notify_workflow_failure.build_alert_html("Scan Email Short-Term", cancelled=False)
+
+        self.assertIn("Workflow failed", html_content)
+        self.assertNotIn("timeout-minutes", html_content)
+
+
+class SendFailureAlertCancelledTests(unittest.TestCase):
+    @patch("scripts.notify_workflow_failure.send_brevo_email")
+    def test_uses_cancelled_subject_when_job_results_indicate_cancellation(self, mock_send):
+        mock_send.return_value = 1
+
+        env = {"WORKFLOW_ALERT_RECIPIENTS": "", "SCAN_EMAIL_FROM": "reports@example.com"}
+        job_results = '{"scan-shard": {"result": "cancelled"}}'
+        with patch.dict("os.environ", env, clear=False):
+            result = notify_workflow_failure.send_failure_alert(
+                "Scan Email Short-Term", job_results_json=job_results
+            )
+
+        self.assertTrue(result)
+        subject = mock_send.call_args.kwargs["subject"]
+        self.assertIn("cancelled/timed out", subject)
 
 
 if __name__ == "__main__":
