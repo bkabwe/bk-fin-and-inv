@@ -24,7 +24,45 @@ _DEFAULT_MAX_WORKERS = 8
 # is skipped from the expensive ARIMA/trend/GARCH/backtest full analysis.
 # Increase this value to make the pre-filter more permissive (fewer false
 # negatives); set ``use_fast_screen=False`` to disable entirely.
-_DEFAULT_FAST_SCREEN_MARGIN = 15
+DEFAULT_FAST_SCREEN_MARGIN = 15
+
+
+def screener_row_from_analysis(
+    result: dict,
+    min_score: int,
+    *,
+    label: str = "",
+) -> dict | None:
+    """Build a screener result row from an already-computed
+    :func:`modules.scoring_engine.analyze_stock` result.
+
+    Returns ``None`` when ``result["score"]`` doesn't meet ``min_score``.
+    Factored out of ``run_screener``'s per-ticker worker so callers that
+    already have a shared ``analyze_stock`` result for this ticker (e.g. the
+    sharded scan-email path, which derives both a screener row and a
+    profit-opportunities row from a single analysis) can build this row
+    without re-running the full analysis.
+    """
+    if result["score"] < min_score:
+        return None
+    entry, current = result["entry_price"], result["current_price"]
+    pct = ((current - entry) / entry * 100) if entry and current else None
+    return {
+        "Ticker": result["ticker"],
+        "Company": result["company"],
+        "Score": result["score"],
+        "Recommendation": result["recommendation"],
+        "Time Horizon": result["time_horizon"],
+        "Sector Trend": str(result.get("sector_trend") or "unknown").replace("_", " ").title(),
+        "Market Cap Tier": result.get("market_cap_tier") or "unknown",
+        "Long-Term Stage": result.get("longterm_stage") or "",
+        "Entry Price": entry,
+        "Target Price": result["target_price"],
+        "Stop Loss": result["stop_loss"],
+        "Current Price": current,
+        "% from Entry": round(pct, 2) if pct is not None else None,
+        **({"Index": label} if label else {}),
+    }
 
 
 def _get_tickers(universe: str, custom_tickers: list[str] | None = None) -> list[str]:
@@ -49,7 +87,7 @@ def run_screener(
     progress_callback: Callable[[float], None] | None = None,
     max_workers: int = _DEFAULT_MAX_WORKERS,
     use_fast_screen: bool = True,
-    fast_screen_margin: int = _DEFAULT_FAST_SCREEN_MARGIN,
+    fast_screen_margin: int = DEFAULT_FAST_SCREEN_MARGIN,
     on_ticker_processed: Callable[[str, dict], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
     on_total_known: Callable[[int], None] | None = None,
@@ -148,25 +186,8 @@ def run_screener(
             result = analyze_stock(ticker)
             with _lock:
                 fully_analyzed_count += 1
-            if result["score"] >= min_score:
-                entry, current = result["entry_price"], result["current_price"]
-                pct = ((current - entry) / entry * 100) if entry and current else None
-                row = {
-                    "Ticker": result["ticker"],
-                    "Company": result["company"],
-                    "Score": result["score"],
-                    "Recommendation": result["recommendation"],
-                    "Time Horizon": result["time_horizon"],
-                    "Sector Trend": str(result.get("sector_trend") or "unknown").replace("_", " ").title(),
-                    "Market Cap Tier": result.get("market_cap_tier") or "unknown",
-                    "Long-Term Stage": result.get("longterm_stage") or "",
-                    "Entry Price": entry,
-                    "Target Price": result["target_price"],
-                    "Stop Loss": result["stop_loss"],
-                    "Current Price": current,
-                    "% from Entry": round(pct, 2) if pct is not None else None,
-                    **({"Index": label} if label else {}),
-                }
+            row = screener_row_from_analysis(result, min_score, label=label)
+            if row is not None:
                 with _lock:
                     rows.append(row)
         except Exception as exc:

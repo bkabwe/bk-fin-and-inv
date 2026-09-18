@@ -29,59 +29,7 @@ try:
 
     cache_data = st.cache_data
 except Exception:  # pragma: no cover
-    import threading as _threading
-    import time as _time
-
-    def cache_data(ttl: int | None = None):  # type: ignore[misc]
-        """TTL-aware, stampede-safe cache fallback for non-Streamlit (FastAPI) deployments."""
-
-        def decorator(func):
-            _cache: dict = {}
-            _inflight: dict = {}
-            _lock = _threading.Lock()
-
-            def wrapper(*args, **kwargs):
-                try:
-                    key = (args, tuple(sorted(kwargs.items())))
-                    hash(key)
-                except TypeError:
-                    # An argument (e.g. run_walk_forward's `data` DataFrame)
-                    # isn't hashable, so this call can't be cache-keyed here.
-                    # Run it directly rather than crashing -- Streamlit's real
-                    # st.cache_data (used whenever it's installed) already
-                    # handles DataFrame args via its own content hashing, so
-                    # this fallback path is only reachable in headless
-                    # (non-Streamlit) deployments.
-                    return func(*args, **kwargs)
-                while True:
-                    now = _time.monotonic()
-                    with _lock:
-                        entry = _cache.get(key)
-                        if entry is not None:
-                            value, ts = entry
-                            if ttl is None or (now - ts) < ttl:
-                                return value
-                        event = _inflight.get(key)
-                        if event is None:
-                            ev = _threading.Event()
-                            _inflight[key] = ev
-                            break
-                    event.wait(timeout=300)
-
-                try:
-                    result = func(*args, **kwargs)
-                    with _lock:
-                        _cache[key] = (result, _time.monotonic())
-                    return result
-                finally:
-                    with _lock:
-                        ev = _inflight.pop(key, None)
-                    if ev is not None:
-                        ev.set()
-
-            return wrapper
-
-        return decorator
+    from modules.cache_fallback import cache_data
 
 
 def _rmse(actual: np.ndarray, pred: np.ndarray) -> float:

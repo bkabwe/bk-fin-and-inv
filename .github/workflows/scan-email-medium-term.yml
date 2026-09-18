@@ -58,6 +58,10 @@ jobs:
   scan-shard:
     needs: discover
     runs-on: ubuntu-latest
+    # GitHub's hard job limit is 6h; fail loudly with a clear timeout error
+    # comfortably before that instead of being silently cancelled at the
+    # hard limit with no diagnostic signal.
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
@@ -153,7 +157,11 @@ jobs:
 
   notify-on-failure:
     needs: [discover, scan-shard, reduce]
-    if: failure()
+    # A shard hitting `timeout-minutes` (or the hard 6h GitHub Actions limit)
+    # concludes as "cancelled", not "failure" -- `if: failure()` alone would
+    # miss it and silently degrade this run's screener/profit-opportunities
+    # coverage and prediction-tracker history without any alert.
+    if: failure() || cancelled()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -163,4 +171,7 @@ jobs:
       - name: Install notifier dependencies
         run: pip install requests
       - name: Send workflow-failure alert
-        run: python scripts/notify_workflow_failure.py --workflow "Scan Email Medium-Term"
+        run: |
+          python scripts/notify_workflow_failure.py \
+            --workflow "Scan Email Medium-Term" \
+            --job-results '${{ toJson(needs) }}'
