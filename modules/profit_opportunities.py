@@ -17,7 +17,6 @@ per-ticker analysis helpers defined here.
 from __future__ import annotations
 
 import threading
-import time
 from datetime import date, timedelta
 from typing import Any, Callable
 
@@ -42,46 +41,7 @@ try:  # pragma: no cover - exercised implicitly wherever Streamlit runs
 
     cache_data = st.cache_data
 except Exception:  # pragma: no cover
-
-    def cache_data(ttl: int | None = None):  # type: ignore[misc]
-        """TTL-aware, stampede-safe cache fallback for non-Streamlit usage."""
-
-        def decorator(func):
-            _cache: dict = {}
-            _inflight: dict = {}
-            _lock = threading.Lock()
-
-            def wrapper(*args, **kwargs):
-                key = (args, tuple(sorted(kwargs.items())))
-                while True:
-                    now = time.monotonic()
-                    with _lock:
-                        entry = _cache.get(key)
-                        if entry is not None:
-                            value, ts = entry
-                            if ttl is None or (now - ts) < ttl:
-                                return value
-                        event = _inflight.get(key)
-                        if event is None:
-                            ev = threading.Event()
-                            _inflight[key] = ev
-                            break
-                    event.wait(timeout=300)
-
-                try:
-                    result = func(*args, **kwargs)
-                    with _lock:
-                        _cache[key] = (result, time.monotonic())
-                    return result
-                finally:
-                    with _lock:
-                        ev = _inflight.pop(key, None)
-                    if ev is not None:
-                        ev.set()
-
-            return wrapper
-
-        return decorator
+    from modules.cache_fallback import cache_data
 
 
 try:  # pragma: no cover
@@ -205,6 +165,74 @@ def collect_universe_tickers(
     return ordered, {k: ", ".join(sorted(v)) for k, v in source_map.items()}
 
 
+def profit_row_from_analysis(
+    ticker: str,
+    horizon: str,
+    analysis: dict[str, Any],
+    *,
+    label: str = "",
+) -> dict[str, Any] | None:
+    """Build a profit-opportunities result row from an already-computed
+    :func:`modules.scoring_engine.analyze_stock` result.
+
+    Returns ``None`` when the analysis has no usable (positive) current
+    price. Factored out of :func:`analyze_ticker_for_horizon` so callers that
+    already have a shared ``analyze_stock`` result for this ticker (e.g. the
+    sharded scan-email path, which derives both a screener row and a
+    profit-opportunities row from a single analysis) can build this row
+    without re-running the full analysis.
+    """
+    settings = HORIZON_SETTINGS[horizon]
+    projections = analysis.get("projections") or {}
+    current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
+    if current_price <= 0:
+        return None
+
+    target_price = float(projections.get(settings["target_key"]) or 0)
+    upside = float(projections.get(settings["upside_key"]) or 0)
+    rsi = (analysis.get("technical") or {}).get("indicators", {}).get("rsi")
+    breakdown = analysis.get("score_breakdown") or {}
+    lightgbm_backtested_key = settings.get("lightgbm_backtested_key")
+    lightgbm_backtested = bool(projections.get(lightgbm_backtested_key)) if lightgbm_backtested_key else None
+
+    return {
+        "Ticker": ticker,
+        "Company": analysis.get("company") or ticker,
+        "Score": int(analysis.get("score") or 0),
+        "Current Price": round(current_price, 4),
+        "Target Price": round(target_price, 4),
+        "Target Low": round(float(projections.get(settings["target_low_key"]) or target_price * 0.95), 4),
+        "Target High": round(float(projections.get(settings["target_high_key"]) or target_price * 1.05), 4),
+        "Projected Upside %": round(upside, 4),
+        "Sector Trend": str(analysis.get("sector_trend") or "unknown").replace("_", " ").title(),
+        "Market Cap Tier": analysis.get("market_cap_tier") or "unknown",
+        "Long-Term Stage": analysis.get("longterm_stage") or "",
+        "Confidence": str(projections.get("data_quality") or "Limited"),
+        "Basis": str(projections.get(settings["basis_key"]) or ""),
+        "_rsi": rsi,
+        # Internal-only technical sub-scores (stripped before display/API
+        # response, same as _rsi above), threaded through to
+        # record_predictions_from_scan so modules.prediction_tracker can
+        # empirically measure their inter-correlation over time -- see
+        # modules.prediction_tracker.SUBSCORE_ROW_FIELDS and
+        # compute_subscore_correlation_stats.
+        "_trend_score": breakdown.get("trend"),
+        "_momentum_score": breakdown.get("momentum"),
+        "_rs_score": breakdown.get("relative_strength"),
+        "_breakout_score": breakdown.get("breakout"),
+        "_volume_quality_score": breakdown.get("volume_quality"),
+        # Internal-only: whether this horizon's LightGBM ensemble
+        # component (if any) was backed by genuine per-ticker backtest
+        # evidence rather than the small fixed fallback weight. None for
+        # horizons without a LightGBM component (long-term). Callers that
+        # only want to surface backtest-confirmed LightGBM picks (e.g. the
+        # scheduled profit-opportunities report) filter on this before
+        # stripping it from the displayed/attached results.
+        "_lightgbm_backtested": lightgbm_backtested,
+        **({"Index": label} if label else {}),
+    }
+
+
 def analyze_ticker_for_horizon(
     ticker: str,
     horizon: str,
@@ -229,7 +257,6 @@ def analyze_ticker_for_horizon(
     re-applies it at display time so users can adjust the threshold without
     triggering a full re-scan.
     """
-    settings = HORIZON_SETTINGS[horizon]
     outcome: dict[str, Any] = {"row": None, "fast_filtered": False, "fully_analyzed": False, "failed": False, "reason": None}
     try:
         if use_fast_screen:
@@ -248,55 +275,7 @@ def analyze_ticker_for_horizon(
             analyze_kwargs["projection_data_override"] = price_data
         analysis = analyze_stock(ticker, **analyze_kwargs)
         outcome["fully_analyzed"] = True
-
-        projections = analysis.get("projections") or {}
-        current_price = float(projections.get("current_price") or analysis.get("current_price") or 0)
-        if current_price <= 0:
-            return outcome
-
-        target_price = float(projections.get(settings["target_key"]) or 0)
-        upside = float(projections.get(settings["upside_key"]) or 0)
-        rsi = (analysis.get("technical") or {}).get("indicators", {}).get("rsi")
-        breakdown = analysis.get("score_breakdown") or {}
-        lightgbm_backtested_key = settings.get("lightgbm_backtested_key")
-        lightgbm_backtested = bool(projections.get(lightgbm_backtested_key)) if lightgbm_backtested_key else None
-
-        outcome["row"] = {
-            "Ticker": ticker,
-            "Company": analysis.get("company") or ticker,
-            "Score": int(analysis.get("score") or 0),
-            "Current Price": round(current_price, 4),
-            "Target Price": round(target_price, 4),
-            "Target Low": round(float(projections.get(settings["target_low_key"]) or target_price * 0.95), 4),
-            "Target High": round(float(projections.get(settings["target_high_key"]) or target_price * 1.05), 4),
-            "Projected Upside %": round(upside, 4),
-            "Sector Trend": str(analysis.get("sector_trend") or "unknown").replace("_", " ").title(),
-            "Market Cap Tier": analysis.get("market_cap_tier") or "unknown",
-            "Long-Term Stage": analysis.get("longterm_stage") or "",
-            "Confidence": str(projections.get("data_quality") or "Limited"),
-            "Basis": str(projections.get(settings["basis_key"]) or ""),
-            "_rsi": rsi,
-            # Internal-only technical sub-scores (stripped before display/API
-            # response, same as _rsi above), threaded through to
-            # record_predictions_from_scan so modules.prediction_tracker can
-            # empirically measure their inter-correlation over time -- see
-            # modules.prediction_tracker.SUBSCORE_ROW_FIELDS and
-            # compute_subscore_correlation_stats.
-            "_trend_score": breakdown.get("trend"),
-            "_momentum_score": breakdown.get("momentum"),
-            "_rs_score": breakdown.get("relative_strength"),
-            "_breakout_score": breakdown.get("breakout"),
-            "_volume_quality_score": breakdown.get("volume_quality"),
-            # Internal-only: whether this horizon's LightGBM ensemble
-            # component (if any) was backed by genuine per-ticker backtest
-            # evidence rather than the small fixed fallback weight. None for
-            # horizons without a LightGBM component (long-term). Callers that
-            # only want to surface backtest-confirmed LightGBM picks (e.g. the
-            # scheduled profit-opportunities report) filter on this before
-            # stripping it from the displayed/attached results.
-            "_lightgbm_backtested": lightgbm_backtested,
-            **({"Index": label} if label else {}),
-        }
+        outcome["row"] = profit_row_from_analysis(ticker, horizon, analysis, label=label)
         return outcome
     except Exception as exc:
         outcome["failed"] = True

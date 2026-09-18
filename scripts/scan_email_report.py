@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from modules.data_fetcher import get_stock_data
 from modules.email_reports import (
     csv_attachment,
     render_html_table,
@@ -37,9 +39,11 @@ from modules.profit_opportunities import (
     DEFAULT_FAST_SCREEN_MARGIN,
     HORIZON_SETTINGS as _ALL_HORIZON_SETTINGS,
     filter_by_upside,
+    profit_row_from_analysis,
     scan_profit_opportunities,
 )
-from modules.screener import run_screener
+from modules.scoring_engine import analyze_stock, fast_screen_score
+from modules.screener import DEFAULT_FAST_SCREEN_MARGIN as SCREENER_FAST_SCREEN_MARGIN, screener_row_from_analysis
 
 # Scheduled scans only cover short/medium term horizons; keep the same
 # restricted subset here (rather than the full three-horizon superset in
@@ -50,6 +54,14 @@ DEFAULT_MIN_UPSIDE_PCT = 15.0
 DEFAULT_FAST_SCREEN_PROXY_THRESHOLD = 15
 TOP_RESULTS_LIMIT = 75
 PREVIEW_LIMIT = 10
+
+# The two fast-screen thresholds `run_screener` and
+# `scan_and_filter_profit_opportunities` each applied independently before
+# `run_scan_shard` unified them into a single per-ticker pass. A ticker can
+# clear one and not the other, so `_run_shard_ticker` evaluates both from one
+# shared `fast_screen_score` call rather than reusing a single threshold.
+SCREENER_FAST_SCREEN_THRESHOLD = DEFAULT_MIN_SCORE - SCREENER_FAST_SCREEN_MARGIN  # 50 - 15 = 35
+PROFIT_FAST_SCREEN_THRESHOLD = DEFAULT_FAST_SCREEN_PROXY_THRESHOLD  # matches scan_and_filter_profit_opportunities's effective threshold
 
 
 @contextmanager
@@ -392,6 +404,93 @@ def build_scan_report(
     )
 
 
+def _run_shard_ticker(ticker: str, horizon: str) -> dict[str, Any]:
+    """Run a single shared full analysis for `ticker` and derive both a
+    screener-style row and a horizon-specific profit-opportunities row from
+    it.
+
+    This replaces what used to be two fully independent `analyze_stock()`
+    passes per ticker inside `run_scan_shard` -- once via `run_screener`
+    (1y data) and once via `scan_and_filter_profit_opportunities` (5y data).
+    Both passes fed into `get_price_projections`, which runs a genuine 30d
+    *and* 180d ARIMA/LightGBM walk-forward backtest, so every ticker's
+    backtests were being computed twice per shard; with ~277 tickers/shard
+    that duplication was the root cause of shards exceeding GitHub's 6h job
+    limit once PR 58 fixed a caching bug that had been silently swallowing
+    these calls. Fetching one 5y OHLCV window (a superset of the screener's
+    former 1y window) and calling `analyze_stock()` exactly once collapses
+    that back down to one backtest pass per ticker per shard, with zero
+    change to the models, windows, or evidence used.
+
+    Returns a status dict:
+    ``{"screener_row": dict | None, "profit_row": dict | None,
+       "screener_fast_filtered": bool, "profit_fast_filtered": bool,
+       "screener_fully_analyzed": bool, "profit_fully_analyzed": bool,
+       "failed": bool, "reason": str | None}``.
+
+    The screener and profit-opportunities fast-screen thresholds
+    (`SCREENER_FAST_SCREEN_THRESHOLD`/`PROFIT_FAST_SCREEN_THRESHOLD`) are
+    independent -- a ticker can clear one and not the other -- so both are
+    checked against a single shared `fast_screen_score` call, and the
+    expensive `analyze_stock()` call is skipped entirely only when a ticker
+    fails both.
+    """
+    outcome: dict[str, Any] = {
+        "screener_row": None,
+        "profit_row": None,
+        "screener_fast_filtered": False,
+        "profit_fast_filtered": False,
+        "screener_fully_analyzed": False,
+        "profit_fully_analyzed": False,
+        "failed": False,
+        "reason": None,
+    }
+    try:
+        try:
+            # 5y (not 1y) so a genuine 180d LightGBM walk-forward backtest has
+            # enough history to run inside analyze_stock -- see the identical
+            # rationale documented at modules.scoring_engine's
+            # _get_price_projections_core, which this mirrors.
+            price_data = get_stock_data(ticker, period="5y", interval="1d")
+        except Exception:
+            # Fall through with price_data=None: fast_screen_score and
+            # analyze_stock each retry their own default-period fetch below,
+            # matching scan_profit_opportunities's existing graceful
+            # degradation on a prefetch failure.
+            price_data = None
+
+        fast_score, err = fast_screen_score(ticker, data=price_data)
+        if err is not None:
+            outcome["failed"] = True
+            outcome["reason"] = f"fast-screen error: {err}"
+            return outcome
+
+        passes_screener = fast_score >= SCREENER_FAST_SCREEN_THRESHOLD
+        passes_profit = fast_score >= PROFIT_FAST_SCREEN_THRESHOLD
+        outcome["screener_fast_filtered"] = not passes_screener
+        outcome["profit_fast_filtered"] = not passes_profit
+        if not passes_screener and not passes_profit:
+            return outcome
+
+        analyze_kwargs: dict[str, Any] = {"investment_horizon": horizon}
+        if price_data is not None:
+            analyze_kwargs["data_override"] = price_data
+            analyze_kwargs["projection_data_override"] = price_data
+        analysis = analyze_stock(ticker, **analyze_kwargs)
+
+        if passes_screener:
+            outcome["screener_fully_analyzed"] = True
+            outcome["screener_row"] = screener_row_from_analysis(analysis, DEFAULT_MIN_SCORE)
+        if passes_profit:
+            outcome["profit_fully_analyzed"] = True
+            outcome["profit_row"] = profit_row_from_analysis(ticker, horizon, analysis)
+        return outcome
+    except Exception as exc:
+        outcome["failed"] = True
+        outcome["reason"] = str(exc) or type(exc).__name__
+        return outcome
+
+
 def run_scan_shard(
     horizon: str,
     manifest: dict[str, Any],
@@ -399,7 +498,13 @@ def run_scan_shard(
     shard_index: int,
     shard_count: int,
 ) -> dict[str, Any]:
-    """Run the screener + profit-opportunities scans for one ticker shard.
+    """Run the screener + profit-opportunities analysis for one ticker shard.
+
+    Each ticker is analyzed exactly once via `_run_shard_ticker`, which
+    derives both the screener-style row and the horizon-specific
+    profit-opportunities row from a single `analyze_stock()` call (see its
+    docstring for why this eliminates the duplicate-backtest root cause of
+    shard timeouts).
 
     Returns unrecorded, untruncated partial results (internal scoring fields
     intact) plus raw per-shard stats, ready to be merged with other shards'
@@ -432,32 +537,83 @@ def run_scan_shard(
     if not ((batch or {}).get("models") or {}):
         raise RuntimeError(f"Shard {shard_index}/{shard_count} batch artifact is empty or unreachable")
 
+    total = len(shard_tickers)
+    screener_rows: list[dict] = []
+    profit_rows: list[dict] = []
+    screener_fast_filtered_count = 0
+    screener_fully_analyzed_count = 0
+    profit_fast_filtered_count = 0
+    profit_fully_analyzed_count = 0
+    # A single shared fast-screen/analyze_stock call now backs both the
+    # screener and profit-opportunities views of each ticker (see
+    # `_run_shard_ticker`), so a failure is necessarily shared too -- unlike
+    # the old independent `run_screener`/`scan_and_filter_profit_opportunities`
+    # calls, there's no longer a scenario where one path fails and the other
+    # succeeds for the same ticker.
+    failed_count = 0
+
+    start_time = time.monotonic()
     with live_scoring_context(manifest, batch, macro_table):
-        screener_partial = run_screener(
-            universe="custom",
-            custom_tickers=shard_tickers,
-            min_score=DEFAULT_MIN_SCORE,
-            max_results=max(len(shard_tickers), 1),
-            max_workers=1,
-            use_fast_screen=True,
-        )
-        profit_partial, profit_stats_base = scan_and_filter_profit_opportunities(shard_tickers, horizon, max_results=None)
+        for i, ticker in enumerate(shard_tickers, start=1):
+            result = _run_shard_ticker(ticker, horizon)
+            if result["failed"]:
+                failed_count += 1
+            if result["screener_fast_filtered"]:
+                screener_fast_filtered_count += 1
+            if result["screener_fully_analyzed"]:
+                screener_fully_analyzed_count += 1
+            if result["screener_row"] is not None:
+                screener_rows.append(result["screener_row"])
+            if result["profit_fast_filtered"]:
+                profit_fast_filtered_count += 1
+            if result["profit_fully_analyzed"]:
+                profit_fully_analyzed_count += 1
+            if result["profit_row"] is not None:
+                profit_rows.append(result["profit_row"])
+
+            # ETA log line: cheap, run-log-only visibility so a future
+            # per-ticker slowdown shows up long before it turns into a full
+            # 6h job timeout (see notify-on-failure's timeout messaging).
+            if i == 1 or i % 25 == 0 or i == total:
+                elapsed = time.monotonic() - start_time
+                per_ticker = elapsed / i
+                print(
+                    f"Shard {shard_index}/{shard_count} progress: {i}/{total} tickers processed "
+                    f"| elapsed={elapsed / 60:.1f}m | ~{per_ticker:.1f}s/ticker "
+                    f"| projected shard total ~{(per_ticker * total) / 60:.1f}m",
+                    flush=True,
+                )
+
+    screener_partial = pd.DataFrame(screener_rows) if screener_rows else pd.DataFrame()
+
+    profit_scanned = pd.DataFrame(profit_rows) if profit_rows else pd.DataFrame()
+    profit_confirmed, lightgbm_unconfirmed_count = _require_lightgbm_backtested(profit_scanned)
+    # max_results=None: final top-N truncation is deferred to reduce_scan_shards
+    # once all shards' partials are combined, matching the old
+    # scan_and_filter_profit_opportunities(..., max_results=None) call here.
+    profit_partial = filter_by_upside(profit_confirmed, horizon, min_upside_pct=DEFAULT_MIN_UPSIDE_PCT, max_results=None)
 
     print(
-        f"Shard {shard_index}/{shard_count}: tickers={len(shard_tickers)} "
+        f"Shard {shard_index}/{shard_count}: tickers={total} "
         f"screener_qualified={len(screener_partial)} profit_qualified={len(profit_partial)}"
     )
     return {
         "shard_index": shard_index,
         "screener": screener_partial,
         "screener_attrs": {
-            "fast_filtered_count": int(screener_partial.attrs.get("fast_filtered_count") or 0),
-            "fully_analyzed_count": int(screener_partial.attrs.get("fully_analyzed_count") or 0),
-            "failed_count": int(screener_partial.attrs.get("failed_count") or 0),
-            "source_ticker_count": int(screener_partial.attrs.get("source_ticker_count") or len(shard_tickers)),
+            "fast_filtered_count": screener_fast_filtered_count,
+            "fully_analyzed_count": screener_fully_analyzed_count,
+            "failed_count": failed_count,
+            "source_ticker_count": total,
         },
         "profit": profit_partial,
-        "profit_stats_base": profit_stats_base,
+        "profit_stats_base": {
+            "scanned_count": total,
+            "fast_filtered_count": profit_fast_filtered_count,
+            "passed_fast_screen_count": profit_fully_analyzed_count,
+            "failed_count": failed_count,
+            "lightgbm_unconfirmed_count": lightgbm_unconfirmed_count,
+        },
     }
 
 

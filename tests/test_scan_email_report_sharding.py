@@ -198,46 +198,143 @@ class RequireLightgbmBacktestedTests(unittest.TestCase):
 
 
 
+def _fake_analysis(
+    ticker: str,
+    *,
+    score: int = 80,
+    current_price: float = 100.0,
+    upside_pct: float = 20.0,
+    lightgbm_backtested: bool = True,
+) -> dict:
+    """A minimal but shape-complete `analyze_stock()`-style result, covering
+    every field `screener_row_from_analysis`/`profit_row_from_analysis` read."""
+    return {
+        "ticker": ticker,
+        "company": f"{ticker} Inc.",
+        "current_price": current_price,
+        "score": score,
+        "recommendation": "Buy",
+        "sector_trend": "bullish",
+        "market_cap_tier": "large",
+        "time_horizon": "Short-Term Trade",
+        "longterm_stage": "",
+        "entry_price": current_price,
+        "target_price": current_price * 1.1,
+        "stop_loss": current_price * 0.9,
+        "technical": {"indicators": {"rsi": 55.0}},
+        "score_breakdown": {"trend": 1, "momentum": 2, "relative_strength": 3, "breakout": 4, "volume_quality": 5},
+        "projections": {
+            "current_price": current_price,
+            "short_term_target": current_price * (1 + upside_pct / 100),
+            "short_term_low": current_price * 1.05,
+            "short_term_high": current_price * 1.15,
+            "short_term_upside": upside_pct,
+            "short_term_basis": "ARIMA",
+            "short_term_lightgbm_backtested": lightgbm_backtested,
+            "data_quality": "Full",
+        },
+    }
+
+
 class RunScanShardTests(unittest.TestCase):
     def test_empty_shard_skips_batch_download_and_scan(self):
         manifest = _manifest_with_shards(2, {"AAPL": 1})
         with (
             patch("scripts.scan_email_report.load_return_model_batch_from_urls") as mock_load_batch,
-            patch("scripts.scan_email_report.run_screener") as mock_screener,
+            patch("scripts.scan_email_report.analyze_stock") as mock_analyze,
         ):
             partial = scan_email_report.run_scan_shard("short_term", manifest, pd.DataFrame(), 0, 2)
 
         mock_load_batch.assert_not_called()
-        mock_screener.assert_not_called()
+        mock_analyze.assert_not_called()
         self.assertEqual(partial["shard_index"], 0)
         self.assertTrue(partial["screener"].empty)
         self.assertTrue(partial["profit"].empty)
 
-    def test_non_empty_shard_downloads_batch_and_runs_scans(self):
+    def test_non_empty_shard_calls_analyze_stock_exactly_once_per_ticker(self):
+        # Regression test for the PR-58 shard-timeout root cause: `analyze_stock`
+        # (and the 30d/180d walk-forward backtests it triggers) must run exactly
+        # once per ticker per shard, not once via a screener pass and again via
+        # a profit-opportunities pass.
         manifest = _manifest_with_shards(2, {"AAPL": 0, "MSFT": 0})
-        screener_df = pd.DataFrame({"Ticker": ["AAPL"], "Score": [80]})
-        screener_df.attrs.update({"fast_filtered_count": 1, "fully_analyzed_count": 2, "failed_count": 0})
-        profit_df = pd.DataFrame({"Ticker": ["AAPL"], "_rsi": [55.0]})
+        fake_price_data = pd.DataFrame({"Close": [1.0, 2.0]})
 
         with (
-            patch("scripts.scan_email_report.load_return_model_batch_from_urls", return_value={"models": {"AAPL": {}}}) as mock_load_batch,
-            patch("scripts.scan_email_report.run_screener", return_value=screener_df) as mock_screener,
             patch(
-                "scripts.scan_email_report.scan_and_filter_profit_opportunities",
-                return_value=(profit_df, {"scanned_count": 2}),
-            ) as mock_scan_filter,
+                "scripts.scan_email_report.load_return_model_batch_from_urls",
+                return_value={"models": {"AAPL": {}, "MSFT": {}}},
+            ) as mock_load_batch,
             patch("scripts.scan_email_report.live_scoring_context") as mock_context,
+            patch("scripts.scan_email_report.get_stock_data", return_value=fake_price_data),
+            patch("scripts.scan_email_report.fast_screen_score", return_value=(90, None)),
+            patch("scripts.scan_email_report.analyze_stock", side_effect=lambda ticker, **kw: _fake_analysis(ticker)) as mock_analyze,
         ):
             mock_context.return_value.__enter__ = lambda self: None
             mock_context.return_value.__exit__ = lambda self, *exc: None
             partial = scan_email_report.run_scan_shard("short_term", manifest, pd.DataFrame(), 0, 2)
 
         mock_load_batch.assert_called_once_with(["https://example.com/shard-0.joblib"])
-        mock_screener.assert_called_once()
-        self.assertEqual(mock_screener.call_args.kwargs["custom_tickers"], ["AAPL", "MSFT"])
-        mock_scan_filter.assert_called_once_with(["AAPL", "MSFT"], "short_term", max_results=None)
+        self.assertEqual(mock_analyze.call_count, 2)
+        self.assertEqual(sorted(call.args[0] for call in mock_analyze.call_args_list), ["AAPL", "MSFT"])
+        # Both the screener-style and profit-opportunities rows must be
+        # derivable from that single shared analysis per ticker.
+        self.assertEqual(sorted(partial["screener"]["Ticker"]), ["AAPL", "MSFT"])
+        self.assertEqual(sorted(partial["profit"]["Ticker"]), ["AAPL", "MSFT"])
+        self.assertEqual(partial["screener_attrs"]["fully_analyzed_count"], 2)
+        self.assertEqual(partial["screener_attrs"]["fast_filtered_count"], 0)
+        self.assertEqual(partial["screener_attrs"]["failed_count"], 0)
+        self.assertEqual(partial["screener_attrs"]["source_ticker_count"], 2)
+        self.assertEqual(partial["profit_stats_base"]["scanned_count"], 2)
+        self.assertEqual(partial["profit_stats_base"]["passed_fast_screen_count"], 2)
+        self.assertEqual(partial["profit_stats_base"]["lightgbm_unconfirmed_count"], 0)
+
+    def test_ticker_failing_both_fast_screens_skips_analyze_stock(self):
+        # Skipping analyze_stock entirely when a ticker fails *both* the
+        # screener's (35) and profit-opportunities' (15) thresholds is the
+        # other half of the Phase 2 optimization -- verify it doesn't
+        # silently start calling analyze_stock for clearly-unqualified tickers.
+        manifest = _manifest_with_shards(2, {"AAPL": 0})
+        with (
+            patch("scripts.scan_email_report.load_return_model_batch_from_urls", return_value={"models": {"AAPL": {}}}),
+            patch("scripts.scan_email_report.live_scoring_context") as mock_context,
+            patch("scripts.scan_email_report.get_stock_data", return_value=pd.DataFrame({"Close": [1.0]})),
+            patch("scripts.scan_email_report.fast_screen_score", return_value=(5, None)),
+            patch("scripts.scan_email_report.analyze_stock") as mock_analyze,
+        ):
+            mock_context.return_value.__enter__ = lambda self: None
+            mock_context.return_value.__exit__ = lambda self, *exc: None
+            partial = scan_email_report.run_scan_shard("short_term", manifest, pd.DataFrame(), 0, 2)
+
+        mock_analyze.assert_not_called()
+        self.assertTrue(partial["screener"].empty)
+        self.assertTrue(partial["profit"].empty)
         self.assertEqual(partial["screener_attrs"]["fast_filtered_count"], 1)
-        self.assertEqual(partial["profit_stats_base"], {"scanned_count": 2})
+        self.assertEqual(partial["profit_stats_base"]["fast_filtered_count"], 1)
+
+    def test_ticker_passing_only_profit_threshold_builds_profit_row_only(self):
+        # A fast-score of 20 clears the profit-opportunities threshold (15)
+        # but not the stricter screener threshold (35) -- both are
+        # independent, so only the profit row should be built even though
+        # analyze_stock still only runs once.
+        manifest = _manifest_with_shards(2, {"AAPL": 0})
+        with (
+            patch("scripts.scan_email_report.load_return_model_batch_from_urls", return_value={"models": {"AAPL": {}}}),
+            patch("scripts.scan_email_report.live_scoring_context") as mock_context,
+            patch("scripts.scan_email_report.get_stock_data", return_value=pd.DataFrame({"Close": [1.0]})),
+            patch("scripts.scan_email_report.fast_screen_score", return_value=(20, None)),
+            patch("scripts.scan_email_report.analyze_stock", side_effect=lambda ticker, **kw: _fake_analysis(ticker)) as mock_analyze,
+        ):
+            mock_context.return_value.__enter__ = lambda self: None
+            mock_context.return_value.__exit__ = lambda self, *exc: None
+            partial = scan_email_report.run_scan_shard("short_term", manifest, pd.DataFrame(), 0, 2)
+
+        mock_analyze.assert_called_once()
+        self.assertTrue(partial["screener"].empty)
+        self.assertEqual(list(partial["profit"]["Ticker"]), ["AAPL"])
+        self.assertEqual(partial["screener_attrs"]["fast_filtered_count"], 1)
+        self.assertEqual(partial["screener_attrs"]["fully_analyzed_count"], 0)
+        self.assertEqual(partial["profit_stats_base"]["fast_filtered_count"], 0)
+        self.assertEqual(partial["profit_stats_base"]["passed_fast_screen_count"], 1)
 
     def test_raises_when_batch_is_empty(self):
         manifest = _manifest_with_shards(2, {"AAPL": 0})
