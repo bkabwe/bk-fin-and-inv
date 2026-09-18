@@ -650,6 +650,8 @@ def _get_price_projections_core(
             "outlook": "Neutral",
             "recommendation_to_sell_at": "Insufficient data to build projections.",
             "data_quality": "Limited",
+            "short_term_lightgbm_backtested": False,
+            "medium_term_lightgbm_backtested": False,
         }
 
     models_used: list[str] = []
@@ -712,6 +714,15 @@ def _get_price_projections_core(
         include_lightgbm=180 in lightgbm_projections,
     )
     long_model_weights = _projection_model_weights(720, backtest if model_weights else None, include_lightgbm=False)
+
+    # Whether LightGBM's contribution to this horizon's ensemble was actually
+    # backed by real per-ticker walk-forward evidence (vs. the small fixed
+    # fallback weight assigned above whenever a live model exists but this
+    # horizon's own backtest has no lightgbm_rmse). Consumers that only want
+    # to surface genuinely-validated LightGBM picks (e.g. the scheduled
+    # profit-opportunities report) can filter on these flags.
+    short_term_lightgbm_backtested = bool(30 in lightgbm_projections and _has_lightgbm_backtest_support(short_backtest))
+    medium_term_lightgbm_backtested = bool(180 in lightgbm_projections and _has_lightgbm_backtest_support(medium_backtest))
 
     arima_30 = arima_180 = arima_720 = None
     if STATSMODELS_AVAILABLE:
@@ -977,6 +988,8 @@ def _get_price_projections_core(
         "outlook": outlook,
         "recommendation_to_sell_at": recommendation_to_sell_at,
         "data_quality": data_quality,
+        "short_term_lightgbm_backtested": short_term_lightgbm_backtested,
+        "medium_term_lightgbm_backtested": medium_term_lightgbm_backtested,
     }
 
 

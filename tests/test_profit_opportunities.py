@@ -67,5 +67,38 @@ class AnalyzeTickerForHorizonSubscoreTests(unittest.TestCase):
             self.assertIsNone(row[field])
 
 
+class AnalyzeTickerForHorizonLightgbmBacktestedTests(unittest.TestCase):
+    """analyze_ticker_for_horizon's row dict should expose the per-horizon
+    LightGBM-backtested flag computed by modules.scoring_engine, so callers
+    (e.g. the scheduled scan report) can filter on genuinely backtest-
+    confirmed LightGBM picks."""
+
+    def test_row_exposes_true_lightgbm_backtested_flag_for_short_term(self):
+        analysis = _make_analysis()
+        analysis["projections"]["short_term_lightgbm_backtested"] = True
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "short_term", use_fast_screen=False)
+
+        self.assertIs(outcome["row"]["_lightgbm_backtested"], True)
+
+    def test_row_exposes_false_lightgbm_backtested_flag_when_absent(self):
+        analysis = _make_analysis()
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "medium_term", use_fast_screen=False)
+
+        self.assertIs(outcome["row"]["_lightgbm_backtested"], False)
+
+    def test_row_lightgbm_backtested_flag_is_none_for_long_term(self):
+        # long_term has no LightGBM component at all (see
+        # modules.scoring_engine), so HORIZON_SETTINGS deliberately omits a
+        # lightgbm_backtested_key for it and the row field stays None rather
+        # than filtering out every long-term result.
+        analysis = _make_analysis()
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "long_term", use_fast_screen=False)
+
+        self.assertIsNone(outcome["row"]["_lightgbm_backtested"])
+
+
 if __name__ == "__main__":
     unittest.main()

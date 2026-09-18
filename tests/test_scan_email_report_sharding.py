@@ -104,9 +104,29 @@ class ScanAndFilterFinalizeSplitTests(unittest.TestCase):
         self.assertEqual(mock_filter.call_args.kwargs.get("max_results"), None)
         self.assertIn("_rsi", results.columns)
         self.assertEqual(stats_base["scanned_count"], 1)
+        self.assertEqual(stats_base["lightgbm_unconfirmed_count"], 0)
         self.assertNotIn("qualified_count", stats_base)
         self.assertNotIn("recorded_count", stats_base)
         mock_scan.assert_called_once()
+
+    def test_scan_and_filter_drops_rows_lacking_lightgbm_backtest_evidence(self):
+        scanned = pd.DataFrame(
+            {
+                "Ticker": ["AAPL", "MSFT"],
+                "_lightgbm_backtested": [True, False],
+                "Projected Upside %": [20.0, 30.0],
+            }
+        )
+        scanned.attrs.update({"scanned_count": 2, "fast_filtered_count": 0, "fully_analyzed_count": 2, "failed_count": 0})
+
+        with (
+            patch("scripts.scan_email_report.scan_profit_opportunities", return_value=scanned),
+            patch("scripts.scan_email_report.record_predictions_from_scan"),
+        ):
+            results, stats_base = scan_email_report.scan_and_filter_profit_opportunities(["AAPL", "MSFT"], "short_term")
+
+        self.assertEqual(list(results["Ticker"]), ["AAPL"])
+        self.assertEqual(stats_base["lightgbm_unconfirmed_count"], 1)
 
     def test_finalize_strips_internal_fields_and_records_once_when_requested(self):
         results = pd.DataFrame({"Ticker": ["MSFT", "AAPL"], "_rsi": [60.0, 55.0], "_trend_score": [1, 2]})
@@ -124,6 +144,24 @@ class ScanAndFilterFinalizeSplitTests(unittest.TestCase):
         self.assertEqual(stats["qualified_count"], 2)
         self.assertEqual(stats["scanned_count"], 5)
 
+    def test_finalize_drops_confidence_and_lightgbm_backtested_for_short_term_only(self):
+        results = pd.DataFrame(
+            {
+                "Ticker": ["AAPL"],
+                "Confidence": ["Full"],
+                "_lightgbm_backtested": [True],
+            }
+        )
+
+        with patch("scripts.scan_email_report.record_predictions_from_scan"):
+            short_display, _ = scan_email_report.finalize_profit_results(results, "short_term", record=False)
+            medium_display, _ = scan_email_report.finalize_profit_results(results, "medium_term", record=False)
+
+        self.assertNotIn("Confidence", short_display.columns)
+        self.assertNotIn("_lightgbm_backtested", short_display.columns)
+        self.assertIn("Confidence", medium_display.columns)
+        self.assertNotIn("_lightgbm_backtested", medium_display.columns)
+
     def test_finalize_does_not_record_when_record_false(self):
         results = pd.DataFrame({"Ticker": ["MSFT"], "_rsi": [60.0]})
         with patch("scripts.scan_email_report.record_predictions_from_scan") as mock_record:
@@ -138,6 +176,26 @@ class ScanAndFilterFinalizeSplitTests(unittest.TestCase):
         self.assertTrue(display.empty)
         self.assertEqual(stats["recorded_count"], 0)
         self.assertEqual(stats["qualified_count"], 0)
+
+
+class RequireLightgbmBacktestedTests(unittest.TestCase):
+    def test_keeps_only_confirmed_rows_and_counts_dropped(self):
+        results = pd.DataFrame({"Ticker": ["AAPL", "MSFT", "GOOG"], "_lightgbm_backtested": [True, False, True]})
+        filtered, dropped = scan_email_report._require_lightgbm_backtested(results)
+        self.assertEqual(list(filtered["Ticker"]), ["AAPL", "GOOG"])
+        self.assertEqual(dropped, 1)
+
+    def test_no_op_when_column_missing(self):
+        results = pd.DataFrame({"Ticker": ["AAPL"]})
+        filtered, dropped = scan_email_report._require_lightgbm_backtested(results)
+        pd.testing.assert_frame_equal(filtered, results)
+        self.assertEqual(dropped, 0)
+
+    def test_no_op_when_results_empty(self):
+        filtered, dropped = scan_email_report._require_lightgbm_backtested(pd.DataFrame())
+        self.assertTrue(filtered.empty)
+        self.assertEqual(dropped, 0)
+
 
 
 class RunScanShardTests(unittest.TestCase):
@@ -225,7 +283,7 @@ class MergeShardOutputsTests(unittest.TestCase):
         )
         self.assertEqual(
             merged["profit_stats_totals"],
-            {"scanned_count": 4, "fast_filtered_count": 1, "passed_fast_screen_count": 2, "failed_count": 1},
+            {"scanned_count": 4, "fast_filtered_count": 1, "passed_fast_screen_count": 2, "failed_count": 1, "lightgbm_unconfirmed_count": 0},
         )
 
     def test_raises_when_no_partial_files_present(self):
@@ -237,12 +295,25 @@ class ReduceScanShardsTests(unittest.TestCase):
     def test_truncates_merged_frames_records_once_and_sends_single_email(self):
         manifest = {"tickers": {"AAPL": {}, "MSFT": {}}, "latest_batch": {}}
         screener_frame = pd.DataFrame({"Ticker": ["AAPL", "MSFT"], "Score": [70, 90]})
-        profit_frame = pd.DataFrame({"Ticker": ["AAPL", "MSFT"], "Projected Upside %": [10.0, 20.0], "_rsi": [55.0, 60.0]})
+        profit_frame = pd.DataFrame(
+            {
+                "Ticker": ["AAPL", "MSFT"],
+                "Score": [60, 80],
+                "Projected Upside %": [10.0, 20.0],
+                "_rsi": [55.0, 60.0],
+            }
+        )
         merged = {
             "screener_frames": [screener_frame],
             "screener_attrs_totals": {"fast_filtered_count": 1, "fully_analyzed_count": 2, "failed_count": 0, "source_ticker_count": 2},
             "profit_frames": [profit_frame],
-            "profit_stats_totals": {"scanned_count": 2, "fast_filtered_count": 1, "passed_fast_screen_count": 2, "failed_count": 0},
+            "profit_stats_totals": {
+                "scanned_count": 2,
+                "fast_filtered_count": 1,
+                "passed_fast_screen_count": 2,
+                "failed_count": 0,
+                "lightgbm_unconfirmed_count": 0,
+            },
         }
         finalized_display = profit_frame.drop(columns=["_rsi"])
         finalized_stats = {"scanned_count": 2, "recorded_count": 2, "qualified_count": 2}
@@ -260,11 +331,23 @@ class ReduceScanShardsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         mock_merge.assert_called_once()
-        mock_finalize.assert_called_once()
-        self.assertTrue(mock_finalize.call_args.kwargs["record"])
+        # finalize_profit_results is called three times: once (record=True) on
+        # the deduplicated union of both cuts to record predictions exactly
+        # once per ticker, and once each (record=False) for the by-upside and
+        # by-score display/CSV frames.
+        self.assertEqual(mock_finalize.call_count, 3)
+        record_flags = [call.kwargs["record"] for call in mock_finalize.call_args_list]
+        self.assertEqual(record_flags.count(True), 1)
+        self.assertEqual(record_flags.count(False), 2)
         mock_build_report.assert_called_once()
         mock_send_email.assert_called_once()
         self.assertIn("2026-01-01", mock_send_email.call_args.kwargs["subject"])
+        attachments = mock_send_email.call_args.kwargs["attachments"]
+        self.assertEqual(len(attachments), 3)
+        attachment_names = [attachment["name"] for attachment in attachments]
+        self.assertIn("screener_top75_2026-01-01.csv", attachment_names)
+        self.assertIn("profit_opportunities_by_upside_top75_2026-01-01.csv", attachment_names)
+        self.assertIn("profit_opportunities_by_score_top75_2026-01-01.csv", attachment_names)
 
     def test_handles_all_empty_shards_without_raising(self):
         manifest = {"tickers": {}, "latest_batch": {}}
@@ -272,7 +355,13 @@ class ReduceScanShardsTests(unittest.TestCase):
             "screener_frames": [],
             "screener_attrs_totals": {"fast_filtered_count": 0, "fully_analyzed_count": 0, "failed_count": 0, "source_ticker_count": 0},
             "profit_frames": [],
-            "profit_stats_totals": {"scanned_count": 0, "fast_filtered_count": 0, "passed_fast_screen_count": 0, "failed_count": 0},
+            "profit_stats_totals": {
+                "scanned_count": 0,
+                "fast_filtered_count": 0,
+                "passed_fast_screen_count": 0,
+                "failed_count": 0,
+                "lightgbm_unconfirmed_count": 0,
+            },
         }
         with (
             patch("scripts.scan_email_report.merge_shard_outputs", return_value=merged),

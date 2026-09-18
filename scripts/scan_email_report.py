@@ -145,6 +145,24 @@ def fetch_shared_macro_table(lookback_days: int = 365 * 5) -> pd.DataFrame:
     return macro_table
 
 
+def _require_lightgbm_backtested(results: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Drop rows whose LightGBM ensemble contribution (if any) for this
+    horizon wasn't backed by genuine per-ticker walk-forward backtest
+    evidence -- i.e. rows that either had no live LightGBM prediction at all,
+    or would only have relied on the small fixed fallback weight (see
+    modules.scoring_engine._has_lightgbm_backtest_support).
+
+    Every profit-opportunities result the scheduled report ships must have a
+    real, backtested LightGBM signal behind it. Returns
+    `(filtered_results, dropped_count)`.
+    """
+    if results is None or results.empty or "_lightgbm_backtested" not in results.columns:
+        return results, 0
+    confirmed_mask = results["_lightgbm_backtested"] == True  # noqa: E712
+    dropped = int((~confirmed_mask).sum())
+    return results[confirmed_mask].reset_index(drop=True), dropped
+
+
 def scan_and_filter_profit_opportunities(
     tickers: list[str],
     horizon: str,
@@ -172,12 +190,14 @@ def scan_and_filter_profit_opportunities(
         # Polygon fetch per ticker, just a larger payload.
         prefetch_price_period="5y",
     )
-    filtered = filter_by_upside(scanned, horizon, min_upside_pct=min_upside_pct, max_results=max_results)
+    confirmed, lightgbm_unconfirmed_count = _require_lightgbm_backtested(scanned)
+    filtered = filter_by_upside(confirmed, horizon, min_upside_pct=min_upside_pct, max_results=max_results)
     stats_base = {
         "scanned_count": int(scanned.attrs.get("scanned_count", len(tickers))),
         "fast_filtered_count": int(scanned.attrs.get("fast_filtered_count", 0)),
         "passed_fast_screen_count": int(scanned.attrs.get("fully_analyzed_count", 0)),
         "failed_count": int(scanned.attrs.get("failed_count", 0)),
+        "lightgbm_unconfirmed_count": lightgbm_unconfirmed_count,
     }
     return filtered, stats_base
 
@@ -197,7 +217,15 @@ def finalize_profit_results(
     here at the reduce stage (not per-shard).
     """
     recorded_rows = results.to_dict("records") if not results.empty else []
-    display_results = results.drop(columns=["_rsi", *SUBSCORE_ROW_FIELDS], errors="ignore")
+    drop_columns = ["_rsi", "_lightgbm_backtested", *SUBSCORE_ROW_FIELDS]
+    if horizon == "short_term":
+        # Confidence (Full/Limited/Technical Only) is derived from a
+        # ticker-wide models_used list that includes Fundamental Fair Value
+        # even though the short-term ensemble never uses it -- the label is
+        # effectively meaningless at this horizon, so it's dropped from the
+        # short-term dashboard/attachment (medium-term keeps it).
+        drop_columns.append("Confidence")
+    display_results = results.drop(columns=drop_columns, errors="ignore")
 
     if record and recorded_rows:
         recorded_count = record_predictions_from_scan(recorded_rows, horizon=horizon, source="profit_opportunities")
@@ -256,22 +284,83 @@ def _preview_rows(df: pd.DataFrame, columns: list[str], *, limit: int = PREVIEW_
     return formatted
 
 
+def _profit_subsection(
+    title: str,
+    sort_label: str,
+    results: pd.DataFrame,
+    profit_stats: dict[str, int],
+    horizon: str,
+    *,
+    show_recorded_tile: bool = False,
+) -> str:
+    top = results.iloc[0] if not results.empty else None
+    avg_upside = float(results["Projected Upside %"].mean()) if not results.empty else None
+    median_upside = float(results["Projected Upside %"].median()) if not results.empty else None
+
+    columns = ["Ticker", "Company", "Score", "Current Price", "Target Price", "Projected Upside %"]
+    tiles = [
+        {"label": "Top ticker", "value": str(top["Ticker"]) if top is not None else "—"},
+        {
+            "label": "Avg / median upside",
+            "value": ("—" if avg_upside is None else f"{avg_upside:.2f}% / {median_upside:.2f}%"),
+        },
+    ]
+    if show_recorded_tile:
+        tiles = [
+            {"label": "Passed fast-screen", "value": str(int(profit_stats.get("passed_fast_screen_count") or 0))},
+            {"label": "Recorded predictions", "value": str(int(profit_stats.get("recorded_count") or 0))},
+            {
+                "label": "LightGBM-unconfirmed dropped",
+                "value": str(int(profit_stats.get("lightgbm_unconfirmed_count") or 0)),
+            },
+            *tiles,
+        ]
+
+    legend_html = ""
+    if horizon != "short_term":
+        # Confidence (Full/Limited/Technical Only) is derived from a
+        # ticker-wide models_used list that includes models the short-term
+        # ensemble never uses (see modules.scoring_engine), so it's omitted
+        # entirely from short-term output where the label is close to
+        # meaningless; medium-term keeps it.
+        columns = [*columns, "Confidence"]
+        tiles.append(
+            {
+                "label": "High-confidence picks",
+                "value": str(int((results["Confidence"] == "Full").sum())) if not results.empty else "0",
+            }
+        )
+        legend_html = (
+            '<div style="margin-top:14px;"><div style="color:#a9bdd7;font-size:12px;text-transform:uppercase;'
+            'letter-spacing:0.06em;margin-bottom:6px;">Confidence legend</div>'
+            f"{render_legend([{'label': 'Full', 'description': 'ARIMA, trend, and fundamental/DCF models all contributed to the projection — highest-confidence tier.'}, {'label': 'Limited', 'description': 'Partial model coverage (e.g. missing fundamentals or a fitted trend) — treat with more caution.'}, {'label': 'Technical Only', 'description': 'Speculative/OTC ticker with no fundamental EPS data — projection is technical-trend only, higher risk.'}])}"
+            "</div>"
+        )
+
+    return (
+        f'<h3 style="margin:18px 0 8px 0;color:#f4fff8;">{title}</h3>'
+        f'<p style="margin:0 0 12px 0;color:#a9bdd7;">Ranked by {sort_label}, all LightGBM-backtest-confirmed for '
+        f"{HORIZON_SETTINGS[horizon]['label']}. Top 10 preview below; full top 75 is attached as CSV.</p>"
+        f"{render_metric_tiles(tiles)}"
+        f'<div style="margin-top:18px;">{render_html_table(columns, _preview_rows(results, columns))}</div>'
+        f"{legend_html}"
+    )
+
+
 def build_scan_report(
     manifest: dict[str, Any],
     tickers: list[str],
     screener_results: pd.DataFrame,
-    profit_results: pd.DataFrame,
+    profit_by_upside: pd.DataFrame,
+    profit_by_score: pd.DataFrame,
     profit_stats: dict[str, int],
     horizon: str,
     run_date: str,
 ) -> str:
     current_run = (manifest or {}).get("current_run") or {}
     screener_top = screener_results.iloc[0] if not screener_results.empty else None
-    profit_top = profit_results.iloc[0] if not profit_results.empty else None
     screener_avg_score = float(screener_results["Score"].mean()) if not screener_results.empty else None
     screener_median_score = float(screener_results["Score"].median()) if not screener_results.empty else None
-    profit_avg_upside = float(profit_results["Projected Upside %"].mean()) if not profit_results.empty else None
-    profit_median_upside = float(profit_results["Projected Upside %"].median()) if not profit_results.empty else None
 
     sections = [
         (
@@ -282,12 +371,11 @@ def build_scan_report(
         ),
         (
             f"<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Profit opportunities top 75</h2>"
-            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Projected-upside scan for {HORIZON_SETTINGS[horizon]['label']}. Top 10 preview below; full top 75 is attached as CSV.</p>"
-            f"{render_metric_tiles([{'label': 'Passed fast-screen', 'value': str(int(profit_stats.get('passed_fast_screen_count') or 0))}, {'label': 'Recorded predictions', 'value': str(int(profit_stats.get('recorded_count') or 0))}, {'label': 'Top ticker', 'value': str(profit_top['Ticker']) if profit_top is not None else '—'}, {'label': 'Avg / median upside', 'value': ('—' if profit_avg_upside is None else f'{profit_avg_upside:.2f}% / {profit_median_upside:.2f}%')}, {'label': 'High-confidence picks', 'value': str(int((profit_results['Confidence'] == 'Full').sum())) if not profit_results.empty else '0'}])}"
-            f"<div style=\"margin-top:18px;\">{render_html_table(['Ticker', 'Company', 'Score', 'Current Price', 'Target Price', 'Projected Upside %', 'Confidence'], _preview_rows(profit_results, ['Ticker', 'Company', 'Score', 'Current Price', 'Target Price', 'Projected Upside %', 'Confidence']))}</div>"
-            f"<div style=\"margin-top:14px;\"><div style=\"color:#a9bdd7;font-size:12px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;\">Confidence legend</div>"
-            f"{render_legend([{'label': 'Full', 'description': 'ARIMA, trend, and fundamental/DCF models all contributed to the projection — highest-confidence tier.'}, {'label': 'Limited', 'description': 'Partial model coverage (e.g. missing fundamentals or a fitted trend) — treat with more caution.'}, {'label': 'Technical Only', 'description': 'Speculative/OTC ticker with no fundamental EPS data — projection is technical-trend only, higher risk.'}])}"
-            "</div>"
+            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Split into two rankings over the same qualifying pool for {HORIZON_SETTINGS[horizon]['label']}: one by projected upside, one by overall score. Full top 75 of each is attached as CSV.</p>"
+            + _profit_subsection(
+                "By upside", "projected upside %", profit_by_upside, profit_stats, horizon, show_recorded_tile=True
+            )
+            + _profit_subsection("By score", "overall score", profit_by_score, profit_stats, horizon)
         ),
     ]
 
@@ -318,7 +406,13 @@ def run_scan_shard(
     partials and finalized exactly once at the reduce stage.
     """
     empty_screener_attrs = {"fast_filtered_count": 0, "fully_analyzed_count": 0, "failed_count": 0, "source_ticker_count": 0}
-    empty_profit_stats = {"scanned_count": 0, "fast_filtered_count": 0, "passed_fast_screen_count": 0, "failed_count": 0}
+    empty_profit_stats = {
+        "scanned_count": 0,
+        "fast_filtered_count": 0,
+        "passed_fast_screen_count": 0,
+        "failed_count": 0,
+        "lightgbm_unconfirmed_count": 0,
+    }
 
     shard_tickers = tickers_for_shard(manifest, shard_index, shard_count)
     if not shard_tickers:
@@ -375,7 +469,13 @@ def merge_shard_outputs(partial_dir: Path) -> dict[str, Any]:
     screener_frames: list[pd.DataFrame] = []
     profit_frames: list[pd.DataFrame] = []
     screener_attrs_totals = {"fast_filtered_count": 0, "fully_analyzed_count": 0, "failed_count": 0, "source_ticker_count": 0}
-    profit_stats_totals = {"scanned_count": 0, "fast_filtered_count": 0, "passed_fast_screen_count": 0, "failed_count": 0}
+    profit_stats_totals = {
+        "scanned_count": 0,
+        "fast_filtered_count": 0,
+        "passed_fast_screen_count": 0,
+        "failed_count": 0,
+        "lightgbm_unconfirmed_count": 0,
+    }
 
     for path in partial_files:
         partial = joblib.load(path)
@@ -411,18 +511,33 @@ def reduce_scan_shards(horizon: str, manifest: dict[str, Any], partial_dir: Path
     screener_results.attrs.update(merged["screener_attrs_totals"])
 
     if merged["profit_frames"]:
-        profit_raw = pd.concat(merged["profit_frames"], ignore_index=True)
-        profit_raw = profit_raw.sort_values("Projected Upside %", ascending=False).head(TOP_RESULTS_LIMIT).reset_index(drop=True)
+        profit_pool = pd.concat(merged["profit_frames"], ignore_index=True)
     else:
-        profit_raw = pd.DataFrame()
-    profit_results, profit_stats = finalize_profit_results(
-        profit_raw, horizon, record=True, stats_base=merged["profit_stats_totals"]
-    )
+        profit_pool = pd.DataFrame()
 
-    html_content = build_scan_report(manifest, tickers, screener_results, profit_results, profit_stats, horizon, run_date)
+    if not profit_pool.empty:
+        profit_by_upside_raw = profit_pool.sort_values("Projected Upside %", ascending=False).head(TOP_RESULTS_LIMIT).reset_index(drop=True)
+        profit_by_score_raw = profit_pool.sort_values("Score", ascending=False).head(TOP_RESULTS_LIMIT).reset_index(drop=True)
+        # A ticker can rank in the top 75 by both upside and score; predictions
+        # must be recorded exactly once per ticker, so record from the
+        # deduplicated union of both cuts rather than once per cut.
+        union_raw = pd.concat([profit_by_upside_raw, profit_by_score_raw], ignore_index=True).drop_duplicates(
+            subset="Ticker", keep="first"
+        ).reset_index(drop=True)
+    else:
+        profit_by_upside_raw = profit_by_score_raw = union_raw = profit_pool
+
+    _, profit_stats = finalize_profit_results(union_raw, horizon, record=True, stats_base=merged["profit_stats_totals"])
+    profit_by_upside, _ = finalize_profit_results(profit_by_upside_raw, horizon, record=False)
+    profit_by_score, _ = finalize_profit_results(profit_by_score_raw, horizon, record=False)
+
+    html_content = build_scan_report(
+        manifest, tickers, screener_results, profit_by_upside, profit_by_score, profit_stats, horizon, run_date
+    )
     attachments = [
         csv_attachment(f"screener_top75_{run_date}.csv", screener_results.to_csv(index=False)),
-        csv_attachment(f"profit_opportunities_top75_{run_date}.csv", profit_results.to_csv(index=False)),
+        csv_attachment(f"profit_opportunities_by_upside_top75_{run_date}.csv", profit_by_upside.to_csv(index=False)),
+        csv_attachment(f"profit_opportunities_by_score_top75_{run_date}.csv", profit_by_score.to_csv(index=False)),
     ]
     subject = f"BK Self {HORIZON_SETTINGS[horizon]['label']} scan report — {run_date}"
     sent_count = send_brevo_email(subject=subject, html_content=html_content, attachments=attachments)
