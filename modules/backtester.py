@@ -279,17 +279,28 @@ def run_walk_forward(
                         )
                         continue
                     x_train_all, y_train_all = datasets[lightgbm_horizon]
-                    x_train = x_train_all.reindex(train_price.index).dropna(how="all")
+                    # Embargo: every training row's forward-return label is
+                    # computed `lightgbm_horizon` days ahead, so the last
+                    # `lightgbm_horizon` rows of the raw train window have
+                    # labels whose target close falls inside (or past) the
+                    # held-out test window -- training on them leaks test-period
+                    # price movement into the model before it's evaluated on
+                    # that same period. Drop those rows so no training label's
+                    # horizon crosses the train/test boundary (a purged/embargoed
+                    # walk-forward split, mirroring Purged/Embargoed K-Fold).
+                    embargoed_train_len = max(0, len(train_price.index) - int(lightgbm_horizon))
+                    embargoed_train_index = train_price.index[:embargoed_train_len]
+                    x_train = x_train_all.reindex(embargoed_train_index).dropna(how="all")
                     y_train = y_train_all.reindex(x_train.index).dropna()
                     x_train = x_train.reindex(y_train.index)
                     if len(y_train) == 0:
                         logger.warning(
-                            "LightGBM backtest skipped for %s at start=%d: no usable rows remain after training-window alignment",
+                            "LightGBM backtest skipped for %s at start=%d: no usable rows remain after embargoed training-window alignment",
                             ticker.upper(),
                             start,
                         )
                         continue
-                    dynamic_min_rows = min(50, max(10, int(config.train_len / 3)))
+                    dynamic_min_rows = min(50, max(10, int(embargoed_train_len / 3)))
                     models = train_return_models(
                         {lightgbm_horizon: (x_train, y_train)},
                         min_rows_per_horizon=dynamic_min_rows,
