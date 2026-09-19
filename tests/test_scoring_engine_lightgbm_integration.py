@@ -111,11 +111,10 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
 
     def test_short_and_medium_basis_derive_adaptive_lightgbm_percent_from_backtest_evidence(self):
         # trend_rmse=1.0, lightgbm_rmse=0.9 -> LightGBM has the lower RMSE of
-        # the pair. With ARIMA removed, trend is now the only other
-        # component, so any LightGBM win here mathematically implies its raw
-        # inverse-RMSE share exceeds 50% and gets clipped by
-        # LIGHTGBM_MAX_ADAPTIVE_SHARE, landing on an even 50/50 split with
-        # trend before horizon-budget scaling.
+        # the pair, with a raw inverse-RMSE share of 10/19 (~52.6%). With
+        # lightgbm_windows=4, the dynamic cap (_lightgbm_adaptive_share_cap)
+        # is 0.62, so this modest win is under the cap and passes through
+        # unclipped rather than being forced to an even 50/50 split.
         backtest = {
             "arima_rmse": 2.0,
             "trend_rmse": 1.0,
@@ -123,6 +122,7 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
             "n_windows": 4,
             "lightgbm_windows": 4,
         }
+        self.assertAlmostEqual(scoring_engine._lightgbm_adaptive_share_cap(4), 0.62, places=6)
 
         short_weights = scoring_engine._projection_model_weights(30, backtest, include_lightgbm=True)
         medium_weights = scoring_engine._projection_model_weights(180, backtest, include_lightgbm=True)
@@ -144,31 +144,48 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
             ]
         )
 
-        # short budget (0.80) * LIGHTGBM_MAX_ADAPTIVE_SHARE (0.50) = 0.40 -> "40%".
-        self.assertIn("LightGBM(40%)", short_basis)
-        # medium_budget (0.50) * LIGHTGBM_MAX_ADAPTIVE_SHARE (0.50) = 0.25 -> "25%".
-        self.assertIn("LightGBM(25%)", medium_basis)
+        # short budget (0.80) * raw share (10/19) = 8/19 (~42.1%) -> "42%".
+        self.assertIn("LightGBM(42%)", short_basis)
+        # medium_budget (0.50) * raw share (10/19) = 5/19 (~26.3%) -> "26%".
+        self.assertIn("LightGBM(26%)", medium_basis)
 
     def test_adaptive_lightgbm_share_is_capped_and_excess_redistributed(self):
-        # LightGBM's raw inverse-RMSE share here would be ~98% of the (trend,
-        # lightgbm) pair (rmse of 0.1 vs. 4.0), but LIGHTGBM_MAX_ADAPTIVE_SHARE
-        # caps it at 50%, with the freed weight redistributed back to trend
-        # (the only remaining non-LightGBM component now that ARIMA has been
-        # removed from the ensemble), landing on an even 50/50 split.
+        # LightGBM's raw inverse-RMSE share here would be ~97.6% of the
+        # (trend, lightgbm) pair (rmse of 0.1 vs. 4.0). With
+        # lightgbm_windows=4, the dynamic cap is 0.62, so the excess above
+        # that is redistributed back to trend (the only remaining
+        # non-LightGBM component now that ARIMA has been removed from the
+        # ensemble), landing on a 62/38 split rather than an even 50/50 one.
         backtest = {
             "trend_rmse": 4.0,
             "lightgbm_rmse": 0.1,
             "n_windows": 4,
             "lightgbm_windows": 4,
         }
+        cap = scoring_engine._lightgbm_adaptive_share_cap(4)
+        self.assertAlmostEqual(cap, 0.62, places=6)
 
         weights = scoring_engine._inverse_rmse_weights(backtest, include_lightgbm=True)
 
         self.assertIsNotNone(weights)
         self.assertNotIn("arima", weights)
-        self.assertAlmostEqual(weights["lightgbm"], scoring_engine.LIGHTGBM_MAX_ADAPTIVE_SHARE, places=6)
-        self.assertAlmostEqual(weights["trend"], scoring_engine.LIGHTGBM_MAX_ADAPTIVE_SHARE, places=6)
+        self.assertAlmostEqual(weights["lightgbm"], cap, places=6)
+        self.assertAlmostEqual(weights["trend"], 1.0 - cap, places=6)
         self.assertAlmostEqual(sum(weights.values()), 1.0, places=6)
+
+    def test_lightgbm_adaptive_share_cap_floors_ceilings_and_interpolates(self):
+        # Sparse evidence (<=1 window) keeps the conservative 50% floor;
+        # evidence scales linearly up to the 70% ceiling at >=6 windows.
+        self.assertEqual(scoring_engine._lightgbm_adaptive_share_cap(None), scoring_engine.LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP)
+        self.assertEqual(scoring_engine._lightgbm_adaptive_share_cap(0), scoring_engine.LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP)
+        self.assertEqual(scoring_engine._lightgbm_adaptive_share_cap(1), scoring_engine.LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP)
+        self.assertAlmostEqual(scoring_engine._lightgbm_adaptive_share_cap(2), 0.54, places=6)
+        self.assertAlmostEqual(scoring_engine._lightgbm_adaptive_share_cap(3), 0.58, places=6)
+        self.assertAlmostEqual(scoring_engine._lightgbm_adaptive_share_cap(6), scoring_engine.LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP)
+        self.assertEqual(
+            scoring_engine._lightgbm_adaptive_share_cap(10),
+            scoring_engine.LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP,
+        )
 
     def test_long_horizon_weights_explicitly_exclude_lightgbm(self):
         weights = scoring_engine._projection_model_weights(
@@ -509,6 +526,40 @@ class GarchSharedForecastTests(unittest.TestCase):
             low, high = scoring_engine._garch_confidence_from_returns(100.0, np.zeros(100), 30)
         self.assertIsNone(low)
         self.assertIsNone(high)
+
+
+class FillMissing52WeekRangeTests(unittest.TestCase):
+    def test_fills_range_when_keys_are_explicitly_none(self):
+        # Regression test: modules.polygon_client.build_info_adapter always
+        # sets these keys (to None, since Polygon's overview endpoint has no
+        # 52-week range data) rather than omitting them, so the fallback
+        # must check the *value*, not just key membership.
+        data = _sample_projection_data(300)
+        info = {"fiftyTwoWeekHigh": None, "fiftyTwoWeekLow": None}
+
+        filled = scoring_engine._fill_missing_52w_range(info, data)
+
+        cutoff = pd.to_datetime(data.index).max() - pd.Timedelta(days=365)
+        trailing = data.loc[pd.to_datetime(data.index) >= cutoff]
+        self.assertAlmostEqual(filled["fiftyTwoWeekHigh"], float(trailing["High"].max()), places=6)
+        self.assertAlmostEqual(filled["fiftyTwoWeekLow"], float(trailing["Low"].min()), places=6)
+
+    def test_does_not_overwrite_existing_values(self):
+        data = _sample_projection_data(300)
+        info = {"fiftyTwoWeekHigh": 999.0, "fiftyTwoWeekLow": 1.0}
+
+        filled = scoring_engine._fill_missing_52w_range(info, data)
+
+        self.assertEqual(filled["fiftyTwoWeekHigh"], 999.0)
+        self.assertEqual(filled["fiftyTwoWeekLow"], 1.0)
+
+    def test_handles_empty_data_without_raising(self):
+        info = {"fiftyTwoWeekHigh": None, "fiftyTwoWeekLow": None}
+
+        filled = scoring_engine._fill_missing_52w_range(info, pd.DataFrame())
+
+        self.assertIsNone(filled["fiftyTwoWeekHigh"])
+        self.assertIsNone(filled["fiftyTwoWeekLow"])
 
 
 if __name__ == "__main__":

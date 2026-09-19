@@ -449,9 +449,16 @@ def list_active_ticker_details(
         "order": "asc",
     }
     if primary_exchange:
-        params["primary_exchange"] = primary_exchange
-    if otc is not None:
-        params["otc"] = str(bool(otc)).lower()
+        # Polygon's /v3/reference/tickers list endpoint filters on
+        # "exchange" (MIC code, e.g. XNAS/XASE), not "primary_exchange" --
+        # that name only appears as a field on each *result* row. Sending
+        # "primary_exchange" as a query param is silently ignored by
+        # Polygon, so NASDAQ/NYSE American scans previously fell back to the
+        # full unfiltered universe.
+        params["exchange"] = primary_exchange
+    # Note: this endpoint has no server-side OTC filter param; OTC vs.
+    # non-OTC is determined below from each result row's own
+    # "primary_exchange" field instead.
 
     tickers: list[dict[str, Any]] = []
     seen: set[str] = set()

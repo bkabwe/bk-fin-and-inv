@@ -49,9 +49,10 @@ LIGHTGBM_BATCH_LOCAL_PATH = _REPO_ROOT / "data" / DEFAULT_BATCH_ASSET_NAME
 # Fixed-weight fallback used only when a per-ticker walk-forward backtest can't
 # produce a valid lightgbm_rmse (e.g. too little history, or the backtest call
 # failed). When real backtest evidence IS available, _projection_model_weights
-# instead derives LightGBM's share adaptively (see LIGHTGBM_MAX_ADAPTIVE_SHARE
-# below) from the same inverse-RMSE evidence used for trend, rather than
-# reserving one of these fixed percentages off the top.
+# instead derives LightGBM's share adaptively (see
+# LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP/LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP below) from
+# the same inverse-RMSE evidence used for trend, rather than reserving one of
+# these fixed percentages off the top.
 #
 # Based on honestly-reported walk-forward evidence:
 # - 30d: 89 tickers across two disjoint random samples, 6 windows/ticker, LightGBM beat
@@ -65,8 +66,17 @@ LIGHTGBM_WEIGHT_180D = 0.08
 # Even when a live per-ticker backtest shows LightGBM with the lowest RMSE,
 # cap its adaptive share so a noisy small-sample backtest (a handful of
 # windows per ticker) can't crowd out trend entirely and collapse ensemble
-# diversity onto a single model.
-LIGHTGBM_MAX_ADAPTIVE_SHARE = 0.50
+# diversity onto a single model. The cap itself is dynamic (see
+# _lightgbm_adaptive_share_cap below): it scales with how many walk-forward
+# windows actually back that ticker's lightgbm_rmse estimate, rather than
+# applying one fixed ceiling regardless of sample size.
+LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP = 0.50
+LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP = 0.70
+# Window count at/above which the cap reaches LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP.
+# 6 matches the typical replication depth for the 30d horizon backtest config
+# (see modules/backtester.py); the 180d horizon (4 windows/ticker) lands
+# partway between the min and max caps.
+LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS = 6
 
 # Fixed fundamentals-model weight budgets for the medium/long-term price
 # projection ensembles in _get_price_projections_core. These used to be
@@ -94,8 +104,9 @@ LONG_TERM_DCF_WEIGHT = 0.25
 # horizons while fundamentals (valuation/balance-sheet/growth quality, which
 # matter more over longer holding periods) pick up the freed-up weight. This
 # mirrors how price-projection ensemble weights already shrink LightGBM's
-# influence from 30d to 180d to 0 at 720d (see LIGHTGBM_MAX_ADAPTIVE_SHARE and
-# the horizon weight budgets in _projection_model_weights below).
+# influence from 30d to 180d to 0 at 720d (see
+# LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP/LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP and the
+# horizon weight budgets in _projection_model_weights below).
 # ``investment_horizon`` uses the same canonical keys as
 # ``modules.profit_opportunities.HORIZON_SETTINGS``
 # (short_term/medium_term/long_term); omitting it (None) preserves the
@@ -319,6 +330,26 @@ def _cap_target(value: float, current_price: float, cap_value: float | None) -> 
     return round(target, 2)
 
 
+def _lightgbm_adaptive_share_cap(lightgbm_windows: int | None) -> float:
+    """Scale LightGBM's adaptive-share cap with how many walk-forward windows
+    actually back its RMSE estimate, instead of applying one fixed ceiling
+    regardless of sample size.
+
+    With only a window or two (a noisy, small-sample backtest), a raw win
+    could easily be noise, so the cap stays at LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP
+    to guarantee trend keeps a meaningful say. As replication grows toward
+    LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS, linearly raise the cap toward
+    LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP, reflecting growing confidence that the
+    RMSE edge over trend is real rather than a small-sample artifact.
+    """
+    windows = max(int(lightgbm_windows or 0), 0)
+    if windows <= 1:
+        return LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP
+    span = LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP - LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP
+    progress = min((windows - 1) / (LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS - 1), 1.0)
+    return LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP + span * progress
+
+
 def _inverse_rmse_weights(backtest: dict, *, include_lightgbm: bool = False) -> dict[str, float] | None:
     try:
         if int(backtest.get("n_windows") or 0) <= 0:
@@ -333,17 +364,19 @@ def _inverse_rmse_weights(backtest: dict, *, include_lightgbm: bool = False) -> 
         if total <= 0:
             return None
         weights = {k: inv[k] / total for k in inv}
-        if "lightgbm" in weights and weights["lightgbm"] > LIGHTGBM_MAX_ADAPTIVE_SHARE:
-            # Clip LightGBM's share and redistribute the freed weight back to
-            # trend proportionally to its relative inverse-RMSE ratio, so the
-            # excess doesn't just vanish or collapse to a 50/50 split.
-            excess = weights["lightgbm"] - LIGHTGBM_MAX_ADAPTIVE_SHARE
-            weights["lightgbm"] = LIGHTGBM_MAX_ADAPTIVE_SHARE
-            others_total = weights.get("trend", 0.0)
-            if others_total > 0:
-                weights["trend"] += excess * (weights["trend"] / others_total)
-            else:
-                weights["lightgbm"] = 1.0
+        if "lightgbm" in weights:
+            cap = _lightgbm_adaptive_share_cap(backtest.get("lightgbm_windows"))
+            if weights["lightgbm"] > cap:
+                # Clip LightGBM's share and redistribute the freed weight back to
+                # trend proportionally to its relative inverse-RMSE ratio, so the
+                # excess doesn't just vanish or collapse to a fixed split.
+                excess = weights["lightgbm"] - cap
+                weights["lightgbm"] = cap
+                others_total = weights.get("trend", 0.0)
+                if others_total > 0:
+                    weights["trend"] += excess * (weights["trend"] / others_total)
+                else:
+                    weights["lightgbm"] = 1.0
         return weights
     except Exception:
         return None
@@ -995,6 +1028,34 @@ def get_price_projections(
     return _get_price_projections_core(ticker, info=info_override, data=data_override, avg_cost=avg_cost)
 
 
+def _fill_missing_52w_range(info: dict, data: pd.DataFrame) -> dict:
+    """Backstop 52-week high/low from trailing OHLC history when the info
+    adapter didn't provide it.
+
+    Polygon's ticker overview endpoint (see modules.polygon_client.
+    build_info_adapter) has no 52-week range fields, so it sets
+    "fiftyTwoWeekHigh"/"fiftyTwoWeekLow" to None rather than omitting them.
+    That means checking ``"fiftyTwoWeekHigh" not in info`` is always False in
+    live scoring -- the key IS present, just with a None value -- so this
+    must check the *value* instead to actually engage the fallback.
+    """
+    if data is None or data.empty:
+        return info
+    try:
+        max_date = pd.to_datetime(data.index).max()
+        cutoff = max_date - pd.Timedelta(days=365)
+        trailing_52w = data.loc[pd.to_datetime(data.index) >= cutoff]
+    except Exception:
+        trailing_52w = data.tail(252)
+    if info.get("fiftyTwoWeekHigh") is None and not trailing_52w.empty and "High" in trailing_52w:
+        with contextlib.suppress(Exception):
+            info["fiftyTwoWeekHigh"] = float(trailing_52w["High"].astype(float).max())
+    if info.get("fiftyTwoWeekLow") is None and not trailing_52w.empty and "Low" in trailing_52w:
+        with contextlib.suppress(Exception):
+            info["fiftyTwoWeekLow"] = float(trailing_52w["Low"].astype(float).min())
+    return info
+
+
 def analyze_stock(
     ticker: str,
     period: str = "1y",
@@ -1010,21 +1071,7 @@ def analyze_stock(
     info = info_override if info_override is not None else get_stock_info(ticker)
     projection_data = projection_data_override if projection_data_override is not None else data_override
 
-    info = dict(info or {})
-    trailing_52w = pd.DataFrame()
-    if not data.empty:
-        try:
-            max_date = pd.to_datetime(data.index).max()
-            cutoff = max_date - pd.Timedelta(days=365)
-            trailing_52w = data.loc[pd.to_datetime(data.index) >= cutoff]
-        except Exception:
-            trailing_52w = data.tail(252)
-    if "fiftyTwoWeekHigh" not in info and not trailing_52w.empty and "High" in trailing_52w:
-        with contextlib.suppress(Exception):
-            info["fiftyTwoWeekHigh"] = float(trailing_52w["High"].astype(float).max())
-    if "fiftyTwoWeekLow" not in info and not trailing_52w.empty and "Low" in trailing_52w:
-        with contextlib.suppress(Exception):
-            info["fiftyTwoWeekLow"] = float(trailing_52w["Low"].astype(float).min())
+    info = _fill_missing_52w_range(dict(info or {}), data)
 
     technical = analyze_technical(data)
     if not data.empty:

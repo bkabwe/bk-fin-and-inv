@@ -438,12 +438,19 @@ evaluate_arima=False)` and the same at `horizon=180`) and derives LightGBM's
 ensemble weight **adaptively** from that evidence: `_inverse_rmse_weights()`
 splits each horizon's weight budget across trend/LightGBM in proportion to
 their inverse walk-forward RMSE, instead of reserving a fixed percentage for
-LightGBM. `LIGHTGBM_MAX_ADAPTIVE_SHARE` (50%) caps LightGBM's share of that
-split so a noisy, small-sample per-ticker backtest (a handful of windows)
+LightGBM. A **dynamic cap** (`_lightgbm_adaptive_share_cap()`) limits
+LightGBM's share of that split so a noisy, small-sample per-ticker backtest
 can't crowd out trend entirely; any excess above the cap is redistributed
-back to trend. When a ticker's backtest can't produce a valid
-`lightgbm_rmse` (e.g. too little history), live scoring falls back to the
-previous fixed weights, `LIGHTGBM_WEIGHT_30D = 0.15` and
+back to trend. The cap itself scales with how many walk-forward windows back
+the ticker's `lightgbm_rmse` estimate: it floors at
+`LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP` (50%) for sparse evidence (≤1 window) and
+rises linearly to `LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP` (70%) once evidence
+reaches `LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS` (6) windows, so
+better-replicated per-ticker backtests (e.g. the 30d horizon's typical 6
+windows) can earn a larger adaptive share than thinner ones (e.g. 180d's
+typical 4 windows, landing at a 62% cap). When a ticker's backtest can't
+produce a valid `lightgbm_rmse` (e.g. too little history), live scoring
+falls back to the previous fixed weights, `LIGHTGBM_WEIGHT_30D = 0.15` and
 `LIGHTGBM_WEIGHT_180D = 0.08`, which remain in the code as that fallback.
 **720d remains intentionally excluded from the live ensemble for now**
 because current validation has only one non-overlapping window per ticker,
