@@ -190,7 +190,11 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertGreater(len(captured_training_row_indexes), 0)
         close_index = data["Close"].dropna().astype(float).tail(252).index
         expected_starts = list(range(0, max(1, len(close_index) - (60 + 30) + 1), 30))[:10]
-        expected_windows = [close_index[start : start + 60] for start in expected_starts]
+        # Embargo: the last `horizon` (30) rows of each 60-row train window are
+        # excluded because their forward-return label's target close falls
+        # inside the held-out test window (see run_walk_forward's embargo
+        # comment). Only the first 30 rows of each window remain trainable.
+        expected_windows = [close_index[start : start + 30] for start in expected_starts]
         self.assertEqual(len(captured_training_row_indexes), len(expected_windows))
         for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows, strict=False):
             self.assertTrue(captured_index.equals(expected_index))
@@ -258,12 +262,14 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         close_index = data["Close"].dropna().astype(float).tail(252).index
         normalized_index = backtester._normalize_lightgbm_price_frame(data.copy().reindex(close_index)).index
         expected_starts = list(range(0, max(1, len(normalized_index) - (60 + 30) + 1), 30))[:10]
-        expected_windows = [normalized_index[start : start + 60] for start in expected_starts]
+        # Embargo: only the first 30 (of 60) train rows survive -- see the
+        # embargo comment in run_walk_forward / the analogous non-tz test above.
+        expected_windows = [normalized_index[start : start + 30] for start in expected_starts]
 
         self.assertEqual(len(captured_training_row_indexes), len(expected_windows))
         for captured_index, expected_index in zip(captured_training_row_indexes, expected_windows, strict=False):
             self.assertIsNone(getattr(captured_index, "tz", None))
-            self.assertEqual(len(captured_index), 60)
+            self.assertEqual(len(captured_index), 30)
             self.assertTrue(captured_index.equals(expected_index))
 
     def test_lightgbm_training_examples_reindex_against_normalized_timezone_aware_train_window(self):

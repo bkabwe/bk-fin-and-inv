@@ -404,15 +404,20 @@ configured TTL (e.g. 1 hour for stock data, 24 hours for backtests).
 The app now includes `modules/feature_engineering.py`, which builds a daily-indexed
 feature table per ticker as a data-preparation layer for a planned future
 feature-based forecasting model (not yet wired into scoring/projections in this
-phase). The table combines:
-- Technical features (rolling volatility, EMA, RSI, daily-bar VWAP approximation,
-  and volume-vs-average)
+phase). All features are intentionally stationary (ratios, percent changes, and
+returns rather than raw price/level values) so a tree-based model like LightGBM
+never has to extrapolate outside the numeric range it was trained on. The table
+combines:
+- Technical features: rolling volatility, close-to-EMA and close-to-daily-VWAP-
+  approximation ratios, RSI, volume-vs-average, lagged daily returns (AR-style:
+  1d/2d/5d), and rolling mean returns (MA-style: 5d/20d/50d)
 - SEC EDGAR fundamentals (`fundamental_revenue_growth`,
   `fundamental_debt_to_equity` (percent points, matching existing SEC adapter
   scaling), and `fundamental_gross_margin`), forward-filled from filing dates
   across daily rows
-- Shared macro features from FRED (`DGS10`, `CPIAUCSL`, `FEDFUNDS`) with level and
-  5-day/30-day delta and percent-change metrics
+- Shared macro features from FRED (`DGS10`, `CPIAUCSL`, `FEDFUNDS`) as 5-day/
+  30-day delta and percent-change metrics only (raw levels are used internally
+  to compute these but are not exposed as features)
 
 Design principle: feature assembly is TTL-cached incrementally and decoupled from
 scan cadence so repeated scans avoid unnecessary recomputation/refetching.
@@ -476,6 +481,14 @@ macro-feature columns could remain object-typed when FRED data was unavailable,
 causing every per-window LightGBM fit to fail under the old silent `except`.
 Feature tables are now coerced back to numeric dtypes before training, and any
 remaining per-window LightGBM failure is logged with ticker/window context.
+
+LightGBM's training rows are also now **embargoed**: the last `horizon` rows of
+each raw training window are excluded before fitting, because their
+forward-return label's target close falls inside that window's held-out test
+period (a purged/embargoed split, preventing label leakage across the
+train/test boundary). This shrinks the usable 30d-horizon training window from
+60 to 30 rows; 180d/720d windows are large enough that the embargo removes a
+proportionally smaller share.
 
 To reproduce aggregate comparisons across a representative ticker sample:
 
