@@ -7,7 +7,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from modules.arima_hardening import ARIMA_AVAILABLE, fit_arima_with_hardening
 from modules.backtester import run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
 from modules.feature_engineering import build_feature_table
@@ -50,9 +49,10 @@ LIGHTGBM_BATCH_LOCAL_PATH = _REPO_ROOT / "data" / DEFAULT_BATCH_ASSET_NAME
 # Fixed-weight fallback used only when a per-ticker walk-forward backtest can't
 # produce a valid lightgbm_rmse (e.g. too little history, or the backtest call
 # failed). When real backtest evidence IS available, _projection_model_weights
-# instead derives LightGBM's share adaptively (see LIGHTGBM_MAX_ADAPTIVE_SHARE
-# below) from the same inverse-RMSE evidence used for ARIMA/trend, rather than
-# reserving one of these fixed percentages off the top.
+# instead derives LightGBM's share adaptively (see
+# LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP/LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP below) from
+# the same inverse-RMSE evidence used for trend, rather than reserving one of
+# these fixed percentages off the top.
 #
 # Based on honestly-reported walk-forward evidence:
 # - 30d: 89 tickers across two disjoint random samples, 6 windows/ticker, LightGBM beat
@@ -63,11 +63,20 @@ LIGHTGBM_BATCH_LOCAL_PATH = _REPO_ROOT / "data" / DEFAULT_BATCH_ASSET_NAME
 LIGHTGBM_WEIGHT_30D = 0.15
 LIGHTGBM_WEIGHT_180D = 0.08
 
-# Even when a live per-ticker backtest shows LightGBM with the lowest RMSE of the
-# triad, cap its adaptive share so a noisy small-sample backtest (a handful of
-# windows per ticker) can't crowd out ARIMA/trend entirely and collapse ensemble
-# diversity onto a single model.
-LIGHTGBM_MAX_ADAPTIVE_SHARE = 0.50
+# Even when a live per-ticker backtest shows LightGBM with the lowest RMSE,
+# cap its adaptive share so a noisy small-sample backtest (a handful of
+# windows per ticker) can't crowd out trend entirely and collapse ensemble
+# diversity onto a single model. The cap itself is dynamic (see
+# _lightgbm_adaptive_share_cap below): it scales with how many walk-forward
+# windows actually back that ticker's lightgbm_rmse estimate, rather than
+# applying one fixed ceiling regardless of sample size.
+LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP = 0.50
+LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP = 0.70
+# Window count at/above which the cap reaches LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP.
+# 6 matches the typical replication depth for the 30d horizon backtest config
+# (see modules/backtester.py); the 180d horizon (4 windows/ticker) lands
+# partway between the min and max caps.
+LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS = 6
 
 # Fixed fundamentals-model weight budgets for the medium/long-term price
 # projection ensembles in _get_price_projections_core. These used to be
@@ -77,12 +86,12 @@ LIGHTGBM_MAX_ADAPTIVE_SHARE = 0.50
 # modules/polygon_client.py: no analyst-consensus source is wired up), so the
 # slot could never contribute -- and _weighted_ensemble() only normalizes over
 # components that DO have a value, so its "reserved" share was silently
-# redistributed back onto ARIMA/Trend/Fundamental/DCF in proportion to their
-# own weights, disproportionately inflating ARIMA (typically the largest of
-# the remaining raw weights). The dead Analyst slot has been removed and its
+# redistributed back onto Trend/Fundamental/DCF in proportion to their
+# own weights, disproportionately inflating the remaining largest raw weight.
+# The dead Analyst slot has been removed and its
 # budget reassigned explicitly here instead, consistent with fundamentals
 # mattering more over longer holding periods (see _FUNDAMENTAL_SENTIMENT_WEIGHTS
-# below). The corresponding ARIMA/Trend "budget" in _projection_model_weights
+# below). The corresponding Trend "budget" in _projection_model_weights
 # has been reduced by the same amount so each horizon's weights still sum to 1.0.
 MEDIUM_TERM_FUNDAMENTAL_WEIGHT = 0.30
 MEDIUM_TERM_DCF_WEIGHT = 0.20
@@ -95,8 +104,9 @@ LONG_TERM_DCF_WEIGHT = 0.25
 # horizons while fundamentals (valuation/balance-sheet/growth quality, which
 # matter more over longer holding periods) pick up the freed-up weight. This
 # mirrors how price-projection ensemble weights already shrink LightGBM's
-# influence from 30d to 180d to 0 at 720d (see LIGHTGBM_MAX_ADAPTIVE_SHARE and
-# the horizon weight budgets in _projection_model_weights below).
+# influence from 30d to 180d to 0 at 720d (see
+# LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP/LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP and the
+# horizon weight budgets in _projection_model_weights below).
 # ``investment_horizon`` uses the same canonical keys as
 # ``modules.profit_opportunities.HORIZON_SETTINGS``
 # (short_term/medium_term/long_term); omitting it (None) preserves the
@@ -175,8 +185,6 @@ except Exception:  # pragma: no cover
         return decorator
 
 
-STATSMODELS_AVAILABLE = ARIMA_AVAILABLE
-
 try:  # pragma: no cover
     from sklearn.linear_model import LinearRegression
 
@@ -190,30 +198,6 @@ try:  # pragma: no cover
     ARCH_AVAILABLE = True
 except ImportError:  # pragma: no cover
     ARCH_AVAILABLE = False
-
-
-@cache_data(ttl=86400)
-def _select_arima_order(ticker: str, series_values: tuple[float, ...]) -> tuple[int, int, int]:
-    if not STATSMODELS_AVAILABLE:
-        return (5, 1, 0)
-    series = np.array(series_values, dtype=float)
-    if len(series) < 60:
-        return (5, 1, 0)
-
-    best_order = (5, 1, 0)
-    best_aic = float("inf")
-    for p in range(6):
-        for d in range(2):
-            for q in range(3):
-                try:
-                    fit = fit_arima_with_hardening(series, order=(p, d, q), logger=logger)
-                    if fit.aic < best_aic:
-                        best_aic = float(fit.aic)
-                        best_order = (p, d, q)
-                except Exception:
-                    continue
-    logger.info("Selected ARIMA order for %s: %s (aic=%.2f)", ticker.upper(), best_order, best_aic)
-    return best_order
 
 
 def _recommendation(score: int) -> str:
@@ -346,12 +330,31 @@ def _cap_target(value: float, current_price: float, cap_value: float | None) -> 
     return round(target, 2)
 
 
+def _lightgbm_adaptive_share_cap(lightgbm_windows: int | None) -> float:
+    """Scale LightGBM's adaptive-share cap with how many walk-forward windows
+    actually back its RMSE estimate, instead of applying one fixed ceiling
+    regardless of sample size.
+
+    With only a window or two (a noisy, small-sample backtest), a raw win
+    could easily be noise, so the cap stays at LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP
+    to guarantee trend keeps a meaningful say. As replication grows toward
+    LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS, linearly raise the cap toward
+    LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP, reflecting growing confidence that the
+    RMSE edge over trend is real rather than a small-sample artifact.
+    """
+    windows = max(int(lightgbm_windows or 0), 0)
+    if windows <= 1:
+        return LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP
+    span = LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP - LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP
+    progress = min((windows - 1) / (LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS - 1), 1.0)
+    return LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP + span * progress
+
+
 def _inverse_rmse_weights(backtest: dict, *, include_lightgbm: bool = False) -> dict[str, float] | None:
     try:
         if int(backtest.get("n_windows") or 0) <= 0:
             return None
         rmses = {
-            "arima": float(backtest.get("arima_rmse") or 0),
             "trend": float(backtest.get("trend_rmse") or 0),
         }
         if include_lightgbm and _has_lightgbm_backtest_support(backtest):
@@ -361,19 +364,19 @@ def _inverse_rmse_weights(backtest: dict, *, include_lightgbm: bool = False) -> 
         if total <= 0:
             return None
         weights = {k: inv[k] / total for k in inv}
-        if "lightgbm" in weights and weights["lightgbm"] > LIGHTGBM_MAX_ADAPTIVE_SHARE:
-            # Clip LightGBM's share and redistribute the freed weight back to
-            # arima/trend proportionally to their relative inverse-RMSE ratio,
-            # so the excess doesn't just vanish or collapse to a 50/50 split.
-            excess = weights["lightgbm"] - LIGHTGBM_MAX_ADAPTIVE_SHARE
-            weights["lightgbm"] = LIGHTGBM_MAX_ADAPTIVE_SHARE
-            others_total = weights.get("arima", 0.0) + weights.get("trend", 0.0)
-            if others_total > 0:
-                for name in ("arima", "trend"):
-                    if name in weights:
-                        weights[name] += excess * (weights[name] / others_total)
-            else:
-                weights["lightgbm"] = 1.0
+        if "lightgbm" in weights:
+            cap = _lightgbm_adaptive_share_cap(backtest.get("lightgbm_windows"))
+            if weights["lightgbm"] > cap:
+                # Clip LightGBM's share and redistribute the freed weight back to
+                # trend proportionally to its relative inverse-RMSE ratio, so the
+                # excess doesn't just vanish or collapse to a fixed split.
+                excess = weights["lightgbm"] - cap
+                weights["lightgbm"] = cap
+                others_total = weights.get("trend", 0.0)
+                if others_total > 0:
+                    weights["trend"] += excess * (weights["trend"] / others_total)
+                else:
+                    weights["lightgbm"] = 1.0
         return weights
     except Exception:
         return None
@@ -404,14 +407,13 @@ def _projection_model_weights(
         if include_lightgbm and backtest:
             adaptive_weights = _inverse_rmse_weights(backtest, include_lightgbm=True)
             if adaptive_weights and "lightgbm" in adaptive_weights:
-                # Real per-ticker backtest evidence exists for all three models:
+                # Real per-ticker backtest evidence exists for both models:
                 # split the horizon's weight budget by evidence instead of
                 # reserving a fixed percentage for LightGBM off the top.
                 return {name: budget * weight for name, weight in adaptive_weights.items()}
-        base_weights = _inverse_rmse_weights(backtest or {}) if backtest else {"arima": 0.55, "trend": 0.45}
+        base_weights = _inverse_rmse_weights(backtest or {}) if backtest else {"trend": 1.0}
         scaled = {
-            "arima": budget * float((base_weights or {}).get("arima", 0.55)),
-            "trend": budget * float((base_weights or {}).get("trend", 0.45)),
+            "trend": budget * float((base_weights or {}).get("trend", 1.0)),
         }
         return _blend_lightgbm_weight(scaled, LIGHTGBM_WEIGHT_30D if include_lightgbm else 0.0)
 
@@ -428,18 +430,17 @@ def _projection_model_weights(
             base_weights = _inverse_rmse_weights(backtest)
             if base_weights:
                 scaled = {
-                    "arima": budget * float(base_weights.get("arima", 0.0)),
                     "trend": budget * float(base_weights.get("trend", 0.0)),
                 }
             else:
-                scaled = {"arima": 0.0, "trend": budget}
+                scaled = {"trend": budget}
         else:
-            scaled = {"arima": 0.0, "trend": budget}
+            scaled = {"trend": budget}
         return _blend_lightgbm_weight(scaled, LIGHTGBM_WEIGHT_180D if include_lightgbm else 0.0)
 
     # Keep 720d LightGBM weight at zero for now. The current validation has only one
     # non-overlapping backtest window per ticker at this horizon, so the 20/30 vs.
-    # ARIMA/trend and 22/30 vs. naive win rates are promising but not yet actionable.
+    # trend and 22/30 vs. naive win rates are promising but not yet actionable.
     # Revisit once more historical data accrues naturally and yields additional 720d windows.
     # budget + LONG_TERM_FUNDAMENTAL_WEIGHT + LONG_TERM_DCF_WEIGHT must sum to
     # 1.0 (see the ensemble components built in _get_price_projections_core).
@@ -448,10 +449,9 @@ def _projection_model_weights(
         base_weights = _inverse_rmse_weights(backtest)
         if base_weights:
             return {
-                "arima": long_budget * float(base_weights.get("arima", 0.0)),
                 "trend": long_budget * float(base_weights.get("trend", 0.0)),
             }
-    return {"arima": 0.0, "trend": long_budget}
+    return {"trend": long_budget}
 
 
 def _has_lightgbm_backtest_support(backtest: dict | None) -> bool:
@@ -698,11 +698,17 @@ def _get_price_projections_core(
     # the evaluation, so their ensemble weights reflect real evidence at that
     # horizon rather than reusing a single 30d-window backtest as a proxy for
     # every horizon. Long-term (720d) LightGBM support is out of scope for now
-    # and continues to reuse the 30d backtest's ARIMA/trend evidence unchanged.
+    # and continues to reuse the 30d backtest's trend evidence unchanged.
+    # evaluate_arima=False: ARIMA is no longer part of the live ensemble (see
+    # the removed ARIMA forecast block below), so live scoring skips the
+    # expensive per-ticker ARIMA order search entirely. Standalone research
+    # tooling (modules/backtest_comparison.py) still calls run_walk_forward
+    # with the default evaluate_arima=True to keep comparing ARIMA vs. trend
+    # vs. LightGBM offline.
     backtest = None
     model_weights = None
     try:
-        backtest = run_walk_forward(ticker, data, horizon=30, evaluate_lightgbm=True)
+        backtest = run_walk_forward(ticker, data, horizon=30, evaluate_lightgbm=True, evaluate_arima=False)
         model_weights = _inverse_rmse_weights(backtest)
         if model_weights:
             models_used.append("Adaptive Weights")
@@ -713,7 +719,7 @@ def _get_price_projections_core(
 
     medium_backtest = None
     try:
-        medium_backtest = run_walk_forward(ticker, data, horizon=180, evaluate_lightgbm=True)
+        medium_backtest = run_walk_forward(ticker, data, horizon=180, evaluate_lightgbm=True, evaluate_arima=False)
     except Exception as exc:
         models_skipped.append(f"Medium-term adaptive weights: {exc}")
 
@@ -747,23 +753,6 @@ def _get_price_projections_core(
     # profit-opportunities report) can filter on these flags.
     short_term_lightgbm_backtested = bool(30 in lightgbm_projections and _has_lightgbm_backtest_support(short_backtest))
     medium_term_lightgbm_backtested = bool(180 in lightgbm_projections and _has_lightgbm_backtest_support(medium_backtest))
-
-    arima_30 = arima_180 = arima_720 = None
-    if STATSMODELS_AVAILABLE:
-        try:
-            if close is None or len(close) < 60:
-                raise ValueError("not enough history")
-            series = close.tail(252).astype(float)
-            order = _select_arima_order(ticker.upper(), tuple(np.round(series.values, 6).tolist()))
-            arima_forecast = fit_arima_with_hardening(series, order=order, logger=logger).forecast(steps=720)
-            arima_30 = float(arima_forecast.iloc[29]) if len(arima_forecast) >= 30 else float(arima_forecast.iloc[-1])
-            arima_180 = float(arima_forecast.iloc[179]) if len(arima_forecast) >= 180 else float(arima_forecast.iloc[-1])
-            arima_720 = float(arima_forecast.iloc[719]) if len(arima_forecast) >= 720 else float(arima_forecast.iloc[-1])
-            models_used.append("ARIMA")
-        except Exception as exc:
-            models_skipped.append(f"ARIMA: {exc}")
-    else:
-        models_skipped.append("ARIMA: package not installed")
 
     trend_30 = trend_180 = trend_720 = None
     if SKLEARN_AVAILABLE:
@@ -852,17 +841,15 @@ def _get_price_projections_core(
     # dropped, though: _weighted_ensemble() only normalizes over components
     # with a non-None value, so the "missing" analyst share was silently
     # redistributed *proportionally* back onto whichever other components
-    # were present -- disproportionately inflating ARIMA's effective share
-    # (it typically carries the largest raw weight of the remaining
-    # components) rather than benefiting fundamentals. The weight has been
-    # removed here and its budget reassigned explicitly to Fundamental Fair
-    # Value / DCF+Comps below instead of leaking into ARIMA. If an
+    # were present -- disproportionately inflating the largest of the
+    # remaining raw weights rather than benefiting fundamentals. The weight
+    # has been removed here and its budget reassigned explicitly to
+    # Fundamental Fair Value / DCF+Comps below instead. If an
     # analyst-consensus data source is ever reintroduced, re-add this slot
     # deliberately rather than relying on info.get("targetMeanPrice").
 
     short_projection, short_basis, short_values = _weighted_ensemble(
         [
-            ("ARIMA", arima_30, short_model_weights.get("arima", 0.0)),
             ("Trend", trend_30, short_model_weights.get("trend", 0.0)),
             ("LightGBM", lightgbm_projections.get(30), short_model_weights.get("lightgbm", 0.0)),
             ("Resistance", technical_resistance, 0.20),
@@ -870,7 +857,6 @@ def _get_price_projections_core(
     )
     medium_projection, medium_basis, medium_values = _weighted_ensemble(
         [
-            ("ARIMA", arima_180, medium_model_weights.get("arima", 0.0)),
             ("Trend", trend_180, medium_model_weights.get("trend", 0.0)),
             ("LightGBM", lightgbm_projections.get(180), medium_model_weights.get("lightgbm", 0.0)),
             ("Fundamental", fair_value, MEDIUM_TERM_FUNDAMENTAL_WEIGHT),
@@ -879,7 +865,6 @@ def _get_price_projections_core(
     )
     long_projection, long_basis, long_values = _weighted_ensemble(
         [
-            ("ARIMA", arima_720, long_model_weights.get("arima", 0.0)),
             ("Trend", trend_720, long_model_weights.get("trend", 0.0)),
             ("Fundamental", fair_value, LONG_TERM_FUNDAMENTAL_WEIGHT),
             ("DCF+Comps", dcf_estimate, LONG_TERM_DCF_WEIGHT),
@@ -893,11 +878,8 @@ def _get_price_projections_core(
     directional_models = [
         x
         for x in [
-            arima_30,
             trend_30,
-            arima_180,
             trend_180,
-            arima_720,
             trend_720,
             lightgbm_projections.get(30),
             lightgbm_projections.get(180),
@@ -985,7 +967,7 @@ def _get_price_projections_core(
 
     if is_speculative_otc and "Fundamental Fair Value" not in models_used:
         data_quality = "Technical Only"
-    elif {"ARIMA", "Fundamental Fair Value"}.issubset(set(models_used)) and (
+    elif "Fundamental Fair Value" in models_used and (
         "Log Linear Trend" in models_used or "Log Polynomial Trend" in models_used
     ):
         data_quality = "Full"
@@ -1046,6 +1028,34 @@ def get_price_projections(
     return _get_price_projections_core(ticker, info=info_override, data=data_override, avg_cost=avg_cost)
 
 
+def _fill_missing_52w_range(info: dict, data: pd.DataFrame) -> dict:
+    """Backstop 52-week high/low from trailing OHLC history when the info
+    adapter didn't provide it.
+
+    Polygon's ticker overview endpoint (see modules.polygon_client.
+    build_info_adapter) has no 52-week range fields, so it sets
+    "fiftyTwoWeekHigh"/"fiftyTwoWeekLow" to None rather than omitting them.
+    That means checking ``"fiftyTwoWeekHigh" not in info`` is always False in
+    live scoring -- the key IS present, just with a None value -- so this
+    must check the *value* instead to actually engage the fallback.
+    """
+    if data is None or data.empty:
+        return info
+    try:
+        max_date = pd.to_datetime(data.index).max()
+        cutoff = max_date - pd.Timedelta(days=365)
+        trailing_52w = data.loc[pd.to_datetime(data.index) >= cutoff]
+    except Exception:
+        trailing_52w = data.tail(252)
+    if info.get("fiftyTwoWeekHigh") is None and not trailing_52w.empty and "High" in trailing_52w:
+        with contextlib.suppress(Exception):
+            info["fiftyTwoWeekHigh"] = float(trailing_52w["High"].astype(float).max())
+    if info.get("fiftyTwoWeekLow") is None and not trailing_52w.empty and "Low" in trailing_52w:
+        with contextlib.suppress(Exception):
+            info["fiftyTwoWeekLow"] = float(trailing_52w["Low"].astype(float).min())
+    return info
+
+
 def analyze_stock(
     ticker: str,
     period: str = "1y",
@@ -1061,21 +1071,7 @@ def analyze_stock(
     info = info_override if info_override is not None else get_stock_info(ticker)
     projection_data = projection_data_override if projection_data_override is not None else data_override
 
-    info = dict(info or {})
-    trailing_52w = pd.DataFrame()
-    if not data.empty:
-        try:
-            max_date = pd.to_datetime(data.index).max()
-            cutoff = max_date - pd.Timedelta(days=365)
-            trailing_52w = data.loc[pd.to_datetime(data.index) >= cutoff]
-        except Exception:
-            trailing_52w = data.tail(252)
-    if "fiftyTwoWeekHigh" not in info and not trailing_52w.empty and "High" in trailing_52w:
-        with contextlib.suppress(Exception):
-            info["fiftyTwoWeekHigh"] = float(trailing_52w["High"].astype(float).max())
-    if "fiftyTwoWeekLow" not in info and not trailing_52w.empty and "Low" in trailing_52w:
-        with contextlib.suppress(Exception):
-            info["fiftyTwoWeekLow"] = float(trailing_52w["Low"].astype(float).min())
+    info = _fill_missing_52w_range(dict(info or {}), data)
 
     technical = analyze_technical(data)
     if not data.empty:
@@ -1300,7 +1296,7 @@ def fast_screen_score(
     This is a genuine partial computation of the scoring logic in
     ``analyze_stock`` — it uses the same ``analyze_technical`` call and the
     same formula for ``technical_total``.  It intentionally omits the
-    expensive steps (ARIMA/GARCH forecasting and walk-forward
+    expensive steps (GARCH forecasting and walk-forward
     backtesting) to serve as a cheap first-pass filter.
     """
     try:

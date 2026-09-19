@@ -364,7 +364,7 @@ def _profit_subsection(
         legend_html = (
             '<div style="margin-top:14px;"><div style="color:#a9bdd7;font-size:12px;text-transform:uppercase;'
             'letter-spacing:0.06em;margin-bottom:6px;">Confidence legend</div>'
-            f"{render_legend([{'label': 'Full', 'description': 'ARIMA, trend, and fundamental/DCF models all contributed to the projection — highest-confidence tier.'}, {'label': 'Limited', 'description': 'Partial model coverage (e.g. missing fundamentals or a fitted trend) — treat with more caution.'}, {'label': 'Technical Only', 'description': 'Speculative/OTC ticker with no fundamental EPS data — projection is technical-trend only, higher risk.'}])}"
+            f"{render_legend([{'label': 'Full', 'description': 'Trend and fundamental/DCF models all contributed to the projection — highest-confidence tier.'}, {'label': 'Limited', 'description': 'Partial model coverage (e.g. missing fundamentals or a fitted trend) — treat with more caution.'}, {'label': 'Technical Only', 'description': 'Speculative/OTC ticker with no fundamental EPS data — projection is technical-trend only, higher risk.'}])}"
             "</div>"
         )
 
@@ -432,7 +432,7 @@ def _run_shard_ticker(ticker: str, horizon: str) -> dict[str, Any]:
     passes per ticker inside `run_scan_shard` -- once via `run_screener`
     (1y data) and once via `scan_and_filter_profit_opportunities` (5y data).
     Both passes fed into `get_price_projections`, which runs a genuine 30d
-    *and* 180d ARIMA/LightGBM walk-forward backtest, so every ticker's
+    *and* 180d trend/LightGBM walk-forward backtest, so every ticker's
     backtests were being computed twice per shard; with ~277 tickers/shard
     that duplication was the root cause of shards exceeding GitHub's 6h job
     limit once PR 58 fixed a caching bug that had been silently swallowing

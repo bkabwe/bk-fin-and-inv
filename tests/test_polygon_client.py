@@ -31,6 +31,48 @@ class PolygonClientTests(unittest.TestCase):
         self.assertTrue(pd.isna(data.iloc[0]["Close"]))
         self.assertEqual(float(data.iloc[0]["Open"]), 10.0)
 
+    def test_list_active_ticker_details_sends_exchange_not_primary_exchange_param(self):
+        # Regression test: Polygon's /v3/reference/tickers list endpoint only
+        # recognizes the "exchange" query param for MIC-code filtering;
+        # "primary_exchange" (a result-row field name, not a request param)
+        # was previously sent instead and silently ignored by Polygon.
+        payload = {"results": [{"ticker": "AAPL", "primary_exchange": "XNAS", "type": "CS"}]}
+
+        with patch("modules.polygon_client._request_json", return_value=payload) as request_mock:
+            tickers = polygon_client.list_active_ticker_details(primary_exchange="XNAS", otc=False)
+
+        called_params = request_mock.call_args.args[1]
+        self.assertEqual(called_params.get("exchange"), "XNAS")
+        self.assertNotIn("primary_exchange", called_params)
+        self.assertNotIn("otc", called_params)
+        self.assertEqual([row["ticker"] for row in tickers], ["AAPL"])
+
+    def test_list_active_ticker_details_excludes_otc_rows_when_otc_false(self):
+        payload = {
+            "results": [
+                {"ticker": "AAPL", "primary_exchange": "XNAS", "type": "CS"},
+                {"ticker": "PINKX", "primary_exchange": "OTC MARKETS", "type": "CS"},
+            ]
+        }
+
+        with patch("modules.polygon_client._request_json", return_value=payload):
+            tickers = polygon_client.list_active_ticker_details(otc=False)
+
+        self.assertEqual([row["ticker"] for row in tickers], ["AAPL"])
+
+    def test_list_active_ticker_details_keeps_only_otc_rows_when_otc_true(self):
+        payload = {
+            "results": [
+                {"ticker": "AAPL", "primary_exchange": "XNAS", "type": "CS"},
+                {"ticker": "PINKX", "primary_exchange": "OTC MARKETS", "type": "CS"},
+            ]
+        }
+
+        with patch("modules.polygon_client._request_json", return_value=payload):
+            tickers = polygon_client.list_active_ticker_details(otc=True)
+
+        self.assertEqual([row["ticker"] for row in tickers], ["PINKX"])
+
 
 if __name__ == "__main__":
     unittest.main()

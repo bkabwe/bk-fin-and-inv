@@ -38,15 +38,45 @@ class FeatureEngineeringTechnicalTests(unittest.TestCase):
         ema_manual = close[0]
         for value in close[1:]:
             ema_manual = (alpha * value) + ((1 - alpha) * ema_manual)
+        ema_ratio_manual = (close[-1] / ema_manual) - 1.0
 
         returns = price_data["Close"].pct_change().dropna().values
         vol10_manual = float(np.std(returns[-10:], ddof=1))
 
-        self.assertAlmostEqual(float(table["technical_ema_12d"].iloc[-1]), float(ema_manual), places=6)
+        self.assertAlmostEqual(float(table["technical_close_to_ema_12d"].iloc[-1]), float(ema_ratio_manual), places=6)
         self.assertAlmostEqual(float(table["technical_volatility_10d"].iloc[-1]), vol10_manual, places=12)
         self.assertGreater(float(table["technical_rsi_14d"].iloc[-1]), 99.9)
-        self.assertTrue(table["technical_ema_12d"].iloc[:11].isna().all())
-        self.assertTrue(table["technical_ema_26d"].iloc[:25].isna().all())
+        self.assertTrue(table["technical_close_to_ema_12d"].iloc[:11].isna().all())
+        self.assertTrue(table["technical_close_to_ema_26d"].iloc[:25].isna().all())
+        # Raw price/level features are never exposed to the (tree-based)
+        # LightGBM model -- only stationary ratios/returns are.
+        self.assertNotIn("technical_ema_12d", table.columns)
+        self.assertNotIn("technical_ema_26d", table.columns)
+        self.assertNotIn("technical_vwap_daily_approx", table.columns)
+
+    def test_lagged_return_and_rolling_mean_return_features(self):
+        price_data = _sample_price_frame(90)
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()),
+        ):
+            table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=90)
+
+        returns = price_data["Close"].pct_change()
+        # Compare from index 55 onward so every rolling/lag window (up to 50d) is
+        # fully warmed up and NaN-free on both sides.
+        self.assertTrue(np.allclose(table["technical_return_lag_1d"].iloc[55:].values, returns.shift(1).iloc[55:].values))
+        self.assertTrue(np.allclose(table["technical_return_lag_2d"].iloc[55:].values, returns.shift(2).iloc[55:].values))
+        self.assertTrue(np.allclose(table["technical_return_lag_5d"].iloc[55:].values, returns.shift(5).iloc[55:].values))
+        self.assertTrue(
+            np.allclose(table["technical_return_mean_5d"].iloc[55:].values, returns.rolling(5).mean().iloc[55:].values)
+        )
+        self.assertTrue(
+            np.allclose(table["technical_return_mean_20d"].iloc[55:].values, returns.rolling(20).mean().iloc[55:].values)
+        )
+        self.assertTrue(
+            np.allclose(table["technical_return_mean_50d"].iloc[55:].values, returns.rolling(50).mean().iloc[55:].values)
+        )
 
     def test_rsi_flat_series_is_neutral_after_warmup(self):
         price_data = _sample_price_frame(30)
@@ -60,6 +90,7 @@ class FeatureEngineeringTechnicalTests(unittest.TestCase):
             table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=30)
 
         self.assertAlmostEqual(float(table["technical_rsi_14d"].iloc[-1]), 50.0, places=6)
+
 
 
 class FeatureEngineeringFundamentalTests(unittest.TestCase):
@@ -135,7 +166,7 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
         self.assertTrue(table["fundamental_gross_margin"].isna().all())
         self.assertTrue(table["fundamental_debt_to_equity"].isna().all())
         self.assertTrue(table["fundamental_revenue_growth"].isna().all())
-        self.assertTrue(table["macro_dgs10_level"].isna().all())
+        self.assertNotIn("macro_dgs10_level", table.columns)
         self.assertTrue(table["macro_cpiaucsl_delta_5d"].isna().all())
         self.assertTrue(table["macro_fedfunds_pct_change_30d"].isna().all())
 
@@ -149,7 +180,7 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
 
         self.assertEqual(len(table), 5)
         self.assertTrue(table["technical_volatility_30d"].isna().all())
-        self.assertTrue(table["technical_ema_26d"].isna().all())
+        self.assertTrue(table["technical_close_to_ema_26d"].isna().all())
         self.assertTrue(table["technical_volume_vs_avg_20d"].isna().all())
         self.assertTrue(table["technical_rsi_14d"].isna().all())
 
@@ -203,7 +234,8 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
 
         macro_mock.assert_not_called()
         self.assertFalse(table.empty)
-        self.assertFalse(table["macro_dgs10_level"].isna().all())
+        self.assertNotIn("macro_dgs10_level", table.columns)
+        self.assertFalse(table["macro_dgs10_delta_5d"].isna().all())
 
 
 if __name__ == "__main__":

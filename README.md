@@ -123,8 +123,8 @@ on macOS or don't use Homebrew's `redis` service.
 - Notification bell with unread count + mark-all-read
 - Technical analysis (SMA/EMA, RSI, MACD, Stochastic, Bollinger, ATR, OBV, support/resistance, classic patterns)
 - Unified score + recommendation engine with entry/target/stop-loss suggestions
-- Multi-model projected price targets (ARIMA + log-linear/log-polynomial trend + LightGBM return models for 30d/180d when saved models exist + fundamental fair value + DCF + technical resistance + analyst target, with GARCH confidence bounds)
-- Prophet was removed from the ensemble after walk-forward backtests consistently showed materially higher RMSE on stock series (which generally lack the strong recurring seasonality Prophet is designed for).
+- Multi-model projected price targets (log-linear/log-polynomial trend + LightGBM return models for 30d/180d when saved models exist + fundamental fair value + DCF + technical resistance + analyst target, with GARCH confidence bounds)
+- Prophet was removed from the ensemble after walk-forward backtests consistently showed materially higher RMSE on stock series (which generally lack the strong recurring seasonality Prophet is designed for). ARIMA was later removed too: on its own it isn't reliable for the dynamism of stock markets, and live scoring's adaptive weighting already favored trend/LightGBM over it. `modules/backtester.py`'s walk-forward comparison tooling (`scripts/compare_lightgbm_backtest.py`) still supports an opt-in ARIMA evaluation for offline research.
 
 ## Data Sources
 
@@ -404,15 +404,20 @@ configured TTL (e.g. 1 hour for stock data, 24 hours for backtests).
 The app now includes `modules/feature_engineering.py`, which builds a daily-indexed
 feature table per ticker as a data-preparation layer for a planned future
 feature-based forecasting model (not yet wired into scoring/projections in this
-phase). The table combines:
-- Technical features (rolling volatility, EMA, RSI, daily-bar VWAP approximation,
-  and volume-vs-average)
+phase). All features are intentionally stationary (ratios, percent changes, and
+returns rather than raw price/level values) so a tree-based model like LightGBM
+never has to extrapolate outside the numeric range it was trained on. The table
+combines:
+- Technical features: rolling volatility, close-to-EMA and close-to-daily-VWAP-
+  approximation ratios, RSI, volume-vs-average, lagged daily returns (AR-style:
+  1d/2d/5d), and rolling mean returns (MA-style: 5d/20d/50d)
 - SEC EDGAR fundamentals (`fundamental_revenue_growth`,
   `fundamental_debt_to_equity` (percent points, matching existing SEC adapter
   scaling), and `fundamental_gross_margin`), forward-filled from filing dates
   across daily rows
-- Shared macro features from FRED (`DGS10`, `CPIAUCSL`, `FEDFUNDS`) with level and
-  5-day/30-day delta and percent-change metrics
+- Shared macro features from FRED (`DGS10`, `CPIAUCSL`, `FEDFUNDS`) as 5-day/
+  30-day delta and percent-change metrics only (raw levels are used internally
+  to compute these but are not exposed as features)
 
 Design principle: feature assembly is TTL-cached incrementally and decoupled from
 scan cadence so repeated scans avoid unnecessary recomputation/refetching.
@@ -428,20 +433,36 @@ SEC EDGAR fundamentals alongside technical indicators and shared FRED macro
 features, so it is not a purely technical model.
 
 Live scoring now runs a dedicated per-ticker walk-forward backtest at scan time
-for each in-scope horizon (`run_walk_forward(..., horizon=30, evaluate_lightgbm=True)`
-and the same at `horizon=180`) and derives LightGBM's ensemble weight **adaptively**
-from that evidence: `_inverse_rmse_weights()` splits each horizon's weight budget
-across ARIMA/trend/LightGBM in proportion to their inverse walk-forward RMSE,
-instead of reserving a fixed percentage for LightGBM. `LIGHTGBM_MAX_ADAPTIVE_SHARE`
-(50%) caps LightGBM's share of that split so a noisy, small-sample per-ticker
-backtest (a handful of windows) can't crowd out ARIMA/trend entirely; any excess
-above the cap is redistributed back to ARIMA/trend proportionally. When a
-ticker's backtest can't produce a valid `lightgbm_rmse` (e.g. too little
-history), live scoring falls back to the previous fixed weights,
-`LIGHTGBM_WEIGHT_30D = 0.15` and `LIGHTGBM_WEIGHT_180D = 0.08`, which remain in
-the code as that fallback. **720d remains intentionally excluded from the live
-ensemble for now** because current validation has only one non-overlapping
-window per ticker, which is promising but not yet actionable.
+for each in-scope horizon (`run_walk_forward(..., horizon=30, evaluate_lightgbm=True,
+evaluate_arima=False)` and the same at `horizon=180`) and derives LightGBM's
+ensemble weight **adaptively** from that evidence: `_inverse_rmse_weights()`
+splits each horizon's weight budget across trend/LightGBM in proportion to
+their inverse walk-forward RMSE, instead of reserving a fixed percentage for
+LightGBM. A **dynamic cap** (`_lightgbm_adaptive_share_cap()`) limits
+LightGBM's share of that split so a noisy, small-sample per-ticker backtest
+can't crowd out trend entirely; any excess above the cap is redistributed
+back to trend. The cap itself scales with how many walk-forward windows back
+the ticker's `lightgbm_rmse` estimate: it floors at
+`LIGHTGBM_MIN_ADAPTIVE_SHARE_CAP` (50%) for sparse evidence (≤1 window) and
+rises linearly to `LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP` (70%) once evidence
+reaches `LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS` (6) windows, so
+better-replicated per-ticker backtests (e.g. the 30d horizon's typical 6
+windows) can earn a larger adaptive share than thinner ones (e.g. 180d's
+typical 4 windows, landing at a 62% cap). When a ticker's backtest can't
+produce a valid `lightgbm_rmse` (e.g. too little history), live scoring
+falls back to the previous fixed weights, `LIGHTGBM_WEIGHT_30D = 0.15` and
+`LIGHTGBM_WEIGHT_180D = 0.08`, which remain in the code as that fallback.
+**720d remains intentionally excluded from the live ensemble for now**
+because current validation has only one non-overlapping window per ticker,
+which is promising but not yet actionable.
+
+ARIMA was removed from the live ensemble entirely (it isn't reliable on its
+own for the dynamism of stock markets, and adaptive weighting already
+favored trend/LightGBM over it in practice); `evaluate_arima=False` above
+skips the expensive per-ticker ARIMA order search during live scans.
+`modules/backtester.run_walk_forward()` still supports an opt-in
+`evaluate_arima=True` (the default) for offline research/comparison via
+`modules/backtest_comparison.py`.
 
 Because the 180d backtest needs at least 540 rows of history (a 360-row train
 window + 180-row test window), the live price-projection path now fetches 5
@@ -457,16 +478,17 @@ python scripts/train_lightgbm_return_models.py AAPL
 ```
 
 This writes per-ticker joblib artifacts under `data/lightgbm_return_models/<TICKER>/`.
-If no saved model is available, live scoring falls back to the existing ARIMA/trend
+If no saved model is available, live scoring falls back to the trend-only
 ensemble behavior for that ticker/horizon.
 
 ### Walk-forward validation gate for LightGBM
 `modules/backtester.run_walk_forward()` now supports optional LightGBM RMSE
-evaluation alongside ARIMA and trend over the same rolling windows, for
-validation/decision-gate analysis. The live ensemble now consumes that evidence
-at 30d/180d only, via its own per-horizon backtest call at each of those two
-horizons (see above); 720d remains gated off until more natural history
-accrues and yields more than one non-overlapping validation window per ticker.
+evaluation alongside trend (and, when `evaluate_arima=True`, ARIMA) over the
+same rolling windows, for validation/decision-gate analysis. The live
+ensemble consumes that evidence at 30d/180d only, via its own per-horizon
+backtest call at each of those two horizons with `evaluate_arima=False` (see
+above); 720d remains gated off until more natural history accrues and yields
+more than one non-overlapping validation window per ticker.
 Because LightGBM is trained as fixed-horizon return models (`30/180/720` days),
 the walk-forward path maps each test window to the closest available horizon
 (e.g., 30-day test windows use the 30-day model) and converts the predicted
@@ -476,6 +498,14 @@ macro-feature columns could remain object-typed when FRED data was unavailable,
 causing every per-window LightGBM fit to fail under the old silent `except`.
 Feature tables are now coerced back to numeric dtypes before training, and any
 remaining per-window LightGBM failure is logged with ticker/window context.
+
+LightGBM's training rows are also now **embargoed**: the last `horizon` rows of
+each raw training window are excluded before fitting, because their
+forward-return label's target close falls inside that window's held-out test
+period (a purged/embargoed split, preventing label leakage across the
+train/test boundary). This shrinks the usable 30d-horizon training window from
+60 to 30 rows; 180d/720d windows are large enough that the embargo removes a
+proportionally smaller share.
 
 To reproduce aggregate comparisons across a representative ticker sample:
 
@@ -487,7 +517,11 @@ The script prints mean/median RMSE per model, LightGBM win percentage vs both
 ARIMA and trend, and ticker/window evaluation counts per model.
 
 ### ARIMA convergence hardening
-ARIMA fitting paths in both backtesting and scoring now use stronger convergence
+ARIMA is no longer part of the live price-projection ensemble (see above), but
+`modules/arima_hardening.py` still backs ARIMA fitting in the walk-forward
+backtest-comparison tooling (`modules/backtest_comparison.py`, opt-in via
+`evaluate_arima=True`) and the independent "days to target price" estimate in
+`modules/profit_opportunities.py`. Both paths use stronger convergence
 settings: higher optimizer iteration budget, smarter initialization, and a
 single fallback retry with an alternate optimizer when convergence warnings occur.
 The ARIMA order-grid candidates and AIC selection logic are unchanged, preserving
@@ -510,7 +544,7 @@ large universes (S&P 500, NASDAQ, Russell 2000) while keeping results accurate:
 
 1. **Fast tier** — every ticker in the universe is evaluated with a cheap
    technical-subscore pass (data fetch + `analyze_technical` only, no
-   ARIMA/trend/GARCH/backtest).  The subscore is normalized to 0–100.
+   trend/GARCH/backtest).  The subscore is normalized to 0–100.
 2. **Full tier** — only tickers whose fast-tier score ≥ `min_score − margin`
    proceed to the expensive full analysis (forecasting + walk-forward backtest).
 
@@ -535,7 +569,7 @@ The Profit Opportunities page now offers a **Scan Mode** selector:
 
 - **Fast (Recommended)** — runs per-ticker analysis in a parallel thread pool
   (`max_workers=8`) and optionally applies a cheap technical-subscore
-  pre-filter before the expensive ARIMA/trend/GARCH full analysis.  The
+  pre-filter before the expensive trend/GARCH full analysis.  The
   pre-filter uses the same safeguarded two-tier approach as the Screener
   (conservative threshold + 15-point safety margin) and is toggle-able via
   the "Enable fast-screen pre-filter" checkbox.  Significantly faster on large
@@ -570,7 +604,7 @@ review is needed.
 Every price projection shown to the user is automatically persisted so that,
 once the estimated target date has passed, the app can verify whether the
 prediction actually hit — giving you an empirical track record of the
-ARIMA/trend/GARCH-enhanced ensemble's accuracy.
+trend/LightGBM/GARCH-enhanced ensemble's accuracy.
 
 ### What gets tracked
 Predictions are recorded from three sources:

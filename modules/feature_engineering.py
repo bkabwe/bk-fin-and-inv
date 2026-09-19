@@ -134,18 +134,41 @@ def _technical_features(price_frame: pd.DataFrame) -> pd.DataFrame:
 
     features["technical_volatility_10d"] = returns.rolling(10).std()
     features["technical_volatility_30d"] = returns.rolling(30).std()
-    features["technical_ema_12d"] = close.ewm(span=12, adjust=False, min_periods=12).mean()
-    features["technical_ema_26d"] = close.ewm(span=26, adjust=False, min_periods=26).mean()
+
+    # Tree-based models like LightGBM cannot extrapolate a continuous price
+    # level outside the range seen during training, so raw dollar-denominated
+    # EMA/VWAP levels are never exposed as features -- only the stationary
+    # percentage distance between price and each reference level (a bounded,
+    # scale-free ratio) is.
+    ema_12 = close.ewm(span=12, adjust=False, min_periods=12).mean()
+    ema_26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
+    features["technical_close_to_ema_12d"] = (close / ema_12.replace(0, np.nan)) - 1.0
+    features["technical_close_to_ema_26d"] = (close / ema_26.replace(0, np.nan)) - 1.0
     features["technical_rsi_14d"] = _compute_rsi(close, window=14)
 
     # Daily-bar VWAP approximation: cumulative typical-price*volume / cumulative volume.
     # True VWAP is intraday; this approximation is used because the app currently works with daily OHLCV bars.
     typical_price = (high + low + close) / 3.0
     cumulative_volume = volume.cumsum().replace(0, np.nan)
-    features["technical_vwap_daily_approx"] = (typical_price * volume).cumsum() / cumulative_volume
+    vwap_approx = (typical_price * volume).cumsum() / cumulative_volume
+    features["technical_close_to_vwap"] = (close / vwap_approx.replace(0, np.nan)) - 1.0
 
     rolling_vol_avg_20 = volume.rolling(20).mean()
     features["technical_volume_vs_avg_20d"] = volume / rolling_vol_avg_20.replace(0, np.nan)
+
+    # Auto-Regressive (AR) style features: lagged daily returns give LightGBM
+    # direct access to recent linear autocorrelation structure without the
+    # computational cost of fitting a separate statistical AR model.
+    features["technical_return_lag_1d"] = returns.shift(1)
+    features["technical_return_lag_2d"] = returns.shift(2)
+    features["technical_return_lag_5d"] = returns.shift(5)
+
+    # Moving-Average (MA) style features: rolling mean returns across
+    # several windows give LightGBM direct access to recent momentum without
+    # the computational cost of fitting a separate statistical MA model.
+    features["technical_return_mean_5d"] = returns.rolling(5).mean()
+    features["technical_return_mean_20d"] = returns.rolling(20).mean()
+    features["technical_return_mean_50d"] = returns.rolling(50).mean()
     return features
 
 
@@ -210,9 +233,12 @@ def _fundamental_daily_features(ticker: str, daily_index: pd.DatetimeIndex) -> p
 
 
 def _macro_columns() -> list[str]:
+    # Raw macro levels (e.g. macro_dgs10_level) are intentionally excluded:
+    # they are non-stationary and a tree-based model like LightGBM cannot
+    # extrapolate them outside their historical training range. Only the
+    # already-stationary delta/pct-change transforms are exposed as features.
     columns: list[str] = []
     for prefix in _MACRO_PREFIXES:
-        columns.append(f"macro_{prefix}_level")
         for window in (5, 30):
             columns.append(f"macro_{prefix}_delta_{window}d")
             columns.append(f"macro_{prefix}_pct_change_{window}d")

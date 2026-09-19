@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from pandas.tseries.offsets import CustomBusinessDay
 
-from modules import arima_hardening, backtester, scoring_engine
+from modules import arima_hardening, backtester
 
 
 class ArimaHardeningTests(unittest.TestCase):
@@ -85,15 +85,6 @@ class ArimaHardeningTests(unittest.TestCase):
         fit_result.aic = 1.0
         with patch("modules.backtester.fit_arima_with_hardening", return_value=fit_result) as fit_mock:
             order = backtester._select_arima_order(pd.Series(np.linspace(10.0, 20.0, num=80)))
-        self.assertEqual(order, (0, 0, 0))
-        self.assertTrue(fit_mock.called)
-
-    def test_scoring_order_selection_uses_shared_hardened_fit(self):
-        fit_result = MagicMock()
-        fit_result.aic = 1.0
-        values = tuple(np.linspace(10.0, 20.0, num=80).tolist())
-        with patch("modules.scoring_engine.fit_arima_with_hardening", return_value=fit_result) as fit_mock:
-            order = scoring_engine._select_arima_order("AAPL", values)
         self.assertEqual(order, (0, 0, 0))
         self.assertTrue(fit_mock.called)
 

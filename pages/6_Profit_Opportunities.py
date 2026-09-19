@@ -48,7 +48,7 @@ scan_mode = st.radio(
         "(technical subscore proxy). Significantly quicker on large universes. "
         "May very rarely miss a borderline candidate near the upside threshold.\n\n"
         "**Thorough**: Original sequential behaviour — every ticker gets full "
-        "ARIMA/trend/GARCH analysis. Slower but no pre-filtering shortcuts."
+        "trend/GARCH analysis. Slower but no pre-filtering shortcuts."
     ),
 )
 _fast_mode = scan_mode.startswith("Fast")
