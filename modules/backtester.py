@@ -136,9 +136,16 @@ def run_walk_forward(
     evaluate_lightgbm: bool = False,
     evaluate_naive_baseline: bool = False,
     lightgbm_diagnostics: bool = False,
+    evaluate_arima: bool = True,
 ) -> dict:
     """Walk-forward RMSE comparison across ARIMA/trend/LightGBM (and optionally
     a naive baseline) for a single ticker/horizon.
+
+    ``evaluate_arima`` defaults to True so standalone research/comparison
+    callers (e.g. modules/backtest_comparison.py) keep seeing ARIMA evidence.
+    Live scoring (modules/scoring_engine.py) no longer uses ARIMA in its
+    price-projection ensemble and passes ``evaluate_arima=False`` to skip the
+    expensive per-ticker ARIMA order search entirely.
 
     KNOWN LIMITATIONS (documented, not yet addressed):
 
@@ -200,7 +207,7 @@ def run_walk_forward(
         # low-risk reduction in redundant statsmodels fits. Falls back to
         # per-window selection only if the shared selection itself fails.
         shared_arima_order: tuple[int, int, int] | None = None
-        if ARIMA_AVAILABLE and starts:
+        if evaluate_arima and ARIMA_AVAILABLE and starts:
             first_start = starts[0]
             first_train = close.iloc[first_start : first_start + int(config.train_len)]
             try:
@@ -222,7 +229,7 @@ def run_walk_forward(
 
             test_vals = test.values.astype(float)
 
-            if ARIMA_AVAILABLE:
+            if evaluate_arima and ARIMA_AVAILABLE:
                 try:
                     order = shared_arima_order if shared_arima_order is not None else _select_arima_order(train)
                     pred = fit_arima_with_hardening(train, order=order, logger=logger).forecast(steps=int(config.test_len))

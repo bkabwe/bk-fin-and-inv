@@ -75,9 +75,11 @@ DEFAULT_BATCH_RETENTION = 4
 # shard-asset uploads in the weekly promote job, and an over-throttled
 # per-shard SEC_EDGAR_MAX_REQUESTS_PER_SECOND, see below). 16 already fits in
 # a single wave (16 < 20 concurrent), so it doesn't need to grow beyond the
-# cap. The real per-ticker cost fix is the ARIMA order-search reuse in
-# modules/backtester.py::run_walk_forward -- selecting the (p,d,q) order once
-# per horizon instead of once per walk-forward window cut a synthetic
+# cap. Live scoring's `run_walk_forward` calls now also pass
+# `evaluate_arima=False` (ARIMA was removed from the live ensemble -- see
+# modules/scoring_engine.py), skipping the ARIMA order-search grid entirely
+# during scans instead of merely reusing one shared order per horizon; the
+# prior shared-order-reuse optimization alone had already cut a synthetic
 # 30d+180d per-ticker benchmark from ~92s to ~20s (measured in this repo).
 # The scan-email workflows' "Scan shard" step divides
 # SEC_EDGAR_MAX_REQUESTS_PER_SECOND by this shard count, so aggregate SEC

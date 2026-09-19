@@ -182,14 +182,17 @@ class FredMacroRegimeTests(unittest.TestCase):
 
 
 class ForecastingEnsembleTests(unittest.TestCase):
-    def test_inverse_rmse_weights_use_arima_and_trend(self):
+    def test_inverse_rmse_weights_ignores_arima_and_uses_trend_only(self):
+        # ARIMA has been removed from the live ensemble: _inverse_rmse_weights
+        # no longer reads an "arima_rmse" key at all, so it's ignored here just
+        # like any other unused field, and the sole remaining base component
+        # (trend) gets the full weight.
         weights = scoring_engine._inverse_rmse_weights(
             {"arima_rmse": 2.0, "trend_rmse": 1.0, "n_windows": 4, "unused_rmse": 0.0001}
         )
         self.assertIsNotNone(weights)
-        self.assertEqual(set(weights.keys()), {"arima", "trend"})
-        self.assertGreater(weights["trend"], weights["arima"])
-        self.assertAlmostEqual(sum(weights.values()), 1.0, places=6)
+        self.assertEqual(set(weights.keys()), {"trend"})
+        self.assertAlmostEqual(weights["trend"], 1.0, places=6)
 
     def test_walk_forward_default_shape(self):
         pd_mod = __import__("pandas")

@@ -21,7 +21,7 @@ _DEFAULT_MAX_WORKERS = 8
 
 # Default safety margin for the two-tier fast-screen pre-filter.
 # A ticker whose normalized technical subscore is below ``min_score - margin``
-# is skipped from the expensive ARIMA/trend/GARCH/backtest full analysis.
+# is skipped from the expensive trend/GARCH/backtest full analysis.
 # Increase this value to make the pre-filter more permissive (fewer false
 # negatives); set ``use_fast_screen=False`` to disable entirely.
 DEFAULT_FAST_SCREEN_MARGIN = 15
@@ -115,7 +115,7 @@ def run_screener(
         Number of threads for parallel I/O-bound Polygon fetches.
     use_fast_screen:
         When ``True`` (default), apply a cheap technical-subscore pre-filter
-        before running the expensive full analysis (ARIMA/trend/GARCH +
+        before running the expensive full analysis (trend/GARCH +
         walk-forward backtest).  Set to ``False`` for small universes (e.g.
         NASDAQ 100 custom lists) where speed is less of a concern.
     fast_screen_margin:
