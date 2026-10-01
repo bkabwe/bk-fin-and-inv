@@ -55,6 +55,11 @@ DEFAULT_MIN_SCORE = 50
 DEFAULT_MIN_UPSIDE_PCT = 15.0
 DEFAULT_FAST_SCREEN_PROXY_THRESHOLD = 15
 TOP_RESULTS_LIMIT = 75
+# Max rows any single "Sector" value may claim within a top-75 ranked cut
+# (20% of TOP_RESULTS_LIMIT) -- a diversification/concentration cap so one
+# hot sector can't crowd out the rest of the by-upside/by-score/
+# by-risk-adjusted-upside lists. See _apply_diversification_cap.
+DEFAULT_MAX_PER_SECTOR = 15
 PREVIEW_LIMIT = 10
 # Each ticker's `_run_shard_ticker` call is independent (no shared mutable
 # state) and is I/O-bound (network fetches, live FRED/SEC calls) far more
@@ -194,6 +199,56 @@ def _require_lightgbm_backtested(results: pd.DataFrame) -> tuple[pd.DataFrame, i
     return results[confirmed_mask].reset_index(drop=True), dropped
 
 
+def _exclude_thin_history(results: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Drop rows whose price history falls short of a full walk-forward
+    train+test window for this horizon (e.g. a recent IPO) -- see
+    modules.scoring_engine._is_thin_history.
+
+    A thin-history ticker's projection/confidence are built on much less
+    evidence than the rest of the pool, so it's excluded from the scheduled
+    report's ranked lists entirely rather than silently ranked alongside
+    fully-evidenced tickers. Returns `(filtered_results, dropped_count)`.
+    """
+    if results is None or results.empty or "_thin_history" not in results.columns:
+        return results, 0
+    ample_history_mask = results["_thin_history"] == False  # noqa: E712
+    dropped = int((~ample_history_mask).sum())
+    return results[ample_history_mask].reset_index(drop=True), dropped
+
+
+def _apply_diversification_cap(
+    results: pd.DataFrame,
+    *,
+    limit: int = TOP_RESULTS_LIMIT,
+    max_per_sector: int = DEFAULT_MAX_PER_SECTOR,
+) -> pd.DataFrame:
+    """Truncate an already-ranked (descending) frame to `limit` rows while
+    capping how many rows any single "Sector" value may claim.
+
+    Greedily walks the frame in rank order, skipping rows that would push a
+    sector's running count above `max_per_sector`, so a single hot sector
+    (e.g. every top-upside pick happening to be Technology) can't crowd out
+    the rest of a top-N ranked list. Falls back to a plain head(limit) when
+    the "Sector" column isn't present.
+    """
+    if results is None or results.empty:
+        return results
+    if "Sector" not in results.columns:
+        return results.head(limit).reset_index(drop=True)
+
+    sector_counts: dict[str, int] = {}
+    kept_indices = []
+    for idx, sector in zip(results.index, results["Sector"], strict=True):
+        sector_key = sector if sector else "Unknown"
+        if sector_counts.get(sector_key, 0) >= max_per_sector:
+            continue
+        sector_counts[sector_key] = sector_counts.get(sector_key, 0) + 1
+        kept_indices.append(idx)
+        if len(kept_indices) >= limit:
+            break
+    return results.loc[kept_indices].reset_index(drop=True)
+
+
 def scan_and_filter_profit_opportunities(
     tickers: list[str],
     horizon: str,
@@ -222,13 +277,15 @@ def scan_and_filter_profit_opportunities(
         prefetch_price_period="5y",
     )
     confirmed, lightgbm_unconfirmed_count = _require_lightgbm_backtested(scanned)
-    filtered = filter_by_upside(confirmed, horizon, min_upside_pct=min_upside_pct, max_results=max_results)
+    ample_history, thin_history_dropped_count = _exclude_thin_history(confirmed)
+    filtered = filter_by_upside(ample_history, horizon, min_upside_pct=min_upside_pct, max_results=max_results)
     stats_base = {
         "scanned_count": int(scanned.attrs.get("scanned_count", len(tickers))),
         "fast_filtered_count": int(scanned.attrs.get("fast_filtered_count", 0)),
         "passed_fast_screen_count": int(scanned.attrs.get("fully_analyzed_count", 0)),
         "failed_count": int(scanned.attrs.get("failed_count", 0)),
         "lightgbm_unconfirmed_count": lightgbm_unconfirmed_count,
+        "thin_history_dropped_count": thin_history_dropped_count,
     }
     return filtered, stats_base
 
@@ -248,7 +305,7 @@ def finalize_profit_results(
     here at the reduce stage (not per-shard).
     """
     recorded_rows = results.to_dict("records") if not results.empty else []
-    drop_columns = ["_rsi", "_lightgbm_backtested", *SUBSCORE_ROW_FIELDS]
+    drop_columns = ["_rsi", "_lightgbm_backtested", "_thin_history", *SUBSCORE_ROW_FIELDS]
     if horizon == "short_term":
         # Confidence (Full/Limited/Technical Only) is derived from a
         # ticker-wide models_used list that includes Fundamental Fair Value
@@ -310,6 +367,7 @@ def _preview_rows(df: pd.DataFrame, columns: list[str], *, limit: int = PREVIEW_
                 "Current Price": _format_value(row.get("Current Price"), currency=True),
                 "Target Price": _format_value(row.get("Target Price"), currency=True),
                 "Projected Upside %": _format_value(row.get("Projected Upside %"), pct=True),
+                "Risk-Adjusted Upside": _format_value(row.get("Risk-Adjusted Upside")),
             }
         )
     return formatted
@@ -328,7 +386,7 @@ def _profit_subsection(
     avg_upside = float(results["Projected Upside %"].mean()) if not results.empty else None
     median_upside = float(results["Projected Upside %"].median()) if not results.empty else None
 
-    columns = ["Ticker", "Company", "Score", "Current Price", "Target Price", "Projected Upside %"]
+    columns = ["Ticker", "Company", "Score", "Current Price", "Target Price", "Projected Upside %", "Risk-Adjusted Upside"]
     tiles = [
         {"label": "Top ticker", "value": str(top["Ticker"]) if top is not None else "—"},
         {
@@ -343,6 +401,10 @@ def _profit_subsection(
             {
                 "label": "LightGBM-unconfirmed dropped",
                 "value": str(int(profit_stats.get("lightgbm_unconfirmed_count") or 0)),
+            },
+            {
+                "label": "Thin-history dropped",
+                "value": str(int(profit_stats.get("thin_history_dropped_count") or 0)),
             },
             *tiles,
         ]
@@ -384,6 +446,7 @@ def build_scan_report(
     screener_results: pd.DataFrame,
     profit_by_upside: pd.DataFrame,
     profit_by_score: pd.DataFrame,
+    profit_by_risk_adjusted: pd.DataFrame,
     profit_stats: dict[str, int],
     horizon: str,
     run_date: str,
@@ -402,11 +465,12 @@ def build_scan_report(
         ),
         (
             f"<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Profit opportunities top 75</h2>"
-            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Split into two rankings over the same qualifying pool for {HORIZON_SETTINGS[horizon]['label']}: one by projected upside, one by overall score. Full top 75 of each is attached as CSV.</p>"
+            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Split into three rankings over the same qualifying pool for {HORIZON_SETTINGS[horizon]['label']}: by projected upside, by overall score, and by risk-adjusted upside (upside ÷ confidence-band width). Each list applies a max-{DEFAULT_MAX_PER_SECTOR}-per-sector diversification cap. Full top 75 of each is attached as CSV.</p>"
             + _profit_subsection(
                 "By upside", "projected upside %", profit_by_upside, profit_stats, horizon, show_recorded_tile=True
             )
             + _profit_subsection("By score", "overall score", profit_by_score, profit_stats, horizon)
+            + _profit_subsection("By risk-adjusted upside", "risk-adjusted upside", profit_by_risk_adjusted, profit_stats, horizon)
         ),
     ]
 
@@ -545,6 +609,7 @@ def run_scan_shard(
         "passed_fast_screen_count": 0,
         "failed_count": 0,
         "lightgbm_unconfirmed_count": 0,
+        "thin_history_dropped_count": 0,
     }
 
     shard_tickers = tickers_for_shard(manifest, shard_index, shard_count)
@@ -641,10 +706,13 @@ def run_scan_shard(
 
     profit_scanned = pd.DataFrame(profit_rows) if profit_rows else pd.DataFrame()
     profit_confirmed, lightgbm_unconfirmed_count = _require_lightgbm_backtested(profit_scanned)
+    profit_ample_history, thin_history_dropped_count = _exclude_thin_history(profit_confirmed)
     # max_results=None: final top-N truncation is deferred to reduce_scan_shards
     # once all shards' partials are combined, matching the old
     # scan_and_filter_profit_opportunities(..., max_results=None) call here.
-    profit_partial = filter_by_upside(profit_confirmed, horizon, min_upside_pct=DEFAULT_MIN_UPSIDE_PCT, max_results=None)
+    profit_partial = filter_by_upside(
+        profit_ample_history, horizon, min_upside_pct=DEFAULT_MIN_UPSIDE_PCT, max_results=None
+    )
 
     print(
         f"Shard {shard_index}/{shard_count}: tickers={total} "
@@ -666,6 +734,7 @@ def run_scan_shard(
             "passed_fast_screen_count": profit_fully_analyzed_count,
             "failed_count": failed_count,
             "lightgbm_unconfirmed_count": lightgbm_unconfirmed_count,
+            "thin_history_dropped_count": thin_history_dropped_count,
         },
     }
 
@@ -684,6 +753,7 @@ def merge_shard_outputs(partial_dir: Path) -> dict[str, Any]:
         "passed_fast_screen_count": 0,
         "failed_count": 0,
         "lightgbm_unconfirmed_count": 0,
+        "thin_history_dropped_count": 0,
     }
 
     for path in partial_files:
@@ -714,7 +784,7 @@ def reduce_scan_shards(horizon: str, manifest: dict[str, Any], partial_dir: Path
 
     if merged["screener_frames"]:
         screener_results = pd.concat(merged["screener_frames"], ignore_index=True)
-        screener_results = screener_results.sort_values("Score", ascending=False).head(TOP_RESULTS_LIMIT).reset_index(drop=True)
+        screener_results = _apply_diversification_cap(screener_results.sort_values("Score", ascending=False).reset_index(drop=True))
     else:
         screener_results = pd.DataFrame()
     screener_results.attrs.update(merged["screener_attrs_totals"])
@@ -725,28 +795,47 @@ def reduce_scan_shards(horizon: str, manifest: dict[str, Any], partial_dir: Path
         profit_pool = pd.DataFrame()
 
     if not profit_pool.empty:
-        profit_by_upside_raw = profit_pool.sort_values("Projected Upside %", ascending=False).head(TOP_RESULTS_LIMIT).reset_index(drop=True)
-        profit_by_score_raw = profit_pool.sort_values("Score", ascending=False).head(TOP_RESULTS_LIMIT).reset_index(drop=True)
-        # A ticker can rank in the top 75 by both upside and score; predictions
+        profit_by_upside_sorted = profit_pool.sort_values("Projected Upside %", ascending=False).reset_index(drop=True)
+        profit_by_score_sorted = profit_pool.sort_values("Score", ascending=False).reset_index(drop=True)
+        profit_by_risk_adjusted_sorted = profit_pool.sort_values("Risk-Adjusted Upside", ascending=False).reset_index(
+            drop=True
+        )
+        profit_by_upside_raw = _apply_diversification_cap(profit_by_upside_sorted)
+        profit_by_score_raw = _apply_diversification_cap(profit_by_score_sorted)
+        profit_by_risk_adjusted_raw = _apply_diversification_cap(profit_by_risk_adjusted_sorted)
+        # A ticker can rank in the top 75 of more than one cut; predictions
         # must be recorded exactly once per ticker, so record from the
-        # deduplicated union of both cuts rather than once per cut.
-        union_raw = pd.concat([profit_by_upside_raw, profit_by_score_raw], ignore_index=True).drop_duplicates(
-            subset="Ticker", keep="first"
-        ).reset_index(drop=True)
+        # deduplicated union of all three cuts rather than once per cut.
+        union_raw = pd.concat(
+            [profit_by_upside_raw, profit_by_score_raw, profit_by_risk_adjusted_raw], ignore_index=True
+        ).drop_duplicates(subset="Ticker", keep="first").reset_index(drop=True)
     else:
-        profit_by_upside_raw = profit_by_score_raw = union_raw = profit_pool
+        profit_by_upside_raw = profit_by_score_raw = profit_by_risk_adjusted_raw = union_raw = profit_pool
 
     _, profit_stats = finalize_profit_results(union_raw, horizon, record=True, stats_base=merged["profit_stats_totals"])
     profit_by_upside, _ = finalize_profit_results(profit_by_upside_raw, horizon, record=False)
     profit_by_score, _ = finalize_profit_results(profit_by_score_raw, horizon, record=False)
+    profit_by_risk_adjusted, _ = finalize_profit_results(profit_by_risk_adjusted_raw, horizon, record=False)
 
     html_content = build_scan_report(
-        manifest, tickers, screener_results, profit_by_upside, profit_by_score, profit_stats, horizon, run_date
+        manifest,
+        tickers,
+        screener_results,
+        profit_by_upside,
+        profit_by_score,
+        profit_by_risk_adjusted,
+        profit_stats,
+        horizon,
+        run_date,
     )
     attachments = [
         csv_attachment(f"screener_top75_{run_date}.csv", screener_results.to_csv(index=False)),
         csv_attachment(f"profit_opportunities_by_upside_top75_{run_date}.csv", profit_by_upside.to_csv(index=False)),
         csv_attachment(f"profit_opportunities_by_score_top75_{run_date}.csv", profit_by_score.to_csv(index=False)),
+        csv_attachment(
+            f"profit_opportunities_by_risk_adjusted_upside_top75_{run_date}.csv",
+            profit_by_risk_adjusted.to_csv(index=False),
+        ),
     ]
     subject = f"BK Self {HORIZON_SETTINGS[horizon]['label']} scan report — {run_date}"
     sent_count = send_brevo_email(subject=subject, html_content=html_content, attachments=attachments)

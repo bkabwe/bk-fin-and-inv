@@ -47,12 +47,14 @@ def screener_row_from_analysis(
         return None
     entry, current = result["entry_price"], result["current_price"]
     pct = ((current - entry) / entry * 100) if entry and current else None
+    sector = (result.get("fundamentals") or {}).get("metrics", {}).get("sector")
     return {
         "Ticker": result["ticker"],
         "Company": result["company"],
         "Score": result["score"],
         "Recommendation": result["recommendation"],
         "Time Horizon": result["time_horizon"],
+        "Sector": str(sector) if sector else "Unknown",
         "Sector Trend": str(result.get("sector_trend") or "unknown").replace("_", " ").title(),
         "Market Cap Tier": result.get("market_cap_tier") or "unknown",
         "Long-Term Stage": result.get("longterm_stage") or "",

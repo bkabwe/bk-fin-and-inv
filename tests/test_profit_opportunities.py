@@ -100,5 +100,73 @@ class AnalyzeTickerForHorizonLightgbmBacktestedTests(unittest.TestCase):
         self.assertIsNone(outcome["row"]["_lightgbm_backtested"])
 
 
+class AnalyzeTickerForHorizonConfidenceTests(unittest.TestCase):
+    """analyze_ticker_for_horizon's row dict should expose the per-horizon
+    projection confidence, thin-history flag, sector, and a risk-adjusted
+    upside ranking metric -- see modules.scoring_engine's
+    _projection_confidence/_is_thin_history and the Phase 2 action-plan
+    items these support."""
+
+    def test_row_exposes_confidence_score_and_thin_history(self):
+        analysis = _make_analysis()
+        analysis["projections"]["short_term_confidence"] = 62
+        analysis["projections"]["short_term_thin_history"] = True
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "short_term", use_fast_screen=False)
+
+        row = outcome["row"]
+        self.assertEqual(row["Confidence Score"], 62)
+        self.assertIs(row["_thin_history"], True)
+
+    def test_row_defaults_confidence_score_to_zero_when_absent(self):
+        analysis = _make_analysis()
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "short_term", use_fast_screen=False)
+
+        self.assertEqual(outcome["row"]["Confidence Score"], 0)
+        self.assertIs(outcome["row"]["_thin_history"], False)
+
+    def test_row_exposes_sector_from_fundamentals_metrics(self):
+        analysis = _make_analysis(fundamentals={"metrics": {"sector": "Technology"}})
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "short_term", use_fast_screen=False)
+
+        self.assertEqual(outcome["row"]["Sector"], "Technology")
+
+    def test_row_sector_defaults_to_unknown_when_absent(self):
+        analysis = _make_analysis()
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "short_term", use_fast_screen=False)
+
+        self.assertEqual(outcome["row"]["Sector"], "Unknown")
+
+    def test_risk_adjusted_upside_is_upside_over_band_width(self):
+        # current=190, target_low=195, target_high=205 -> band width =
+        # (205-195)/190*100 = 5.263...%; upside=5.26 -> ratio ~= 1.0.
+        analysis = _make_analysis()
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "short_term", use_fast_screen=False)
+
+        row = outcome["row"]
+        band_width_pct = (row["Target High"] - row["Target Low"]) / row["Current Price"] * 100
+        self.assertAlmostEqual(row["Risk-Adjusted Upside"], row["Projected Upside %"] / band_width_pct, places=2)
+
+    def test_risk_adjusted_upside_floors_band_width_to_avoid_divide_by_near_zero(self):
+        analysis = _make_analysis()
+        # A near-zero band width (target_low == target_high == target) must
+        # not blow the ratio up toward infinity.
+        analysis["projections"]["short_term_low"] = 200.0
+        analysis["projections"]["short_term_high"] = 200.0
+        with patch.object(profit_opportunities, "analyze_stock", return_value=analysis):
+            outcome = profit_opportunities.analyze_ticker_for_horizon("AAPL", "short_term", use_fast_screen=False)
+
+        row = outcome["row"]
+        self.assertAlmostEqual(
+            row["Risk-Adjusted Upside"],
+            row["Projected Upside %"] / profit_opportunities.DEFAULT_MIN_BAND_WIDTH_PCT,
+            places=2,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
