@@ -268,7 +268,19 @@ rather than guesswork:
 - **No transaction costs or slippage in backtest RMSE**: backtests measure
   price-forecast RMSE, not net-of-cost tradeable returns. Treat backtest wins
   as directional-accuracy evidence only, not proof of after-cost
-  profitability.
+  profitability. A proper fix is a distinct, larger-scope evaluation
+  framework (simulating net-of-cost tradeable returns from a trading rule),
+  not a tweak to the existing RMSE comparison, so it remains a documented
+  gap rather than a quick change.
+- **LightGBM hyperparameters (`n_estimators=250, learning_rate=0.05,
+  num_leaves=31`) are fixed, not tuned**: a proper sweep is constrained by
+  the same small training windows noted above (as few as ~30 embargoed rows
+  at the 30d horizon after the purge window), so any grid search would risk
+  overfitting hyperparameters to a single backtest run — the exact anti-
+  pattern the Diebold-Mariano significance testing above was added to catch.
+  Revisiting these values is better done once enough accumulated
+  `modules/experiment_tracker.py` run history exists to compare candidate
+  configs across many runs rather than one.
 - **Long-horizon projections do not account for dividends**: price history
   from Polygon is split-adjusted but **not** dividend-adjusted (see "Data
   Sources" below), so projected upside for dividend-paying names is a pure
@@ -744,6 +756,40 @@ back up to 10 days to skip weekends/holidays. The filter fails open (keeps
 the unfiltered list) on any fetch error or empty response, and keeps (does
 not drop) tickers missing from the bars response (e.g. very recent IPOs),
 treating "no data" as not evidence of illiquidity.
+
+### LightGBM bagging/model-averaging (opt-in)
+
+`modules/lightgbm_model.train_return_models()` gained an opt-in
+`n_bagged_estimators` parameter (default `1`, i.e. unchanged single-model
+behavior). When set above 1, it trains that many row-bootstrapped,
+differently-seeded `LGBMRegressor`s per horizon (each fit on a
+`bagging_fraction` resample of the training rows) and wraps them in a new
+`BaggedLGBMRegressor` that averages their predictions — a variance-reduction
+technique suited to the existing small training windows (as few as ~50-60
+rows at the 30d horizon) without touching the feature set or objective. The
+wrapper mirrors the plain model's `.predict()`/`.feature_name_` interface,
+so it drops into the existing `predict_forward_return()`/`save_return_
+models()`/`load_return_models()` plumbing unchanged, and is also exposed via
+`scripts/train_lightgbm_return_models.py --n-bagged-estimators`. The
+scheduled batch-training pipeline (`scripts/lightgbm_batch_pipeline.py`)
+still calls `train_return_models()` with the implicit default (bagging
+off), since enabling it for live models is a methodology change that should
+follow a dedicated walk-forward comparison first, not ship as a default.
+
+### LightGBM quantile regression / prediction intervals (not yet live)
+
+`modules/lightgbm_model.train_return_quantile_models()` trains per-horizon,
+per-quantile LightGBM models (`objective="quantile"`) to produce forward-
+return prediction intervals (default an 80% interval via
+`DEFAULT_RETURN_QUANTILES = (0.1, 0.9)`), alongside new
+`predict_forward_return_quantiles()`/`save_return_quantile_models()`/
+`load_return_quantile_models()` helpers mirroring the point-estimate API.
+This is deliberately **not yet wired into** the live scoring ensemble's
+GARCH-based confidence bands: doing so would change several already-
+validated downstream fields (market-cap band padding, per-horizon
+projection confidence, risk-adjusted upside), so it ships here as a
+tested, standalone capability for offline evaluation first, pending a
+backtest comparing it against the current band-construction approach.
 
 ---
 

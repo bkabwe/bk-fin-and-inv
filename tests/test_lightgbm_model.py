@@ -253,6 +253,100 @@ class LightGBMModelTests(unittest.TestCase):
         pred = lightgbm_model.predict_forward_return(None, _sample_feature_table(length=1).iloc[0])
         self.assertIsNone(pred)
 
+    def test_train_return_models_default_bagging_matches_single_model_behavior(self):
+        examples = {30: (_sample_feature_table(length=120), pd.Series(np.linspace(0.01, 0.03, num=120)))}
+        models = lightgbm_model.train_return_models(examples, min_rows_per_horizon=50)
+        self.assertIsNotNone(models)
+        self.assertIsInstance((models or {})[30], lightgbm_model.LGBMRegressor)
+
+    def test_train_return_models_bagging_returns_bagged_wrapper_and_averages_predictions(self):
+        price_data = _sample_price_data(length=900)
+        feature_table = _sample_feature_table(length=900)
+        examples = lightgbm_model.build_return_training_examples(
+            "AAPL", price_data, feature_table=feature_table, horizons=(30,)
+        )
+        models = lightgbm_model.train_return_models(
+            examples, min_rows_per_horizon=50, n_bagged_estimators=3, bagging_fraction=0.8
+        )
+        self.assertIsNotNone(models)
+        bagged = (models or {})[30]
+        self.assertIsInstance(bagged, lightgbm_model.BaggedLGBMRegressor)
+        self.assertEqual(len(bagged.models), 3)
+
+        pred = lightgbm_model.predict_forward_return(bagged, feature_table.iloc[-1])
+        self.assertIsNotNone(pred)
+        self.assertTrue(np.isfinite(float(pred)))
+
+        # Averaging predictions manually should match BaggedLGBMRegressor.predict().
+        x = feature_table.iloc[[-1]].reindex(columns=bagged.feature_name_)
+        manual_mean = np.mean([m.predict(x)[0] for m in bagged.models])
+        self.assertAlmostEqual(float(pred), float(manual_mean), places=10)
+
+    def test_bagged_model_save_and_load_round_trip(self):
+        price_data = _sample_price_data(length=900)
+        feature_table = _sample_feature_table(length=900)
+        examples = lightgbm_model.build_return_training_examples(
+            "AAPL", price_data, feature_table=feature_table, horizons=(30,)
+        )
+        models = lightgbm_model.train_return_models(examples, min_rows_per_horizon=50, n_bagged_estimators=2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lightgbm_model.save_return_models(models or {}, tmpdir)
+            loaded = lightgbm_model.load_return_models(tmpdir, horizons=(30,))
+        self.assertIsInstance(loaded[30], lightgbm_model.BaggedLGBMRegressor)
+        pred = lightgbm_model.predict_forward_return(loaded[30], feature_table.iloc[-1])
+        self.assertIsNotNone(pred)
+
+    def test_bagged_regressor_requires_at_least_one_model(self):
+        with self.assertRaises(ValueError):
+            lightgbm_model.BaggedLGBMRegressor([])
+
+    def test_train_return_quantile_models_produces_ordered_interval(self):
+        price_data = _sample_price_data(length=900)
+        feature_table = _sample_feature_table(length=900)
+        examples = lightgbm_model.build_return_training_examples(
+            "AAPL", price_data, feature_table=feature_table, horizons=(30,)
+        )
+        quantile_models = lightgbm_model.train_return_quantile_models(examples, min_rows_per_horizon=50)
+        self.assertIsNotNone(quantile_models)
+        self.assertIn(30, quantile_models or {})
+        horizon_models = (quantile_models or {})[30]
+        self.assertEqual(set(horizon_models.keys()), set(lightgbm_model.DEFAULT_RETURN_QUANTILES))
+
+        predictions = lightgbm_model.predict_forward_return_quantiles(horizon_models, feature_table.iloc[-1])
+        self.assertEqual(set(predictions.keys()), set(lightgbm_model.DEFAULT_RETURN_QUANTILES))
+        low_quantile, high_quantile = sorted(lightgbm_model.DEFAULT_RETURN_QUANTILES)
+        self.assertLessEqual(predictions[low_quantile], predictions[high_quantile])
+
+    def test_quantile_models_save_and_load_round_trip(self):
+        price_data = _sample_price_data(length=900)
+        feature_table = _sample_feature_table(length=900)
+        examples = lightgbm_model.build_return_training_examples(
+            "AAPL", price_data, feature_table=feature_table, horizons=(30,)
+        )
+        quantile_models = lightgbm_model.train_return_quantile_models(examples, min_rows_per_horizon=50)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved = lightgbm_model.save_return_quantile_models(quantile_models or {}, tmpdir)
+            self.assertEqual(len(saved), 2)
+            loaded = lightgbm_model.load_return_quantile_models(tmpdir, horizons=(30,))
+        self.assertIn(30, loaded)
+        self.assertEqual(set(loaded[30].keys()), set(lightgbm_model.DEFAULT_RETURN_QUANTILES))
+
+    def test_train_return_quantile_models_graceful_when_lightgbm_missing(self):
+        example = {30: (_sample_feature_table(length=120), pd.Series(np.linspace(0.01, 0.03, num=120)))}
+        with patch("modules.lightgbm_model.LIGHTGBM_AVAILABLE", False):
+            result = lightgbm_model.train_return_quantile_models(example, min_rows_per_horizon=10)
+        self.assertIsNone(result)
+
+    def test_train_return_quantile_models_skips_thin_horizon(self):
+        x_small = _sample_feature_table(length=20)
+        y_small = pd.Series(np.linspace(0.01, 0.02, num=20))
+        result = lightgbm_model.train_return_quantile_models({30: (x_small, y_small)}, min_rows_per_horizon=50)
+        self.assertIsNone(result)
+
+    def test_predict_forward_return_quantiles_handles_empty_models(self):
+        self.assertEqual(lightgbm_model.predict_forward_return_quantiles(None, _sample_feature_table(length=1).iloc[0]), {})
+        self.assertEqual(lightgbm_model.predict_forward_return_quantiles({}, _sample_feature_table(length=1).iloc[0]), {})
+
 
 if __name__ == "__main__":
     unittest.main()
