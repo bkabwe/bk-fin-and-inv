@@ -537,6 +537,83 @@ def compute_score_validation_stats(min_samples: int = 5) -> dict:
     }
 
 
+def _upside_calibration_stats(subset: list[dict], min_samples: int) -> dict:
+    """Information coefficient + bias stats for one subset, testing whether
+    the projected_upside_pct forecast itself is systematically over/under-
+    optimistic relative to realized returns -- not just whether the
+    composite Score ranks outcomes correctly (see _score_ic_stats above)."""
+    n = len(subset)
+    if n < min_samples:
+        return {
+            "count": n,
+            "information_coefficient": None,
+            "mean_bias_pct": None,
+            "median_bias_pct": None,
+            "overoptimism_rate": None,
+        }
+
+    projected = [float(r["projected_upside_pct"]) for r in subset]
+    returns = [float(r["actual_return_pct"]) for r in subset]
+    ic = _pearson_correlation(projected, returns)
+
+    # bias = actual - projected; negative => the realized return fell short
+    # of the projected upside (over-optimistic forecast), positive => the
+    # forecast was conservative relative to what actually happened.
+    biases = sorted(actual - proj for proj, actual in zip(projected, returns, strict=True))
+    mean_bias = sum(biases) / n
+    mid = n // 2
+    median_bias = biases[mid] if n % 2 == 1 else (biases[mid - 1] + biases[mid]) / 2
+    overoptimism_rate = round(sum(1 for b in biases if b < 0) / n * 100, 1)
+
+    return {
+        "count": n,
+        "information_coefficient": round(ic, 4) if ic is not None else None,
+        "mean_bias_pct": round(mean_bias, 2),
+        "median_bias_pct": round(median_bias, 2),
+        "overoptimism_rate": overoptimism_rate,
+    }
+
+
+def compute_upside_validation_stats(min_samples: int = 5) -> dict:
+    """Correlate recorded projected_upside_pct forecasts against realized
+    forward returns, once predictions are resolved.
+
+    Complements compute_score_validation_stats, which only tests the
+    composite 0-100 Score's rank-ordering power against outcomes -- this
+    tests the upside forecast number itself (the raw "+N% upside" figures
+    surfaced in the profit-opportunities report, e.g. an aggressive
+    long-horizon projection) for systematic bias, not just directional
+    correlation. Reports:
+      - information_coefficient: Pearson correlation between projected
+        upside and realized return (positive => bigger projected upside
+        tends to precede bigger realized returns).
+      - mean_bias_pct / median_bias_pct: average/median (actual - projected)
+        gap; a large negative value flags systematic over-optimism.
+      - overoptimism_rate: % of resolved predictions where the realized
+        return fell short of the projected upside.
+
+    Returns {"overall": {...}, "by_horizon": {horizon: {...}}}. Any bucket
+    with fewer than `min_samples` resolved predictions returns None values
+    rather than a misleadingly precise statistic from a tiny sample.
+    """
+    records = _load_all()
+    resolved = [
+        r
+        for r in records
+        if r.get("status") == "resolved"
+        and r.get("projected_upside_pct") is not None
+        and r.get("actual_return_pct") is not None
+    ]
+
+    by_horizon = {
+        h: _upside_calibration_stats([r for r in resolved if r.get("horizon") == h], min_samples) for h in HORIZON_DAYS
+    }
+    return {
+        "overall": _upside_calibration_stats(resolved, min_samples),
+        "by_horizon": by_horizon,
+    }
+
+
 def compute_subscore_correlation_stats(min_samples: int = 10) -> dict:
     """Pairwise Pearson correlation among the 5 technical sub-scores recorded
     at scan time (see SUBSCORE_ROW_FIELDS): trend, momentum, relative_strength,

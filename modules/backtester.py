@@ -39,6 +39,30 @@ def _rmse(actual: np.ndarray, pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((actual[:n] - pred[:n]) ** 2)))
 
 
+def _path_rmse(actual: np.ndarray, pred: np.ndarray) -> float:
+    """RMSE between actual and predicted day-over-day log returns across a
+    full test window -- a complementary "path-level" accuracy metric to the
+    existing price-level RMSE above (see _rmse), which the README's "Known
+    modeling limitations" section documents as structurally favoring a smooth
+    geometric interpolation toward one terminal-return guess (how this
+    module's LightGBM evaluation path is built) over genuinely modeled
+    day-by-day dynamics: a flat/smooth path's level residual against noisy
+    real prices is often no worse than a "real" but imperfect day-by-day
+    forecast's residual, even though the smooth path captures none of the
+    actual path shape. Measuring log-return RMSE instead directly penalizes
+    an artificially smooth path for reproducing none of the day-to-day
+    variance, giving a fuller comparison of whether a model's path -- not
+    just its endpoint -- resembles reality. Returns inf when fewer than 2
+    points are available (no return can be computed).
+    """
+    if len(actual) < 2 or len(pred) < 2:
+        return float("inf")
+    n = min(len(actual), len(pred))
+    actual_returns = np.diff(np.log(np.maximum(actual[:n], 1e-9)))
+    pred_returns = np.diff(np.log(np.maximum(pred[:n], 1e-9)))
+    return float(np.sqrt(np.mean((actual_returns - pred_returns) ** 2)))
+
+
 # Keep synchronized with rolling/min_period windows in modules.feature_engineering._technical_features.
 _LIGHTGBM_FEATURE_WARMUP_DAYS = max((10, 30, 12, 26, 14, 20))
 DEFAULT_WALK_FORWARD_HORIZON = 30
@@ -137,6 +161,7 @@ def run_walk_forward(
     evaluate_naive_baseline: bool = False,
     lightgbm_diagnostics: bool = False,
     evaluate_arima: bool = True,
+    evaluate_path_rmse: bool = False,
 ) -> dict:
     """Walk-forward RMSE comparison across ARIMA/trend/LightGBM (and optionally
     a naive baseline) for a single ticker/horizon.
@@ -147,6 +172,12 @@ def run_walk_forward(
     price-projection ensemble and passes ``evaluate_arima=False`` to skip the
     expensive per-ticker ARIMA order search entirely.
 
+    ``evaluate_path_rmse`` (opt-in) additionally computes each model's
+    day-over-day log-return RMSE (see ``_path_rmse``) alongside the existing
+    price-level RMSE, directly addressing the "RMSE-metric geometry favors
+    terminal-point accuracy" limitation below with a real supplementary
+    metric rather than leaving it purely documented.
+
     KNOWN LIMITATIONS (documented, not yet addressed):
 
     - **RMSE-metric geometry favors terminal-point accuracy.** Every model's
@@ -155,8 +186,9 @@ def run_walk_forward(
       before computing RMSE. This structurally advantages models optimized
       directly for terminal return (like LightGBM) over general-purpose
       extrapolators (ARIMA/trend), even though it doesn't fully explain any
-      one model's win rate on its own. A supplementary path-level metric
-      (not just terminal-return RMSE) would give a fuller comparison.
+      one model's win rate on its own. Pass ``evaluate_path_rmse=True`` for a
+      supplementary path-level metric (not just terminal-return RMSE) that
+      gives a fuller comparison.
     - **No transaction costs or slippage.** These RMSE comparisons measure
       price-forecast accuracy only, not net-of-cost tradeable returns. A
       model "beating" another on RMSE here is directional-accuracy evidence,
@@ -172,6 +204,10 @@ def run_walk_forward(
         "trend_windows": 0,
         "lightgbm_windows": 0,
     }
+    if evaluate_path_rmse:
+        default["arima_path_rmse"] = None
+        default["trend_path_rmse"] = None
+        default["lightgbm_path_rmse"] = None
     if evaluate_naive_baseline:
         default["naive_rmse"] = 1.0
         default["naive_windows"] = 0
@@ -194,6 +230,9 @@ def run_walk_forward(
         trend_errors: list[float] = []
         lightgbm_errors: list[float] = []
         naive_errors: list[float] = []
+        arima_path_errors: list[float] = []
+        trend_path_errors: list[float] = []
+        lightgbm_path_errors: list[float] = []
         lightgbm_diagnostic_rows: list[dict[str, float | int]] = []
         lightgbm_horizon = int(config.horizon)
 
@@ -233,7 +272,10 @@ def run_walk_forward(
                 try:
                     order = shared_arima_order if shared_arima_order is not None else _select_arima_order(train)
                     pred = fit_arima_with_hardening(train, order=order, logger=logger).forecast(steps=int(config.test_len))
-                    arima_errors.append(_rmse(test_vals, np.array(pred.values, dtype=float)))
+                    pred_arr = np.array(pred.values, dtype=float)
+                    arima_errors.append(_rmse(test_vals, pred_arr))
+                    if evaluate_path_rmse:
+                        arima_path_errors.append(_path_rmse(test_vals, pred_arr))
                 except Exception as exc:
                     logger.warning(
                         "ARIMA backtest window failed for %s at start=%d: %s: %s",
@@ -251,6 +293,8 @@ def run_walk_forward(
                     x_future = np.arange(len(y), len(y) + int(config.test_len)).reshape(-1, 1)
                     pred = np.exp(model.predict(x_future))
                     trend_errors.append(_rmse(test_vals, pred))
+                    if evaluate_path_rmse:
+                        trend_path_errors.append(_path_rmse(test_vals, pred))
                 except Exception:
                     pass
 
@@ -381,6 +425,8 @@ def run_walk_forward(
                     growth = np.exp(np.log(final_price / start_price) / int(config.test_len))
                     pred_path = start_price * np.power(growth, np.arange(1, int(config.test_len) + 1))
                     lightgbm_errors.append(_rmse(test_vals, pred_path.astype(float)))
+                    if evaluate_path_rmse:
+                        lightgbm_path_errors.append(_path_rmse(test_vals, pred_path.astype(float)))
                 except Exception as exc:
                     logger.warning(
                         "LightGBM backtest window failed for %s at start=%d horizon=%sd: %s: %s",
@@ -407,6 +453,12 @@ def run_walk_forward(
         if evaluate_naive_baseline:
             result["naive_rmse"] = round(float(np.mean(naive_errors)) if naive_errors else 1.0, 6)
             result["naive_windows"] = int(len(naive_errors))
+        if evaluate_path_rmse:
+            result["arima_path_rmse"] = round(float(np.mean(arima_path_errors)), 6) if arima_path_errors else None
+            result["trend_path_rmse"] = round(float(np.mean(trend_path_errors)), 6) if trend_path_errors else None
+            result["lightgbm_path_rmse"] = (
+                round(float(np.mean(lightgbm_path_errors)), 6) if lightgbm_path_errors else None
+            )
         if lightgbm_diagnostics:
             prediction_stats = None
             if lightgbm_diagnostic_rows:

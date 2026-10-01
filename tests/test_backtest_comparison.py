@@ -8,6 +8,7 @@ import pandas as pd
 
 from modules import backtester
 from modules.backtest_comparison import (
+    diebold_mariano_test,
     format_per_ticker_diagnostics_table,
     run_lightgbm_backtest_comparison,
     select_sample_tickers,
@@ -525,6 +526,50 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertEqual(result["n_windows"], 6)
         self.assertEqual(result["arima_windows"], 6)
 
+    def test_walk_forward_path_rmse_disabled_by_default(self):
+        data = _realistic_price_frame(length=252)
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            result = backtester.run_walk_forward("AAPL-NOPATH", data, evaluate_lightgbm=False)
+
+        self.assertNotIn("trend_path_rmse", result)
+        self.assertNotIn("arima_path_rmse", result)
+        self.assertNotIn("lightgbm_path_rmse", result)
+
+    @unittest.skipUnless(backtester.SKLEARN_AVAILABLE, "scikit-learn not installed")
+    def test_walk_forward_path_rmse_reports_log_return_rmse_for_trend(self):
+        data = _realistic_price_frame(length=252)
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            result = backtester.run_walk_forward(
+                "AAPL-PATHRMSE",
+                data,
+                evaluate_lightgbm=False,
+                evaluate_path_rmse=True,
+            )
+
+        self.assertIsNotNone(result["trend_path_rmse"])
+        self.assertGreaterEqual(result["trend_path_rmse"], 0.0)
+        self.assertIsNone(result["arima_path_rmse"])
+        self.assertIsNone(result["lightgbm_path_rmse"])
+        # A path-level (log-return) RMSE must differ from the existing
+        # price-level RMSE, since it measures a fundamentally different
+        # quantity (day-over-day return shape, not price-level distance).
+        self.assertNotEqual(result["trend_path_rmse"], result["trend_rmse"])
+
+    def test_path_rmse_zero_for_identical_paths(self):
+        actual = np.array([100.0, 101.0, 99.0, 102.5, 103.0])
+        self.assertEqual(backtester._path_rmse(actual, actual.copy()), 0.0)
+
+    def test_path_rmse_inf_for_single_point_arrays(self):
+        self.assertEqual(backtester._path_rmse(np.array([100.0]), np.array([100.0])), float("inf"))
+
 
 class BacktestComparisonSummaryTests(unittest.TestCase):
     def test_summarize_backtest_results(self):
@@ -693,6 +738,117 @@ class BacktestComparisonSummaryTests(unittest.TestCase):
         self.assertEqual(summary["lightgbm_wins_vs_naive"]["wins"], 1)
         self.assertEqual(summary["lightgbm_wins_vs_naive"]["comparable_tickers"], 2)
         self.assertEqual(summary["lightgbm_wins_vs_naive"]["win_pct"], 50.0)
+
+    def test_summarize_backtest_results_includes_path_rmse_when_present(self):
+        rows = [
+            {
+                "ticker": "AAA",
+                "arima_rmse": 2.0,
+                "trend_rmse": 2.5,
+                "lightgbm_rmse": 1.5,
+                "arima_windows": 3,
+                "trend_windows": 3,
+                "lightgbm_windows": 3,
+                "arima_path_rmse": 0.02,
+                "trend_path_rmse": 0.03,
+                "lightgbm_path_rmse": 0.05,
+            },
+            {
+                "ticker": "BBB",
+                "arima_rmse": 1.0,
+                "trend_rmse": 0.8,
+                "lightgbm_rmse": 1.2,
+                "arima_windows": 2,
+                "trend_windows": 2,
+                "lightgbm_windows": 2,
+                "arima_path_rmse": 0.01,
+                "trend_path_rmse": 0.02,
+                "lightgbm_path_rmse": 0.04,
+            },
+        ]
+        summary = summarize_backtest_results(rows)
+        self.assertIn("mean_path_rmse", summary["models"]["lightgbm"])
+        self.assertIsNotNone(summary["models"]["lightgbm"]["mean_path_rmse"])
+        self.assertGreater(summary["models"]["lightgbm"]["mean_path_rmse"], summary["models"]["arima"]["mean_path_rmse"])
+
+    def test_summarize_backtest_results_omits_path_rmse_when_absent(self):
+        rows = [
+            {
+                "ticker": "AAA",
+                "arima_rmse": 2.0,
+                "trend_rmse": 2.5,
+                "lightgbm_rmse": 1.5,
+                "arima_windows": 3,
+                "trend_windows": 3,
+                "lightgbm_windows": 3,
+            }
+        ]
+        summary = summarize_backtest_results(rows)
+        self.assertNotIn("mean_path_rmse", summary["models"]["lightgbm"])
+
+    def test_summarize_backtest_results_includes_significance_tests(self):
+        rows = [
+            {
+                "ticker": "AAA",
+                "arima_rmse": 2.0,
+                "trend_rmse": 2.5,
+                "lightgbm_rmse": 1.5,
+                "arima_windows": 3,
+                "trend_windows": 3,
+                "lightgbm_windows": 3,
+            },
+            {
+                "ticker": "BBB",
+                "arima_rmse": 1.0,
+                "trend_rmse": 0.8,
+                "lightgbm_rmse": 1.2,
+                "arima_windows": 2,
+                "trend_windows": 2,
+                "lightgbm_windows": 2,
+            },
+        ]
+        summary = summarize_backtest_results(rows)
+        tests_by_pair = {(test["model_a"], test["model_b"]) for test in summary["significance_tests"]}
+        self.assertIn(("lightgbm", "arima"), tests_by_pair)
+        self.assertIn(("lightgbm", "trend"), tests_by_pair)
+
+
+class DieboldMarianoTests(unittest.TestCase):
+    def test_returns_none_fields_with_fewer_than_two_comparable_tickers(self):
+        rows = [
+            {"ticker": "AAA", "lightgbm_rmse": 1.0, "lightgbm_windows": 3, "arima_rmse": 2.0, "arima_windows": 3},
+        ]
+        result = diebold_mariano_test(rows, "lightgbm", "arima")
+        self.assertEqual(result["n_tickers"], 1)
+        self.assertIsNone(result["mean_diff"])
+        self.assertIsNone(result["p_value"])
+        self.assertIsNone(result["significant_at_5pct"])
+
+    def test_skips_tickers_missing_either_model(self):
+        rows = [
+            {"ticker": "AAA", "lightgbm_rmse": 1.0, "lightgbm_windows": 3, "arima_rmse": 2.0, "arima_windows": 3},
+            {"ticker": "BBB", "lightgbm_rmse": 1.1, "lightgbm_windows": 2, "arima_windows": 0},
+        ]
+        result = diebold_mariano_test(rows, "lightgbm", "arima")
+        self.assertEqual(result["n_tickers"], 1)
+
+    def test_consistently_lower_lightgbm_rmse_yields_negative_mean_diff(self):
+        rows = [
+            {"ticker": f"T{i}", "lightgbm_rmse": 1.0, "lightgbm_windows": 3, "arima_rmse": 2.0, "arima_windows": 3}
+            for i in range(10)
+        ]
+        result = diebold_mariano_test(rows, "lightgbm", "arima")
+        self.assertEqual(result["n_tickers"], 10)
+        self.assertLess(result["mean_diff"], 0.0)
+
+    def test_identical_rmse_everywhere_yields_zero_diff_and_not_significant(self):
+        rows = [
+            {"ticker": f"T{i}", "lightgbm_rmse": 1.5, "lightgbm_windows": 3, "arima_rmse": 1.5, "arima_windows": 3}
+            for i in range(5)
+        ]
+        result = diebold_mariano_test(rows, "lightgbm", "arima")
+        self.assertEqual(result["mean_diff"], 0.0)
+        self.assertFalse(result["significant_at_5pct"])
 
 
 if __name__ == "__main__":
