@@ -15,6 +15,7 @@ from modules.prediction_tracker import (
     HORIZON_DAYS,
     compute_max_price_since_scan,
     compute_score_validation_stats,
+    compute_upside_validation_stats,
     get_all_predictions,
     resolve_pending_predictions,
 )
@@ -124,6 +125,7 @@ def build_grading_report(
     rows: list[dict[str, Any]],
     summary: dict[str, Any],
     score_validation: dict[str, Any] | None = None,
+    upside_validation: dict[str, Any] | None = None,
 ) -> str:
     preview_rows = []
     for row in rows:
@@ -216,6 +218,33 @@ def build_grading_report(
             )
         )
 
+    upside_stats = (upside_validation or {}).get("overall") or {}
+    if upside_stats.get("count"):
+        upside_ic = upside_stats.get("information_coefficient")
+        sections.append(
+            "<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Upside forecast validation (all-time, this horizon)</h2>"
+            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Is the projected upside % itself systematically over-optimistic, "
+            f"not just directionally correlated with outcomes? Computed across all {int(upside_stats['count'])} resolved "
+            f"{HORIZON_LABELS[horizon]} predictions to date, not just this batch.</p>"
+            + render_metric_tiles(
+                [
+                    {"label": "Information coefficient", "value": "—" if upside_ic is None else f"{upside_ic:.3f}"},
+                    {
+                        "label": "Mean bias (actual − projected)",
+                        "value": "—" if upside_stats.get("mean_bias_pct") is None else f"{upside_stats['mean_bias_pct']:.2f}%",
+                    },
+                    {
+                        "label": "Median bias (actual − projected)",
+                        "value": "—" if upside_stats.get("median_bias_pct") is None else f"{upside_stats['median_bias_pct']:.2f}%",
+                    },
+                    {
+                        "label": "Over-optimism rate",
+                        "value": "—" if upside_stats.get("overoptimism_rate") is None else f"{upside_stats['overoptimism_rate']:.1f}%",
+                    },
+                ]
+            )
+        )
+
     return render_report_html(
         title=f"{HORIZON_LABELS[horizon]} grading report",
         subtitle=f"Scan date {scan_date.isoformat()} · grading date {grading_date.isoformat()} · tracked batch size {len(rows)}",
@@ -242,7 +271,8 @@ def generate_grading_report(horizon: str) -> int:
     rows = build_grading_rows(batch_records[:75], grading_date)
     summary = compute_batch_summary(rows)
     score_validation = compute_score_validation_stats()
-    html_content = build_grading_report(horizon, scan_date, grading_date, rows, summary, score_validation)
+    upside_validation = compute_upside_validation_stats()
+    html_content = build_grading_report(horizon, scan_date, grading_date, rows, summary, score_validation, upside_validation)
     subject = f"BK Self {HORIZON_LABELS[horizon]} grading report — {scan_date.isoformat()}"
     sent_count = send_brevo_email(subject=subject, html_content=html_content)
     print(f"Sent grading report to {sent_count} recipient(s)")

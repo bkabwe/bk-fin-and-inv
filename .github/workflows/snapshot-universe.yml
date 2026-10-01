@@ -1,0 +1,55 @@
+name: Snapshot Universe
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily and intentionally staggered away from the existing weekly scan/train/grading crons.
+    - cron: '15 15 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snapshot-universe
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.12'  # numpy==2.5.3 (requirements-workflows.txt) requires Python 3.12+
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_BK_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements-workflows.txt
+      - name: Capture current S&P 500 membership snapshot
+        run: |
+          # Keep the scheduled run fast for now; `--with-sentiment` can be added
+          # later once the team wants to accumulate the heavier FinBERT history too.
+          python scripts/snapshot_universe.py
+      - name: Persist snapshot history
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain -- data/snapshots)" ]; then
+            echo "No changes to data/snapshots"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/snapshots
+          git commit -m "chore: update universe snapshots [skip ci]"
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected, rebasing onto latest and retrying ($attempt/3)"
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase "origin/${GITHUB_REF_NAME}"
+          done
+          git push

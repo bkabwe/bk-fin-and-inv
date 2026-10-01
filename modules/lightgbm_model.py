@@ -19,6 +19,11 @@ MAX_FORWARD_RETURN_LABEL_30D = 5.0
 MAX_FORWARD_RETURN_LABEL_180D = 10.0
 MAX_FORWARD_RETURN_LABEL_LONG = 20.0
 
+# Default lower/upper quantile levels for the optional prediction-interval
+# models below (an 80% forward-return interval). Not yet consumed by the
+# live scoring ensemble's confidence bands -- see train_return_quantile_models.
+DEFAULT_RETURN_QUANTILES = (0.1, 0.9)
+
 try:  # pragma: no cover
     from lightgbm import LGBMRegressor
 
@@ -139,9 +144,22 @@ def build_return_training_examples(
     feature_table: pd.DataFrame | None = None,
     lookback_days: int = 1260,
     horizons: tuple[int, ...] = RETURN_HORIZONS,
+    *,
+    sector: str | None = None,
+    shared_sector_return_table: pd.DataFrame | None = None,
 ) -> dict[int, tuple[pd.DataFrame, pd.Series]]:
     """Build per-horizon (X, y) datasets where y is forward return."""
-    raw_features = feature_table if feature_table is not None else build_feature_table(ticker, price_data, lookback_days=lookback_days)
+    raw_features = (
+        feature_table
+        if feature_table is not None
+        else build_feature_table(
+            ticker,
+            price_data,
+            lookback_days=lookback_days,
+            sector=sector,
+            shared_sector_return_table=shared_sector_return_table,
+        )
+    )
     features = prepare_lightgbm_feature_frame(raw_features)
     if features.empty:
         logger.warning("LightGBM training examples skipped for %s: empty feature table", str(ticker).upper())
@@ -208,6 +226,8 @@ def build_return_training_examples_for_ticker(
     horizons: tuple[int, ...] = RETURN_HORIZONS,
     *,
     shared_macro_table: pd.DataFrame | None = None,
+    sector: str | None = None,
+    shared_sector_return_table: pd.DataFrame | None = None,
 ) -> dict[int, tuple[pd.DataFrame, pd.Series]]:
     """Build examples by reusing the existing Polygon-backed get_stock_data flow."""
     price_data = get_stock_data(ticker, period=period, interval=interval)
@@ -219,6 +239,8 @@ def build_return_training_examples_for_ticker(
         price_data,
         lookback_days=lookback_days,
         shared_macro_table=shared_macro_table,
+        sector=sector,
+        shared_sector_return_table=shared_sector_return_table,
     )
     return build_return_training_examples(
         ticker=ticker,
@@ -229,14 +251,85 @@ def build_return_training_examples_for_ticker(
     )
 
 
+class BaggedLGBMRegressor:
+    """Averages predictions across several seeded/row-subsampled LGBMRegressors.
+
+    Exists to reduce single-seed variance within the existing small
+    walk-forward training windows (as few as ~50-60 rows at the 30d horizon)
+    without changing the feature set, objective, or hyperparameters. Mirrors
+    the plain `LGBMRegressor` interface used elsewhere in this module
+    (`.predict()`, `.feature_name_`) so it is a drop-in replacement for
+    `predict_forward_return()` and `joblib`-based save/load. Off by default:
+    `train_return_models(..., n_bagged_estimators=1)` (the default) returns a
+    single bare `LGBMRegressor` per horizon, identical to prior behavior.
+    """
+
+    def __init__(self, models: list[LGBMRegressor]):
+        if not models:
+            raise ValueError("BaggedLGBMRegressor requires at least one fitted model.")
+        self.models = list(models)
+        self.feature_name_ = list(getattr(self.models[0], "feature_name_", []) or [])
+
+    def predict(self, x: pd.DataFrame) -> np.ndarray:
+        predictions = np.column_stack([model.predict(x) for model in self.models])
+        return predictions.mean(axis=1)
+
+
+def _fit_bagged_model(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    *,
+    n_bagged_estimators: int,
+    bagging_fraction: float,
+    random_state: int,
+) -> LGBMRegressor | BaggedLGBMRegressor:
+    if n_bagged_estimators <= 1:
+        model = LGBMRegressor(
+            n_estimators=250,
+            learning_rate=0.05,
+            num_leaves=31,
+            random_state=random_state,
+        )
+        model.fit(x_train, y_train)
+        return model
+
+    fraction = min(1.0, max(0.1, float(bagging_fraction)))
+    sample_size = max(1, int(round(len(y_train) * fraction)))
+    rng = np.random.default_rng(random_state)
+    bagged_models: list[LGBMRegressor] = []
+    for seed_offset in range(int(n_bagged_estimators)):
+        row_positions = rng.choice(len(y_train), size=sample_size, replace=True)
+        x_sample = x_train.iloc[row_positions]
+        y_sample = y_train.iloc[row_positions]
+        model = LGBMRegressor(
+            n_estimators=250,
+            learning_rate=0.05,
+            num_leaves=31,
+            random_state=random_state + seed_offset,
+        )
+        model.fit(x_sample, y_sample)
+        bagged_models.append(model)
+    return BaggedLGBMRegressor(bagged_models)
+
+
 def train_return_models(
     training_examples: dict[int, tuple[pd.DataFrame, pd.Series]],
     min_rows_per_horizon: int = MIN_TRAINING_ROWS_PER_HORIZON,
     random_state: int = 42,
+    n_bagged_estimators: int = 1,
+    bagging_fraction: float = 0.8,
 ) -> dict[int, LGBMRegressor] | None:
     """
     Train one LightGBMRegressor per horizon.
     NaN feature values are passed through intentionally (native LightGBM handling).
+
+    n_bagged_estimators controls optional bagging/model averaging (default 1 =
+    disabled, preserving prior single-model behavior): when > 1, trains that
+    many row-bootstrapped, differently-seeded LGBMRegressors per horizon
+    (each fit on `bagging_fraction` of the training rows, sampled with
+    replacement) and returns a BaggedLGBMRegressor that averages their
+    predictions, trading a modest train-time cost for reduced prediction
+    variance on the same small windows.
     """
     if not LIGHTGBM_AVAILABLE:
         logger.warning("LightGBM package not installed; skipping model training.")
@@ -255,20 +348,20 @@ def train_return_models(
                 int(min_rows_per_horizon),
             )
             continue
-        model = LGBMRegressor(
-            n_estimators=250,
-            learning_rate=0.05,
-            num_leaves=31,
-            random_state=random_state,
-        )
         logger.info(
-            "Training LightGBM horizon %sd with %d rows and %d features",
+            "Training LightGBM horizon %sd with %d rows, %d features, n_bagged_estimators=%d",
             horizon,
             len(y_train),
             x_train.shape[1],
+            int(n_bagged_estimators),
         )
-        model.fit(x_train, y_train)
-        models[int(horizon)] = model
+        models[int(horizon)] = _fit_bagged_model(
+            x_train,
+            y_train,
+            n_bagged_estimators=int(n_bagged_estimators),
+            bagging_fraction=float(bagging_fraction),
+            random_state=random_state,
+        )
 
     if not models:
         logger.warning("LightGBM model training skipped: no horizon met minimum row threshold.")
@@ -330,4 +423,122 @@ def load_return_models(directory: str | Path, horizons: tuple[int, ...] = RETURN
         logger.warning("No LightGBM return models found under %s", str(base))
     else:
         logger.info("Loaded LightGBM return model(s): %s", sorted(models.keys()))
+    return models
+
+
+def train_return_quantile_models(
+    training_examples: dict[int, tuple[pd.DataFrame, pd.Series]],
+    min_rows_per_horizon: int = MIN_TRAINING_ROWS_PER_HORIZON,
+    random_state: int = 42,
+    quantiles: tuple[float, ...] = DEFAULT_RETURN_QUANTILES,
+) -> dict[int, dict[float, LGBMRegressor]] | None:
+    """Train per-horizon, per-quantile LightGBM forward-return models
+    (objective="quantile") to produce prediction intervals, complementing the
+    point-estimate models from train_return_models.
+
+    This is an additive, offline-evaluation capability: it reuses the same
+    training examples/feature set as the point-estimate models and is not yet
+    wired into the live scoring ensemble's GARCH-based confidence bands (see
+    README's "Known modeling limitations" discussion of confidence bands) --
+    integrating it there would change several already-validated downstream
+    fields (market-cap band padding, projection confidence, risk-adjusted
+    upside) and should follow a dedicated backtest comparison first.
+    """
+    if not LIGHTGBM_AVAILABLE:
+        logger.warning("LightGBM package not installed; skipping quantile model training.")
+        return None
+    if not training_examples:
+        logger.warning("No LightGBM training examples provided.")
+        return None
+    if not quantiles:
+        logger.warning("No quantile levels provided; skipping quantile model training.")
+        return None
+
+    models: dict[int, dict[float, LGBMRegressor]] = {}
+    for horizon, (x_train, y_train) in sorted(training_examples.items()):
+        if len(y_train) < int(min_rows_per_horizon):
+            logger.warning(
+                "Skipping LightGBM quantile models for horizon %sd: insufficient rows (%d < %d)",
+                horizon,
+                len(y_train),
+                int(min_rows_per_horizon),
+            )
+            continue
+        horizon_models: dict[float, LGBMRegressor] = {}
+        for quantile in quantiles:
+            model = LGBMRegressor(
+                objective="quantile",
+                alpha=float(quantile),
+                n_estimators=250,
+                learning_rate=0.05,
+                num_leaves=31,
+                random_state=random_state,
+            )
+            model.fit(x_train, y_train)
+            horizon_models[float(quantile)] = model
+        logger.info(
+            "Trained LightGBM quantile models for horizon %sd: quantiles=%s rows=%d",
+            horizon,
+            sorted(horizon_models.keys()),
+            len(y_train),
+        )
+        models[int(horizon)] = horizon_models
+
+    if not models:
+        logger.warning("LightGBM quantile model training skipped: no horizon met minimum row threshold.")
+        return None
+    return models
+
+
+def predict_forward_return_quantiles(
+    quantile_models: dict[float, LGBMRegressor] | None,
+    feature_row: pd.Series | pd.DataFrame,
+) -> dict[float, float]:
+    """Predict forward return at each trained quantile level for one feature row."""
+    if not quantile_models:
+        logger.warning("LightGBM quantile inference skipped: no quantile models provided")
+        return {}
+    predictions: dict[float, float] = {}
+    for quantile, model in sorted(quantile_models.items()):
+        prediction = predict_forward_return(model, feature_row)
+        if prediction is not None:
+            predictions[float(quantile)] = prediction
+    return predictions
+
+
+def save_return_quantile_models(
+    quantile_models: dict[int, dict[float, LGBMRegressor]], directory: str | Path
+) -> list[Path]:
+    base = Path(directory)
+    base.mkdir(parents=True, exist_ok=True)
+    saved_paths: list[Path] = []
+    for horizon, horizon_models in sorted(quantile_models.items()):
+        for quantile, model in sorted(horizon_models.items()):
+            path = base / f"lightgbm_return_h{int(horizon)}_q{quantile:.2f}.joblib"
+            joblib.dump(model, path)
+            saved_paths.append(path)
+    logger.info("Saved %d LightGBM quantile model(s) to %s", len(saved_paths), str(base))
+    return saved_paths
+
+
+def load_return_quantile_models(
+    directory: str | Path,
+    horizons: tuple[int, ...] = RETURN_HORIZONS,
+    quantiles: tuple[float, ...] = DEFAULT_RETURN_QUANTILES,
+) -> dict[int, dict[float, LGBMRegressor]]:
+    base = Path(directory)
+    models: dict[int, dict[float, LGBMRegressor]] = {}
+    for horizon in horizons:
+        horizon_models: dict[float, LGBMRegressor] = {}
+        for quantile in quantiles:
+            path = base / f"lightgbm_return_h{int(horizon)}_q{float(quantile):.2f}.joblib"
+            if not path.exists():
+                continue
+            horizon_models[float(quantile)] = joblib.load(path)
+        if horizon_models:
+            models[int(horizon)] = horizon_models
+    if not models:
+        logger.warning("No LightGBM quantile return models found under %s", str(base))
+    else:
+        logger.info("Loaded LightGBM quantile return model(s): %s", sorted(models.keys()))
     return models

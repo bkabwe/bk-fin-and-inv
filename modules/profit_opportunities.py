@@ -71,6 +71,8 @@ HORIZON_SETTINGS: dict[str, dict[str, Any]] = {
         "upside_key": "short_term_upside",
         "basis_key": "short_term_basis",
         "lightgbm_backtested_key": "short_term_lightgbm_backtested",
+        "confidence_key": "short_term_confidence",
+        "thin_history_key": "short_term_thin_history",
         "date_windows": {"High": 4, "Medium": 6, "Low": 8},
     },
     "medium_term": {
@@ -81,6 +83,8 @@ HORIZON_SETTINGS: dict[str, dict[str, Any]] = {
         "upside_key": "medium_term_upside",
         "basis_key": "medium_term_basis",
         "lightgbm_backtested_key": "medium_term_lightgbm_backtested",
+        "confidence_key": "medium_term_confidence",
+        "thin_history_key": "medium_term_thin_history",
         "date_windows": {"High": 14, "Medium": 21, "Low": 30},
     },
     "long_term": {
@@ -93,6 +97,8 @@ HORIZON_SETTINGS: dict[str, dict[str, Any]] = {
         # No LightGBM at 720d (see modules.scoring_engine), so there's no
         # backtested flag to key off here; analyze_ticker_for_horizon leaves
         # the row field as None rather than filtering long-term results.
+        "confidence_key": "long_term_confidence",
+        "thin_history_key": "long_term_thin_history",
         "date_windows": {"High": 30, "Medium": 45, "Low": 60},
     },
 }
@@ -117,6 +123,13 @@ DEFAULT_MAX_WORKERS = 8
 DEFAULT_FAST_SCREEN_BASE = 30
 DEFAULT_FAST_SCREEN_MARGIN = 15
 DEFAULT_MIN_UPSIDE_PCT = 15.0
+# Floor for the confidence-band width (as % of current price) used when
+# computing "Risk-Adjusted Upside" below, so a near-zero band (e.g. a capped
+# target pinned close to current price) doesn't blow the ratio up toward
+# infinity. modules.scoring_engine._confidence_bounds already floors its own
+# band width at >=8% of current price in the common case, so 1.0% is a
+# conservative lower bound that only binds in unusual edge cases.
+DEFAULT_MIN_BAND_WIDTH_PCT = 1.0
 
 
 def collect_universe_tickers(
@@ -190,10 +203,24 @@ def profit_row_from_analysis(
 
     target_price = float(projections.get(settings["target_key"]) or 0)
     upside = float(projections.get(settings["upside_key"]) or 0)
+    target_low = float(projections.get(settings["target_low_key"]) or target_price * 0.95)
+    target_high = float(projections.get(settings["target_high_key"]) or target_price * 1.05)
     rsi = (analysis.get("technical") or {}).get("indicators", {}).get("rsi")
     breakdown = analysis.get("score_breakdown") or {}
     lightgbm_backtested_key = settings.get("lightgbm_backtested_key")
     lightgbm_backtested = bool(projections.get(lightgbm_backtested_key)) if lightgbm_backtested_key else None
+    thin_history_key = settings.get("thin_history_key")
+    thin_history = bool(projections.get(thin_history_key)) if thin_history_key else None
+    sector = (analysis.get("fundamentals") or {}).get("metrics", {}).get("sector")
+
+    # Risk-adjusted upside: projected upside per unit of forecast uncertainty
+    # (the confidence-band width, as a % of current price), as a companion
+    # ranking cut to plain "by upside" -- surfaces picks with a tight,
+    # high-conviction band over ones with the same raw upside but a much
+    # wider (less certain) target range. Floored at DEFAULT_MIN_BAND_WIDTH_PCT
+    # so a near-zero band width can't blow the ratio toward infinity.
+    band_width_pct = ((target_high - target_low) / current_price) * 100 if current_price else 0.0
+    risk_adjusted_upside = upside / max(band_width_pct, DEFAULT_MIN_BAND_WIDTH_PCT)
 
     return {
         "Ticker": ticker,
@@ -201,9 +228,12 @@ def profit_row_from_analysis(
         "Score": int(analysis.get("score") or 0),
         "Current Price": round(current_price, 4),
         "Target Price": round(target_price, 4),
-        "Target Low": round(float(projections.get(settings["target_low_key"]) or target_price * 0.95), 4),
-        "Target High": round(float(projections.get(settings["target_high_key"]) or target_price * 1.05), 4),
+        "Target Low": round(target_low, 4),
+        "Target High": round(target_high, 4),
         "Projected Upside %": round(upside, 4),
+        "Risk-Adjusted Upside": round(risk_adjusted_upside, 4),
+        "Confidence Score": int(projections.get(settings.get("confidence_key")) or 0),
+        "Sector": str(sector) if sector else "Unknown",
         "Sector Trend": str(analysis.get("sector_trend") or "unknown").replace("_", " ").title(),
         "Market Cap Tier": analysis.get("market_cap_tier") or "unknown",
         "Long-Term Stage": analysis.get("longterm_stage") or "",
@@ -229,6 +259,12 @@ def profit_row_from_analysis(
         # scheduled profit-opportunities report) filter on this before
         # stripping it from the displayed/attached results.
         "_lightgbm_backtested": lightgbm_backtested,
+        # Internal-only: True when this horizon's price history falls short
+        # of a full walk-forward train+test window (e.g. a recent IPO) --
+        # see modules.scoring_engine._is_thin_history. Callers filter/exclude
+        # on this before stripping it from displayed/attached results, same
+        # pattern as _lightgbm_backtested above.
+        "_thin_history": thin_history,
         **({"Index": label} if label else {}),
     }
 

@@ -246,12 +246,68 @@ rather than guesswork:
   walk-forward comparison converts every model's forecast into a smooth
   geometric curve toward one terminal-return guess before computing RMSE,
   which structurally advantages models optimized directly for terminal
-  return (like LightGBM) over general-purpose extrapolators (ARIMA/trend). A
-  supplementary path-level metric would give a fuller comparison.
-- **No transaction costs or slippage in backtest RMSE**: backtests measure
-  price-forecast RMSE, not net-of-cost tradeable returns. Treat backtest wins
-  as directional-accuracy evidence only, not proof of after-cost
-  profitability.
+  return (like LightGBM) over general-purpose extrapolators (ARIMA/trend).
+  `run_walk_forward(..., evaluate_path_rmse=True)` now adds a supplementary
+  **path-level RMSE** (`arima_path_rmse`/`trend_path_rmse`/
+  `lightgbm_path_rmse`) that compares day-over-day log returns instead of
+  price levels, directly penalizing LightGBM's artificially smooth
+  interpolated path against the noisier real walk — see `_path_rmse()` in
+  `modules/backtester.py`. It is opt-in (off by default) since it adds
+  per-window computation; `scripts/compare_lightgbm_backtest.py --path-rmse`
+  enables it from the CLI.
+- **Window counts are small — raw RMSE deltas aren't statistical proof**:
+  per-ticker walk-forward window counts can be as low as 1-4, too few to
+  trust a raw "LightGBM RMSE is lower" claim as evidence of real skill
+  rather than noise. `modules.backtest_comparison.diebold_mariano_test()`
+  now pools one (RMSE² difference) observation per ticker across the
+  comparison and runs a paired t-test against zero, reporting a p-value and
+  significance flag; `summarize_backtest_results()` includes a
+  `significance_tests` list (LightGBM vs. ARIMA/Trend/naive) and
+  `format_comparison_summary()` prints it. Needs at least 2 tickers with
+  overlapping coverage to estimate variance.
+- **Transaction-cost-aware backtest evaluation is opt-in**: the default
+  backtest RMSE comparison still measures price-forecast error, not net-of-cost
+  tradeable returns. `run_walk_forward(..., evaluate_transaction_cost_aware=True,
+  transaction_cost_bps=10.0)` additionally simulates a simple long/flat trading
+  rule per model (trade when the model's predicted return is positive, apply a
+  round-trip cost in basis points on each trade) alongside a buy-and-hold
+  baseline, reporting `trade_rate`/`net_return_mean`/`hit_rate` per model.
+  `modules.backtest_comparison.run_lightgbm_backtest_comparison()` and
+  `summarize_backtest_results()` pool these per-ticker summaries
+  (window-count-weighted, with `hit_rate` weighted by trade count), and
+  `scripts/compare_lightgbm_backtest.py --transaction-cost-aware
+  --transaction-cost-bps 10` prints the pooled result. This remains a
+  simplified long/flat simulation (no position sizing, shorting, or realistic
+  slippage model beyond a flat bps assumption), so treat it as a directional
+  sanity check on after-cost viability rather than a full trading-strategy
+  backtest.
+- **LightGBM hyperparameters (`n_estimators=250, learning_rate=0.05,
+  num_leaves=31`) are fixed, not tuned**: a proper sweep is constrained by
+  the same small training windows noted above (as few as ~30 embargoed rows
+  at the 30d horizon after the purge window), so any grid search would risk
+  overfitting hyperparameters to a single backtest run — the exact anti-
+  pattern the Diebold-Mariano significance testing above was added to catch.
+  Revisiting these values is better done once enough accumulated
+  `modules/experiment_tracker.py` run history exists to compare candidate
+  configs across many runs rather than one.
+- **Long-horizon projections do not account for dividends**: price history
+  from Polygon is split-adjusted but **not** dividend-adjusted (see "Data
+  Sources" below), so projected upside for dividend-paying names is a pure
+  price-return estimate. This caveat compounds at longer horizons — a 720d
+  projection accumulates roughly 2 years of foregone/ignored dividend
+  compounding, whereas a 30d projection barely feels it. No total-return
+  adjustment is applied; treat long-horizon upside numbers for
+  high-dividend-yield names as a price-only lower bound on total return.
+- **No earnings-date/event-risk awareness**: forecasts do not flag or
+  discount confidence for tickers with an earnings release inside the
+  projection horizon, even though earnings prints are a major source of
+  short-horizon price-path discontinuity that a smooth technical/LightGBM
+  projection cannot anticipate. This is a known gap rather than an
+  oversight: Polygon's earnings-calendar endpoint
+  (`/vX/reference/earnings`) requires an Advanced-tier subscription, one
+  level above the Starter plan this app is built against (see "Optional
+  environment variables" above), so this remains blocked on a data-source
+  upgrade rather than an engineering task.
 
 ## Testing & CI
 
@@ -325,7 +381,7 @@ job — one per ticker-partitioned shard declared in the manifest, or a single
 job for older/unsharded manifests — that scans/filters its slice of tickers
 without truncating or recording), and `reduce` (merges every shard's partial
 results, truncates to the final top 75, records the profit-opportunity picks
-into `data/predictions.json` for later grading exactly once, attaches
+into `data/predictions.db` for later grading exactly once, attaches
 screener/profit-opportunity top 75 CSVs, and emails the report). The grading
 workflows run `scripts/grading_report.py` to evaluate the exact prior recorded
 scan batch using both point-in-time resolution and max-price-since-scan
@@ -379,7 +435,7 @@ recipient.
 ### Track-record bugfix: Stock Analysis no longer auto-records predictions
 
 Viewing a ticker on the Stock Analysis page no longer writes passive
-`stock_analysis` predictions into `data/predictions.json`. Track-record entries
+`stock_analysis` predictions into `data/predictions.db`. Track-record entries
 are now created only from deliberate profit-opportunity scans (interactive or
 scheduled), which keeps Track Record totals free of browse-noise.
 
@@ -418,6 +474,34 @@ combines:
 - Shared macro features from FRED (`DGS10`, `CPIAUCSL`, `FEDFUNDS`) as 5-day/
   30-day delta and percent-change metrics only (raw levels are used internally
   to compute these but are not exposed as features)
+- Cross-sectional sector relative-strength features (`modules/sector_returns.py`):
+  each ticker's trailing 21d/63d return alongside its own-sector SPDR ETF's
+  trailing return over the same window (`sector_return_21d`/`sector_return_63d`),
+  plus the ticker's excess return over that ETF (`sector_relative_return_21d`/
+  `sector_relative_return_63d`) -- a genuinely cross-sectional signal ("is this
+  stock outperforming its own sector lately?") that none of the other
+  single-ticker technical/fundamental/macro features can express. Ticker sector
+  labels are normalized via `modules.fundamental_analysis.normalize_sector_name`
+  before being mapped to one of the 11 standard Select Sector SPDR ETFs
+  (e.g. Technology → XLK, Financials → XLF); an unresolvable sector, or
+  unavailable ETF data, yields an all-NaN feature block (not an error) so the
+  output schema stays identical regardless of per-ticker sector coverage. The
+  sector-ETF return table can be fetched once and shared across a whole batch
+  run (`shared_sector_return_table`, mirroring the `shared_macro_table`
+  pattern above) instead of being re-fetched per ticker.
+  **Scope note**: sector is wired into live scoring (`modules/scoring_engine.py`,
+  via the ticker's already-fetched `info["sector"]`) and the single-ticker
+  `scripts/train_lightgbm_return_models.py` CLI, but is **not** wired into the
+  bulk `scripts/lightgbm_batch_pipeline.py` discover/train-shard pipeline --
+  that pipeline's `discover()` phase never fetches per-ticker `sector` today,
+  and adding it would reintroduce one extra API call per ticker across the
+  entire scan universe (thousands of tickers), the same per-ticker-call cost
+  this pipeline's existing liquidity-filter design deliberately avoids. This
+  is a known, intentional gap, not a silent omission: models trained via the
+  primary production batch pipeline do not currently see this feature; only
+  live-scoring-path models and single-ticker CLI-trained models do. It is also
+  not wired into `modules/backtester.py`'s walk-forward LightGBM evaluation
+  path, which does not fetch per-ticker `info`/sector at all.
 
 Design principle: feature assembly is TTL-cached incrementally and decoupled from
 scan cadence so repeated scans avoid unnecessary recomputation/refetching.
@@ -596,6 +680,154 @@ Share count and cost basis are **not** auto-adjusted (to avoid silent
 corruption of user data), but the warning makes it clear that manual
 review is needed.
 
+
+### Point-in-time universe/sentiment snapshots
+
+The repo now includes `scripts/snapshot_universe.py` plus a daily
+`.github/workflows/snapshot-universe.yml` job that appends the current
+`get_sp500_tickers()` membership list to
+`data/snapshots/universe_membership.jsonl`. This does **not** remove the
+existing survivorship-bias caveat overnight — historical backtests still only
+know today's membership until enough dated snapshots accumulate — but it starts
+building the point-in-time index-membership history that a future
+survivorship-bias-aware training/backtest path can consume instead of
+retroactively scraping Wikipedia's current table.
+
+The same script also has an opt-in `--with-sentiment` mode that writes one
+JSONL summary per ticker under `data/snapshots/sentiment/YYYY-MM-DD.jsonl`,
+using `analyze_sentiment()`'s FinBERT + market-signal output. The scheduled
+workflow intentionally leaves that heavier path off for now so the daily run
+stays fast, but the plumbing is now in place to begin accumulating a dated
+sentiment archive instead of only re-computing whatever headlines happen to be
+available at scan time.
+
+### Experiment tracking for backtest runs
+
+The repo now includes `modules/experiment_tracker.py`, a lightweight SQLite
+store at `data/experiments.db` for recording walk-forward/backtest comparison
+runs: run name, horizon, optional explicit git commit, serialized config,
+serialized summary metrics, and optional sample tickers. This addresses the
+current gap where research runs are easy to print once but awkward to compare
+later without ad-hoc notes or copy/paste.
+
+`list_experiment_runs()` surfaces recent runs as plain dicts, and
+`compare_latest_two_runs()` computes per-model numeric deltas such as
+`models.lightgbm.mean_rmse` between the two most recent runs for the same
+`(run_name, horizon)` pair. Unlike `data/predictions.db`, this database is
+intentionally local/derived developer state for iterative experimentation, so
+it is gitignored rather than committed back by CI.
+
+### Per-horizon projection confidence, shrinkage, and thin-history flags
+
+Each of the short/medium/long-term price projections now carries its own
+0-100 **projection confidence** (`short_term_confidence`,
+`medium_term_confidence`, `long_term_confidence` in
+`modules/scoring_engine.py`), computed from ensemble model agreement/
+dispersion and backtest-window evidence depth — deliberately kept separate
+from the composite 0-100 `Score`, since a stock can score well on
+fundamentals/technicals while its *projection* for a given horizon is
+backed by thin evidence (e.g. a recent IPO, or a horizon with only 1-2
+backtest windows).
+
+That confidence number does two things:
+
+- **Shrinkage**: `_apply_confidence_shrinkage()` pulls each horizon's point
+  projection back toward the current price in proportion to
+  `(1 - confidence/100)`, so a low-confidence extreme forecast (large
+  magnitude, thin evidence) is damped rather than passed through at full
+  size, while a high-confidence forecast is left mostly intact. This is
+  separate from (and on top of) the existing GARCH/market-cap confidence
+  **band**-widening, which affects the displayed range, not the point
+  estimate itself.
+- **Thin-history flag**: `_is_thin_history(horizon_days, history_days)`
+  marks `short_term_thin_history`/`medium_term_thin_history`/
+  `long_term_thin_history` as `True` when available price history is too
+  short relative to the horizon to trust that horizon's projection at all.
+
+### Risk-adjusted upside and diversification cap
+
+The Profit Opportunities scan (`modules/profit_opportunities.py`) now
+surfaces a **Confidence Score** column (the relevant horizon's projection
+confidence above) and a **Risk-Adjusted Upside** column
+(`projected upside % ÷ confidence-band width %`, floored at a minimum band
+width to avoid dividing by a near-zero band), rewarding upside that comes
+with a tight projection range over the same upside wrapped in a wide one.
+Both the scheduled scan report (`scripts/scan_email_report.py`) and
+`modules/screener.py` also now carry a **Sector** field used by a new
+`_apply_diversification_cap()` (max `DEFAULT_MAX_PER_SECTOR = 15` per
+sector) applied to every ranked cut, and `_exclude_thin_history()` drops
+thin-history rows from the qualifying pool before ranking. The scheduled
+report is now split into **three** top-75 rankings over the same qualifying
+pool: by projected upside, by overall score, and by risk-adjusted upside —
+not just the original "by upside"/"by score" pair.
+
+### Upside-forecast validation (beyond the composite Score)
+
+`compute_score_validation_stats()` in `modules/prediction_tracker.py` only
+ever tested the composite 0-100 `Score`'s rank-ordering power against
+realized outcomes. The new `compute_upside_validation_stats()` instead
+tests the raw `projected_upside_pct` forecast number itself against
+`actual_return_pct` once predictions resolve — reporting an information
+coefficient (Pearson correlation between projected and realized return),
+mean/median bias (a large negative gap flags systematic over-optimism in
+large upside projections), and an over-optimism rate. `scripts/
+grading_report.py` now surfaces this alongside the existing score
+validation stats.
+
+### Liquidity/tradability filter for scan universes
+
+`get_sp500_tickers()`, `get_nasdaq_tickers()`, `get_nyseamerican_tickers()`,
+and `get_otc_tickers()` in `modules/data_fetcher.py` previously had no
+liquidity floor, so thinly-traded names with little realistic tradability
+could enter the scan universe. `filter_tickers_by_liquidity()` now drops
+tickers whose trailing average dollar volume falls below a floor
+(`DEFAULT_MIN_AVG_DOLLAR_VOLUME = $1M/day` for the major exchanges,
+`DEFAULT_MIN_AVG_DOLLAR_VOLUME_OTC = $100K/day` for OTC, since OTC names are
+structurally much lower-volume and a $1M floor would eliminate nearly the
+whole OTC universe). To avoid thousands of per-ticker API calls, the filter
+is backed by a new bulk `get_grouped_daily_bars()` / `get_latest_grouped_
+daily_bars()` pair in `modules/polygon_client.py`, which fetches close +
+volume for **every** US ticker on the latest trading day in a single
+Polygon call (`/v2/aggs/grouped/locale/us/market/stocks/{date}`), walking
+back up to 10 days to skip weekends/holidays. The filter fails open (keeps
+the unfiltered list) on any fetch error or empty response, and keeps (does
+not drop) tickers missing from the bars response (e.g. very recent IPOs),
+treating "no data" as not evidence of illiquidity.
+
+### LightGBM bagging/model-averaging (opt-in)
+
+`modules/lightgbm_model.train_return_models()` gained an opt-in
+`n_bagged_estimators` parameter (default `1`, i.e. unchanged single-model
+behavior). When set above 1, it trains that many row-bootstrapped,
+differently-seeded `LGBMRegressor`s per horizon (each fit on a
+`bagging_fraction` resample of the training rows) and wraps them in a new
+`BaggedLGBMRegressor` that averages their predictions — a variance-reduction
+technique suited to the existing small training windows (as few as ~50-60
+rows at the 30d horizon) without touching the feature set or objective. The
+wrapper mirrors the plain model's `.predict()`/`.feature_name_` interface,
+so it drops into the existing `predict_forward_return()`/`save_return_
+models()`/`load_return_models()` plumbing unchanged, and is also exposed via
+`scripts/train_lightgbm_return_models.py --n-bagged-estimators`. The
+scheduled batch-training pipeline (`scripts/lightgbm_batch_pipeline.py`)
+still calls `train_return_models()` with the implicit default (bagging
+off), since enabling it for live models is a methodology change that should
+follow a dedicated walk-forward comparison first, not ship as a default.
+
+### LightGBM quantile regression / prediction intervals (not yet live)
+
+`modules/lightgbm_model.train_return_quantile_models()` trains per-horizon,
+per-quantile LightGBM models (`objective="quantile"`) to produce forward-
+return prediction intervals (default an 80% interval via
+`DEFAULT_RETURN_QUANTILES = (0.1, 0.9)`), alongside new
+`predict_forward_return_quantiles()`/`save_return_quantile_models()`/
+`load_return_quantile_models()` helpers mirroring the point-estimate API.
+This is deliberately **not yet wired into** the live scoring ensemble's
+GARCH-based confidence bands: doing so would change several already-
+validated downstream fields (market-cap band padding, per-horizon
+projection confidence, risk-adjusted upside), so it ships here as a
+tested, standalone capability for offline evaluation first, pending a
+backtest comparing it against the current band-construction approach.
+
 ---
 
 ## Prediction Track Record
@@ -676,10 +908,29 @@ Returns the full predictions list, optionally filtered by `status`
 (`pending`, `resolved`, `unresolved_no_data`).
 
 ### Storage
-Predictions are persisted to `data/predictions.json` using the same
-atomic-write pattern (tempfile + `os.replace`) used by the portfolio and
-watchlist modules. Unlike other `data/*.json` files (which hold personal
-portfolio/watchlist data and stay untracked), `data/predictions.json` is
-explicitly un-ignored in `.gitignore` and is committed back to the repository
-by the `scan-email-*` and `grading-report-*` GitHub Actions workflows after
-each run, so prediction history survives across ephemeral CI filesystems.
+Predictions are persisted to `data/predictions.db`, a SQLite database (see
+`modules/prediction_tracker.py`). Unlike other `data/*.json` files (which
+hold personal portfolio/watchlist data and stay untracked), `data/predictions.db`
+is explicitly un-ignored in `.gitignore` and is committed back to the
+repository by the `scan-email-*` and `grading-report-*` GitHub Actions
+workflows after each run, so prediction history survives across ephemeral CI
+filesystems. `.gitattributes` marks it binary so git never attempts a
+line-based diff/3-way merge on it; the workflows' push-retry loop runs
+`git rebase --abort` (instead of blindly retrying) if a rebase ever fails,
+since a genuine concurrent-write conflict on a binary file can't be
+auto-resolved the way a JSON conflict sometimes could.
+
+Earlier versions of this module stored predictions as a flat
+`data/predictions.json` file, with every write (even recording one new
+prediction) loading and re-serializing the entire, ever-growing history.
+SQLite lets `record_prediction`/`resolve_pending_predictions` issue targeted
+INSERT/UPDATE statements against only the rows they touch, and lets the
+read-heavy validation stats (`compute_score_validation_stats`,
+`compute_upside_validation_stats`, `compute_subscore_correlation_stats`)
+`SELECT` only the (resolved, or sub-score-bearing) rows they need instead of
+materializing the full history in Python — so these all stay cheap as
+prediction history keeps growing. The historical `data/predictions.json` file
+is kept in the repo as a frozen snapshot (no longer written to); a one-time
+`scripts/migrate_predictions_to_sqlite.py` backfilled it into
+`data/predictions.db` and can be re-run safely (it's idempotent, keyed on
+each record's existing `id`).

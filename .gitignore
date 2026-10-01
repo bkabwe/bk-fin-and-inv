@@ -3,11 +3,19 @@ data/portfolio.json
 data/watchlist.json
 data/notifications.json
 data/*.json
+data/*.db
+# Local/derived experiment-tracking state is for a developer's own
+# iteration loop, unlike data/predictions.db which CI commits back.
+data/experiments.db
 data/lightgbm_return_models/
 
 # Prediction tracker state is committed by CI so scan/grading runs share
 # history across ephemeral workflow filesystems (not personal/sensitive data).
+# predictions.json is the pre-SQLite-migration format, kept un-ignored only
+# so the one-time migration script (scripts/migrate_predictions_to_sqlite.py)
+# can still read a pre-existing file if one is present during migration.
 !data/predictions.json
+!data/predictions.db
 
 # Environment files
 .env

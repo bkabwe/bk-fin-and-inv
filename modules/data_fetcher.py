@@ -10,6 +10,7 @@ from modules.logger import get_logger
 from modules.polygon_client import (
     PolygonNotConfiguredError,
     build_info_adapter,
+    get_latest_grouped_daily_bars,
     get_news_polygon,
     get_stock_data_polygon,
     is_polygon_configured,
@@ -19,6 +20,19 @@ from modules.polygon_client import (
 from modules.validators import sanitize_ticker
 
 logger = get_logger(__name__)
+
+# Minimum trailing daily dollar volume (close * volume, from the most recent
+# available trading day) a ticker must clear to remain in any scan universe.
+# $1M/day is deliberately conservative -- it screens out effectively
+# untradeable micro-liquidity names without meaningfully shrinking the
+# liquid large/mid/small-cap universe the app is designed to scan.
+DEFAULT_MIN_AVG_DOLLAR_VOLUME = 1_000_000.0
+# OTC/pink-sheet names are structurally lower-volume than listed exchanges
+# even for legitimate small caps, so a $1M floor would wipe out most of that
+# universe; use a lower floor there to still screen out the most extreme
+# illiquidity/manipulation-risk names without eliminating the OTC scan
+# universe entirely.
+DEFAULT_MIN_AVG_DOLLAR_VOLUME_OTC = 100_000.0
 
 try:
     import streamlit as st
@@ -156,6 +170,56 @@ def _normalize_tickers(values: list[Any], limit: int | None = None) -> list[str]
     return unique[:limit] if limit is not None else unique
 
 
+def filter_tickers_by_liquidity(
+    tickers: list[str],
+    min_dollar_volume: float = DEFAULT_MIN_AVG_DOLLAR_VOLUME,
+) -> list[str]:
+    """Drop tickers whose most recent daily dollar volume (close * volume)
+    falls below ``min_dollar_volume``.
+
+    Uses a single bulk Polygon grouped-daily-bars call (not one request per
+    ticker), so this stays cheap enough to run before every scan rather than
+    eating into the runtime headroom gained elsewhere. Tickers missing from
+    the grouped-daily response (e.g. very recent listings, or a transient gap
+    in that bulk call) are kept rather than dropped, since "no data" isn't
+    evidence of illiquidity and erring toward inclusion avoids silently
+    shrinking the universe on a Polygon hiccup. If the bulk call itself
+    fails or returns nothing at all, the full input list is returned
+    unfiltered (fail open) for the same reason.
+    """
+    if not tickers:
+        return []
+    try:
+        bars = get_latest_grouped_daily_bars()
+    except Exception as exc:
+        logger.warning("Liquidity filter skipped: failed to fetch grouped daily bars: %s", exc)
+        return list(tickers)
+    if not bars:
+        logger.warning("Liquidity filter skipped: no grouped daily bars available")
+        return list(tickers)
+
+    filtered: list[str] = []
+    dropped = 0
+    for ticker in tickers:
+        bar = bars.get(ticker)
+        if bar is None:
+            filtered.append(ticker)
+            continue
+        dollar_volume = float(bar.get("close") or 0.0) * float(bar.get("volume") or 0.0)
+        if dollar_volume >= min_dollar_volume:
+            filtered.append(ticker)
+        else:
+            dropped += 1
+    if dropped:
+        logger.info(
+            "Liquidity filter dropped %s/%s tickers below $%.0f trailing daily dollar volume",
+            dropped,
+            len(tickers),
+            min_dollar_volume,
+        )
+    return filtered
+
+
 @cache_data(ttl=86400)
 def get_all_active_ticker_details() -> list[dict[str, Any]]:
     if not is_polygon_configured():
@@ -197,7 +261,7 @@ def get_sp500_tickers() -> list[str]:
             if sym_col:
                 tickers = _normalize_tickers(table[sym_col].astype(str).tolist())
                 if len(tickers) > 100:
-                    return tickers
+                    return filter_tickers_by_liquidity(tickers)
     except Exception as exc:
         logger.error("Failed to fetch S&P 500 tickers from Wikipedia: %s", exc)
     raise RuntimeError("Failed to fetch S&P 500 tickers")
@@ -215,7 +279,7 @@ def get_nasdaq_tickers() -> list[str]:
         raise RuntimeError(f"Failed to fetch NASDAQ tickers from Polygon: {exc}") from exc
     if not tickers:
         raise RuntimeError("Polygon returned no NASDAQ tickers")
-    return tickers
+    return filter_tickers_by_liquidity(tickers)
 
 
 @cache_data(ttl=86400)
@@ -230,7 +294,7 @@ def get_nyseamerican_tickers() -> list[str]:
         raise RuntimeError(f"Failed to fetch NYSE American tickers from Polygon: {exc}") from exc
     if not tickers:
         raise RuntimeError("Polygon returned no NYSE American tickers")
-    return tickers
+    return filter_tickers_by_liquidity(tickers)
 
 
 @cache_data(ttl=86400)
@@ -245,4 +309,4 @@ def get_otc_tickers() -> list[str]:
         raise RuntimeError(f"Failed to fetch OTC tickers from Polygon: {exc}") from exc
     if not tickers:
         raise RuntimeError("Polygon returned no OTC tickers")
-    return tickers
+    return filter_tickers_by_liquidity(tickers, min_dollar_volume=DEFAULT_MIN_AVG_DOLLAR_VOLUME_OTC)

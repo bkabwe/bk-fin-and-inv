@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from modules import fred_client, sec_edgar_client
+from modules import sector_returns as sector_returns_module
 from modules.logger import get_logger
 from modules.validators import sanitize_ticker
 
@@ -288,6 +289,7 @@ def _build_feature_table_cached(
     high_values: tuple[float | int | None, ...],
     low_values: tuple[float | int | None, ...],
     volume_values: tuple[float | int | None, ...],
+    sector: str | None = None,
 ) -> pd.DataFrame:
     index = pd.DatetimeIndex(pd.to_datetime(list(dates), errors="coerce")).dropna().sort_values()
     if len(index) == 0:
@@ -302,6 +304,10 @@ def _build_feature_table_cached(
     table = _technical_features(price_frame)
     table = table.join(_fundamental_daily_features(ticker, table.index), how="left")
     table = table.join(_macro_daily_features(table.index), how="left")
+    table = table.join(
+        sector_returns_module.compute_relative_strength_features(table.index, price_frame["Close"], sector),
+        how="left",
+    )
     table = table.apply(pd.to_numeric, errors="coerce").astype("float64")
     table.index.name = "Date"
 
@@ -316,6 +322,8 @@ def _build_feature_table_uncached(
     *,
     lookback_days: int,
     shared_macro_table: pd.DataFrame | None,
+    sector: str | None = None,
+    shared_sector_return_table: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     normalized = _normalize_price_frame(price_data)
     if normalized.empty:
@@ -324,6 +332,12 @@ def _build_feature_table_uncached(
     table = _technical_features(normalized)
     table = table.join(_fundamental_daily_features(ticker, table.index), how="left")
     table = table.join(_macro_daily_features(table.index, shared_macro_table=shared_macro_table), how="left")
+    table = table.join(
+        sector_returns_module.compute_relative_strength_features(
+            table.index, normalized["Close"], sector, shared_sector_return_table=shared_sector_return_table
+        ),
+        how="left",
+    )
     table = table.apply(pd.to_numeric, errors="coerce").astype("float64")
     table.index.name = "Date"
     if lookback_days > 0 and len(table) > lookback_days:
@@ -337,6 +351,8 @@ def build_feature_table(
     lookback_days: int = 252,
     *,
     shared_macro_table: pd.DataFrame | None = None,
+    sector: str | None = None,
+    shared_sector_return_table: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     try:
         clean_ticker = sanitize_ticker(ticker)
@@ -349,12 +365,14 @@ def build_feature_table(
         logger.warning("Feature engineering skipped for %s: empty price data", clean_ticker or ticker)
         return pd.DataFrame()
 
-    if shared_macro_table is not None:
+    if shared_macro_table is not None or shared_sector_return_table is not None:
         return _build_feature_table_uncached(
             clean_ticker,
             normalized,
             lookback_days=int(lookback_days),
             shared_macro_table=shared_macro_table,
+            sector=sector,
+            shared_sector_return_table=shared_sector_return_table,
         )
 
     dates = tuple(pd.DatetimeIndex(normalized.index).strftime("%Y-%m-%d").tolist())
@@ -366,4 +384,5 @@ def build_feature_table(
         tuple(normalized["High"].tolist()),
         tuple(normalized["Low"].tolist()),
         tuple(normalized["Volume"].tolist()),
+        sector,
     )

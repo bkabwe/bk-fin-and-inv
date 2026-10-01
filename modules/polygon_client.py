@@ -528,6 +528,52 @@ def list_active_tickers(
     return [str(row.get("ticker") or "").strip().upper() for row in rows if str(row.get("ticker") or "").strip()]
 
 
+@cache_data(ttl=21600)
+def get_grouped_daily_bars(trading_date: str, *, adjusted: bool = True) -> dict[str, dict[str, float]]:
+    """One bulk call returning each US-listed stock's close price and volume
+    for ``trading_date`` (YYYY-MM-DD), via Polygon's grouped-daily-bars
+    endpoint.
+
+    This exists specifically to make universe-wide liquidity screening (see
+    ``modules.data_fetcher.filter_tickers_by_liquidity``) cheap: one request
+    covers every ticker for a day, instead of one aggregates request per
+    ticker (which would undo the runtime work already done to keep scan
+    shards fast). Returns an empty dict for non-trading days
+    (weekends/holidays) -- see ``get_latest_grouped_daily_bars`` for the
+    walk-back-to-the-last-trading-day convenience wrapper.
+    """
+    payload = _request_json(
+        f"/v2/aggs/grouped/locale/us/market/stocks/{trading_date}",
+        {"adjusted": str(bool(adjusted)).lower()},
+    )
+    results = payload.get("results") or []
+    bars: dict[str, dict[str, float]] = {}
+    for item in results:
+        symbol = str(item.get("T") or "").strip().upper()
+        if not symbol:
+            continue
+        bars[symbol] = {
+            "close": _coerce_aggregate_value(item.get("c")),
+            "volume": _coerce_aggregate_value(item.get("v")),
+        }
+    return bars
+
+
+def get_latest_grouped_daily_bars(*, lookback_days: int = 10) -> dict[str, dict[str, float]]:
+    """Walk back from yesterday (today's bar may still be incomplete/
+    unavailable intraday) up to ``lookback_days`` calendar days until a
+    trading day with results is found, so liquidity screening doesn't need
+    its own market-calendar logic to skip weekends/holidays.
+    """
+    probe_date = date.today() - timedelta(days=1)
+    for _ in range(max(1, int(lookback_days))):
+        bars = get_grouped_daily_bars(probe_date.isoformat())
+        if bars:
+            return bars
+        probe_date -= timedelta(days=1)
+    return {}
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         return float(value) if value is not None else None

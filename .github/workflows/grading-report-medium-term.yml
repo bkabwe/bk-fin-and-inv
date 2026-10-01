@@ -38,13 +38,13 @@ jobs:
       - name: Persist prediction tracker state
         if: always()
         run: |
-          if [ -z "$(git status --porcelain -- data/predictions.json)" ]; then
-            echo "No changes to data/predictions.json"
+          if [ -z "$(git status --porcelain -- data/predictions.db)" ]; then
+            echo "No changes to data/predictions.db"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/predictions.json
+          git add data/predictions.db
           git commit -m "chore: update prediction tracker state [skip ci]"
           for attempt in 1 2 3; do
             if git push; then
@@ -52,7 +52,15 @@ jobs:
             fi
             echo "Push rejected, rebasing onto latest and retrying ($attempt/3)"
             git fetch origin "${GITHUB_REF_NAME}"
-            git rebase "origin/${GITHUB_REF_NAME}"
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              # predictions.db is a binary SQLite file, so a real conflict
+              # can't be line-merged like the old predictions.json could --
+              # abort cleanly rather than leave the (ephemeral) runner in a
+              # stuck rebase state or risk a corrupt half-applied rebase.
+              echo "Rebase failed, likely a genuine conflict on the binary predictions.db; aborting."
+              git rebase --abort
+              exit 1
+            fi
           done
           git push
 

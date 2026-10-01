@@ -8,6 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from modules.data_fetcher import get_stock_info
 from modules.lightgbm_model import (
     RETURN_HORIZONS,
     build_return_training_examples_for_ticker,
@@ -49,6 +50,21 @@ def _parse_args() -> argparse.Namespace:
         help="Minimum labeled rows required to train a horizon model (default: 50).",
     )
     parser.add_argument(
+        "--n-bagged-estimators",
+        type=int,
+        default=1,
+        help=(
+            "Number of row-bootstrapped, differently-seeded LightGBM models to "
+            "average per horizon (default: 1 = bagging disabled, single model)."
+        ),
+    )
+    parser.add_argument(
+        "--bagging-fraction",
+        type=float,
+        default=0.8,
+        help="Row sample fraction (with replacement) per bagged model when --n-bagged-estimators > 1 (default: 0.8).",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_OUTPUT_DIR),
         help="Base directory where per-ticker model folders are written.",
@@ -59,14 +75,25 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     ticker = str(args.ticker).upper()
+    sector = None
+    try:
+        sector = get_stock_info(ticker).get("sector")
+    except Exception as exc:  # noqa: BLE001 - sector is a best-effort enrichment, not required to train
+        print(f"Warning: could not fetch sector for {ticker} ({exc}); training without sector-relative features.")
     training_examples = build_return_training_examples_for_ticker(
         ticker=ticker,
         period=args.period,
         interval=args.interval,
         lookback_days=int(args.lookback_days),
         horizons=tuple(int(value) for value in args.horizons),
+        sector=sector,
     )
-    models = train_return_models(training_examples, min_rows_per_horizon=int(args.min_rows_per_horizon))
+    models = train_return_models(
+        training_examples,
+        min_rows_per_horizon=int(args.min_rows_per_horizon),
+        n_bagged_estimators=int(args.n_bagged_estimators),
+        bagging_fraction=float(args.bagging_fraction),
+    )
     if not models:
         print(f"No LightGBM return models were trained for {ticker}.")
         return 1

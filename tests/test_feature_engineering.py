@@ -238,5 +238,69 @@ class FeatureEngineeringGracefulDegradationTests(unittest.TestCase):
         self.assertFalse(table["macro_dgs10_delta_5d"].isna().all())
 
 
+class FeatureEngineeringSectorRelativeStrengthTests(unittest.TestCase):
+    def test_no_sector_passed_yields_all_nan_sector_columns_without_fetching(self):
+        price_data = _sample_price_frame(40)
+        feature_engineering._build_feature_table_cached.clear()
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()),
+            patch("modules.feature_engineering.sector_returns_module.build_sector_return_table") as fetch_mock,
+        ):
+            table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=40)
+
+        fetch_mock.assert_not_called()
+        self.assertIn("sector_return_21d", table.columns)
+        self.assertTrue(table["sector_return_21d"].isna().all())
+
+    def test_sector_kwarg_self_fetches_sector_return_table_on_cached_path(self):
+        price_data = _sample_price_frame(120)
+        sector_table = pd.DataFrame(
+            {
+                "XLK_return_21d": np.linspace(0.0, 0.05, num=150),
+                "XLK_return_63d": np.linspace(0.0, 0.1, num=150),
+            },
+            index=pd.date_range("2023-11-01", periods=150, freq="D"),
+        )
+        feature_engineering._build_feature_table_cached.clear()
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()),
+            patch(
+                "modules.feature_engineering.sector_returns_module.build_sector_return_table",
+                return_value=sector_table,
+            ) as fetch_mock,
+        ):
+            table = feature_engineering.build_feature_table("AAPL", price_data, lookback_days=120, sector="Technology")
+
+        fetch_mock.assert_called_once()
+        self.assertFalse(table["sector_return_21d"].isna().all())
+
+    def test_shared_sector_return_table_is_used_without_refetching(self):
+        price_data = _sample_price_frame(120)
+        sector_table = pd.DataFrame(
+            {
+                "XLK_return_21d": np.linspace(0.0, 0.05, num=150),
+                "XLK_return_63d": np.linspace(0.0, 0.1, num=150),
+            },
+            index=pd.date_range("2023-11-01", periods=150, freq="D"),
+        )
+        with (
+            patch("modules.feature_engineering.sec_edgar_client.get_company_facts", return_value={}),
+            patch("modules.feature_engineering.fred_client.get_macro_feature_table", return_value=pd.DataFrame()),
+            patch("modules.feature_engineering.sector_returns_module.build_sector_return_table") as fetch_mock,
+        ):
+            table = feature_engineering.build_feature_table(
+                "AAPL",
+                price_data,
+                lookback_days=120,
+                sector="Technology",
+                shared_sector_return_table=sector_table,
+            )
+
+        fetch_mock.assert_not_called()
+        self.assertFalse(table["sector_return_21d"].isna().all())
+
+
 if __name__ == "__main__":
     unittest.main()

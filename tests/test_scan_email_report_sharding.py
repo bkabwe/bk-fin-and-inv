@@ -197,6 +197,73 @@ class RequireLightgbmBacktestedTests(unittest.TestCase):
         self.assertEqual(dropped, 0)
 
 
+class ExcludeThinHistoryTests(unittest.TestCase):
+    """_exclude_thin_history should drop any row flagged as thin-history
+    (e.g. a recent IPO with too little price history for a full walk-forward
+    window) before it's eligible for a ranked scan-report cut -- see Phase 4
+    item #10 of the modelling-improvement action plan."""
+
+    def test_keeps_only_ample_history_rows_and_counts_dropped(self):
+        results = pd.DataFrame({"Ticker": ["AAPL", "MSFT", "GOOG"], "_thin_history": [False, True, False]})
+        filtered, dropped = scan_email_report._exclude_thin_history(results)
+        self.assertEqual(list(filtered["Ticker"]), ["AAPL", "GOOG"])
+        self.assertEqual(dropped, 1)
+
+    def test_no_op_when_column_missing(self):
+        results = pd.DataFrame({"Ticker": ["AAPL"]})
+        filtered, dropped = scan_email_report._exclude_thin_history(results)
+        pd.testing.assert_frame_equal(filtered, results)
+        self.assertEqual(dropped, 0)
+
+    def test_no_op_when_results_empty(self):
+        filtered, dropped = scan_email_report._exclude_thin_history(pd.DataFrame())
+        self.assertTrue(filtered.empty)
+        self.assertEqual(dropped, 0)
+
+
+class ApplyDiversificationCapTests(unittest.TestCase):
+    """_apply_diversification_cap should enforce a max-per-sector cap on an
+    already-ranked frame while preserving rank order -- see Phase 4 item #18
+    of the modelling-improvement action plan."""
+
+    def test_caps_rows_per_sector_while_preserving_rank_order(self):
+        results = pd.DataFrame(
+            {
+                "Ticker": ["A", "B", "C", "D", "E"],
+                "Sector": ["Tech", "Tech", "Tech", "Energy", "Tech"],
+            }
+        )
+        capped = scan_email_report._apply_diversification_cap(results, limit=10, max_per_sector=2)
+        # Only the first 2 Tech rows (A, B) are kept; C is skipped (3rd Tech
+        # row), D (Energy) and E (Tech, but already capped at 2) -- rank
+        # order among kept rows is preserved.
+        self.assertEqual(list(capped["Ticker"]), ["A", "B", "D"])
+
+    def test_limit_truncates_after_cap_is_applied(self):
+        results = pd.DataFrame(
+            {
+                "Ticker": ["A", "B", "C", "D"],
+                "Sector": ["Tech", "Energy", "Health", "Finance"],
+            }
+        )
+        capped = scan_email_report._apply_diversification_cap(results, limit=2, max_per_sector=5)
+        self.assertEqual(list(capped["Ticker"]), ["A", "B"])
+
+    def test_falls_back_to_plain_head_when_sector_column_missing(self):
+        results = pd.DataFrame({"Ticker": ["A", "B", "C"]})
+        capped = scan_email_report._apply_diversification_cap(results, limit=2, max_per_sector=1)
+        self.assertEqual(list(capped["Ticker"]), ["A", "B"])
+
+    def test_no_op_when_results_empty(self):
+        capped = scan_email_report._apply_diversification_cap(pd.DataFrame(), limit=10, max_per_sector=2)
+        self.assertTrue(capped.empty)
+
+    def test_missing_sector_values_are_grouped_as_unknown(self):
+        results = pd.DataFrame({"Ticker": ["A", "B", "C"], "Sector": [None, None, "Tech"]})
+        capped = scan_email_report._apply_diversification_cap(results, limit=10, max_per_sector=1)
+        self.assertEqual(list(capped["Ticker"]), ["A", "C"])
+
+
 
 def _fake_analysis(
     ticker: str,
@@ -458,7 +525,14 @@ class MergeShardOutputsTests(unittest.TestCase):
         )
         self.assertEqual(
             merged["profit_stats_totals"],
-            {"scanned_count": 4, "fast_filtered_count": 1, "passed_fast_screen_count": 2, "failed_count": 1, "lightgbm_unconfirmed_count": 0},
+            {
+                "scanned_count": 4,
+                "fast_filtered_count": 1,
+                "passed_fast_screen_count": 2,
+                "failed_count": 1,
+                "lightgbm_unconfirmed_count": 0,
+                "thin_history_dropped_count": 0,
+            },
         )
 
     def test_raises_when_no_partial_files_present(self):
@@ -475,6 +549,7 @@ class ReduceScanShardsTests(unittest.TestCase):
                 "Ticker": ["AAPL", "MSFT"],
                 "Score": [60, 80],
                 "Projected Upside %": [10.0, 20.0],
+                "Risk-Adjusted Upside": [2.0, 4.0],
                 "_rsi": [55.0, 60.0],
             }
         )
@@ -488,6 +563,7 @@ class ReduceScanShardsTests(unittest.TestCase):
                 "passed_fast_screen_count": 2,
                 "failed_count": 0,
                 "lightgbm_unconfirmed_count": 0,
+                "thin_history_dropped_count": 0,
             },
         }
         finalized_display = profit_frame.drop(columns=["_rsi"])
@@ -506,23 +582,25 @@ class ReduceScanShardsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         mock_merge.assert_called_once()
-        # finalize_profit_results is called three times: once (record=True) on
-        # the deduplicated union of both cuts to record predictions exactly
-        # once per ticker, and once each (record=False) for the by-upside and
-        # by-score display/CSV frames.
-        self.assertEqual(mock_finalize.call_count, 3)
+        # finalize_profit_results is called four times: once (record=True) on
+        # the deduplicated union of all three cuts to record predictions
+        # exactly once per ticker, and once each (record=False) for the
+        # by-upside, by-score, and by-risk-adjusted-upside display/CSV
+        # frames.
+        self.assertEqual(mock_finalize.call_count, 4)
         record_flags = [call.kwargs["record"] for call in mock_finalize.call_args_list]
         self.assertEqual(record_flags.count(True), 1)
-        self.assertEqual(record_flags.count(False), 2)
+        self.assertEqual(record_flags.count(False), 3)
         mock_build_report.assert_called_once()
         mock_send_email.assert_called_once()
         self.assertIn("2026-01-01", mock_send_email.call_args.kwargs["subject"])
         attachments = mock_send_email.call_args.kwargs["attachments"]
-        self.assertEqual(len(attachments), 3)
+        self.assertEqual(len(attachments), 4)
         attachment_names = [attachment["name"] for attachment in attachments]
         self.assertIn("screener_top75_2026-01-01.csv", attachment_names)
         self.assertIn("profit_opportunities_by_upside_top75_2026-01-01.csv", attachment_names)
         self.assertIn("profit_opportunities_by_score_top75_2026-01-01.csv", attachment_names)
+        self.assertIn("profit_opportunities_by_risk_adjusted_upside_top75_2026-01-01.csv", attachment_names)
 
     def test_handles_all_empty_shards_without_raising(self):
         manifest = {"tickers": {}, "latest_batch": {}}
@@ -536,6 +614,7 @@ class ReduceScanShardsTests(unittest.TestCase):
                 "passed_fast_screen_count": 0,
                 "failed_count": 0,
                 "lightgbm_unconfirmed_count": 0,
+                "thin_history_dropped_count": 0,
             },
         }
         with (

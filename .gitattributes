@@ -1,0 +1,7 @@
+# data/predictions.db is a SQLite database committed by CI (see the
+# scan-email-*/grading-report-* workflows). Mark it binary so git never
+# attempts a line-based diff or 3-way merge on it -- a genuine concurrent
+# write conflict surfaces as a clean "unmergeable" conflict instead of a
+# corrupted file, which the workflows' rebase step aborts on (git rebase
+# --abort) rather than retrying blindly.
+data/predictions.db binary

@@ -1,19 +1,27 @@
 """Prediction Tracker — persist price projections and resolve them after their target date.
 
-Uses the same atomic-JSON-write pattern as modules/portfolio.py.
-Storage: data/predictions.json. Unlike other data/*.json files, this one is
-explicitly un-ignored in .gitignore and committed back by CI (see the
-scan-email-* / grading-report-* workflows) so history survives across
+Storage: data/predictions.db (SQLite). Unlike other data/*.json files, this
+database is explicitly un-ignored in .gitignore and committed back by CI (see
+the scan-email-* / grading-report-* workflows) so history survives across
 ephemeral workflow filesystems.
+
+Prior to this module's SQLite migration, every call (including a single new
+prediction, or checking a handful of pending target dates) loaded and
+re-serialized the entire growing `data/predictions.json` file. SQLite lets
+``record_prediction`` and ``resolve_pending_predictions`` issue targeted
+INSERT/UPDATE statements against only the rows they touch, and lets the
+read-only validation stats (``compute_score_validation_stats``,
+``compute_upside_validation_stats``, ``compute_subscore_correlation_stats``)
+select only the (resolved, or sub-score-bearing) rows they actually need
+instead of materializing every historical record in Python -- so these all
+stay cheap as prediction history keeps accumulating week over week.
 """
 from __future__ import annotations
 
 import json
-import os
-import tempfile
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 from modules.logger import get_logger
@@ -21,7 +29,64 @@ from modules.logger import get_logger
 logger = get_logger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
-PREDICTIONS_FILE = DATA_DIR / "predictions.json"
+PREDICTIONS_DB_FILE = DATA_DIR / "predictions.db"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS predictions (
+    id TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    company TEXT,
+    horizon TEXT NOT NULL,
+    scan_date TEXT NOT NULL,
+    target_date TEXT NOT NULL,
+    current_price_at_scan REAL,
+    target_price REAL,
+    target_low REAL,
+    target_high REAL,
+    projected_upside_pct REAL,
+    score REAL,
+    data_quality TEXT,
+    models_used TEXT,
+    source TEXT,
+    sub_scores_json TEXT,
+    status TEXT NOT NULL,
+    actual_price_at_target_date REAL,
+    actual_return_pct REAL,
+    hit_target INTEGER,
+    hit_band INTEGER,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_predictions_status ON predictions(status);
+CREATE INDEX IF NOT EXISTS idx_predictions_ticker_horizon_scandate
+    ON predictions(ticker, horizon, scan_date);
+CREATE INDEX IF NOT EXISTS idx_predictions_target_date ON predictions(target_date);
+"""
+
+# Columns in storage/row order -- keep in sync with _SCHEMA and _row_to_record/_record_to_row.
+_COLUMNS: tuple[str, ...] = (
+    "id",
+    "ticker",
+    "company",
+    "horizon",
+    "scan_date",
+    "target_date",
+    "current_price_at_scan",
+    "target_price",
+    "target_low",
+    "target_high",
+    "projected_upside_pct",
+    "score",
+    "data_quality",
+    "models_used",
+    "source",
+    "sub_scores_json",
+    "status",
+    "actual_price_at_target_date",
+    "actual_return_pct",
+    "hit_target",
+    "hit_band",
+    "resolved_at",
+)
 
 # Horizon → midpoint days used for target_date calculation.
 # Align with estimate_target_date fallback_days in pages/6_Profit_Opportunities.py.
@@ -48,36 +113,95 @@ SUBSCORE_ROW_FIELDS: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal helpers — SQLite connection + record <-> row conversion
 # ---------------------------------------------------------------------------
 
-def _atomic_write(path: Path, data: Any) -> None:
-    """Write JSON atomically using temp file + rename to prevent corruption."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        delete=False,
-        suffix=".tmp",
-    ) as tmp:
-        json.dump(data, tmp, indent=2, default=str)
-        tmp_path = tmp.name
-    os.replace(tmp_path, path)
+def _connect() -> sqlite3.Connection:
+    """Open a connection to data/predictions.db, creating the schema if needed.
+
+    Short-lived connection per call (mirrors the old open/read/close-per-call
+    JSON pattern) rather than a module-level singleton, so tests that patch
+    ``PREDICTIONS_DB_FILE`` to a fresh temp path don't need any extra teardown.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(PREDICTIONS_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_SCHEMA)
+    return conn
+
+
+def _row_to_record(row: sqlite3.Row) -> dict:
+    rec = {col: row[col] for col in _COLUMNS}
+    rec["sub_scores"] = json.loads(rec.pop("sub_scores_json")) if rec.get("sub_scores_json") else None
+    rec["hit_target"] = bool(rec["hit_target"]) if rec["hit_target"] is not None else None
+    rec["hit_band"] = bool(rec["hit_band"]) if rec["hit_band"] is not None else None
+    return rec
+
+
+def _record_to_row(rec: dict) -> dict:
+    row = {col: rec.get(col) for col in _COLUMNS if col != "sub_scores_json"}
+    sub_scores = rec.get("sub_scores")
+    row["sub_scores_json"] = json.dumps(sub_scores) if sub_scores else None
+    if row.get("hit_target") is not None:
+        row["hit_target"] = int(bool(row["hit_target"]))
+    if row.get("hit_band") is not None:
+        row["hit_band"] = int(bool(row["hit_band"]))
+    return row
 
 
 def _load_all() -> list[dict]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not PREDICTIONS_FILE.exists():
-        return []
-    try:
-        return json.loads(PREDICTIONS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return []
+    """Load every prediction record. Prefer ``_load_by_status``/targeted
+    queries where only a subset of rows is actually needed."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM predictions ORDER BY rowid").fetchall()
+    return [_row_to_record(row) for row in rows]
 
 
-def _save_all(records: list[dict]) -> None:
-    _atomic_write(PREDICTIONS_FILE, records)
+def _load_by_status(status: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM predictions WHERE status = ? ORDER BY rowid", (status,)
+        ).fetchall()
+    return [_row_to_record(row) for row in rows]
+
+
+def _load_with_subscores() -> list[dict]:
+    """Rows (pending or resolved) with a recorded sub_scores blob -- used by
+    compute_subscore_correlation_stats, which needs the full scan history,
+    not just resolved outcomes."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM predictions WHERE sub_scores_json IS NOT NULL ORDER BY rowid"
+        ).fetchall()
+    return [_row_to_record(row) for row in rows]
+
+
+def _load_pending_dedupe_keys() -> set[str]:
+    """Light-weight variant of the dedupe check in record_prediction: only
+    pulls the 3 columns needed to build dedupe keys from pending rows,
+    instead of loading every historical (mostly resolved) record."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT ticker, horizon, scan_date FROM predictions WHERE status = 'pending'"
+        ).fetchall()
+    return {_dedupe_key(row["ticker"], row["horizon"], row["scan_date"]) for row in rows}
+
+
+def _insert_record(rec: dict) -> None:
+    row = _record_to_row(rec)
+    columns = ", ".join(_COLUMNS)
+    placeholders = ", ".join(f":{col}" for col in _COLUMNS)
+    with _connect() as conn:
+        conn.execute(f"INSERT INTO predictions ({columns}) VALUES ({placeholders})", row)
+        conn.commit()
+
+
+def _update_record(rec: dict) -> None:
+    row = _record_to_row(rec)
+    assignments = ", ".join(f"{col} = :{col}" for col in _COLUMNS if col != "id")
+    with _connect() as conn:
+        conn.execute(f"UPDATE predictions SET {assignments} WHERE id = :id", row)
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -113,14 +237,10 @@ def record_prediction(
     Returns the prediction id if recorded, or None if it was deduped.
     """
     today = date.today().isoformat()
-    records = _load_all()
 
     # Dedupe: skip if there's already a pending prediction for the same ticker+horizon today.
-    pending = {
-        _dedupe_key(r["ticker"], r["horizon"], r["scan_date"])
-        for r in records
-        if r.get("status") == "pending"
-    }
+    # Only pending rows are loaded (not the whole, ever-growing resolved history).
+    pending = _load_pending_dedupe_keys()
     dk = _dedupe_key(ticker, horizon, today)
     if dk in pending:
         logger.debug("Prediction already recorded for %s (dedupe_key=%s)", ticker, dk)
@@ -154,8 +274,7 @@ def record_prediction(
         "hit_band": None,
         "resolved_at": None,
     }
-    records.append(rec)
-    _save_all(records)
+    _insert_record(rec)
     logger.info("Recorded prediction %s for %s (%s) — target %s", rec["id"], ticker, horizon, target_date)
     return rec["id"]
 
@@ -272,15 +391,15 @@ def resolve_pending_predictions() -> dict[str, int]:
     # ``modules.data_fetcher.get_stock_data`` directly.
     from modules.data_fetcher import get_stock_data
 
-    records = _load_all()
+    # Only pending rows are loaded -- resolved/unresolved_no_data history (which
+    # only grows and never changes again) is never re-read or re-written here.
+    records = _load_by_status("pending")
     today = date.today()
     resolved_count = 0
     no_data_count = 0
     still_pending_count = 0
 
     for rec in records:
-        if rec.get("status") != "pending":
-            continue
         target_date_str = rec.get("target_date", "")
         try:
             target_date = date.fromisoformat(target_date_str)
@@ -336,6 +455,7 @@ def resolve_pending_predictions() -> dict[str, int]:
             rec["hit_band"] = hit_band
             rec["status"] = "resolved"
             rec["resolved_at"] = datetime.now(timezone.utc).isoformat()
+            _update_record(rec)
             resolved_count += 1
             logger.info(
                 "Resolved prediction %s for %s: actual=%.2f, hit_target=%s, hit_band=%s",
@@ -353,11 +473,11 @@ def resolve_pending_predictions() -> dict[str, int]:
             if days_past >= 7:
                 rec["status"] = "unresolved_no_data"
                 rec["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                _update_record(rec)
                 no_data_count += 1
             else:
                 still_pending_count += 1
 
-    _save_all(records)
     return {
         "resolved": resolved_count,
         "no_data": no_data_count,
@@ -523,16 +643,90 @@ def compute_score_validation_stats(min_samples: int = 5) -> dict:
     with fewer than `min_samples` resolved predictions returns None values
     rather than a misleadingly precise statistic from a tiny sample.
     """
-    records = _load_all()
+    # Only resolved rows are loaded -- pending predictions never contribute
+    # to these stats, so there's no need to load/filter them in Python.
+    resolved_rows = _load_by_status("resolved")
     resolved = [
-        r
-        for r in records
-        if r.get("status") == "resolved" and r.get("score") is not None and r.get("actual_return_pct") is not None
+        r for r in resolved_rows if r.get("score") is not None and r.get("actual_return_pct") is not None
     ]
 
     by_horizon = {h: _score_ic_stats([r for r in resolved if r.get("horizon") == h], min_samples) for h in HORIZON_DAYS}
     return {
         "overall": _score_ic_stats(resolved, min_samples),
+        "by_horizon": by_horizon,
+    }
+
+
+def _upside_calibration_stats(subset: list[dict], min_samples: int) -> dict:
+    """Information coefficient + bias stats for one subset, testing whether
+    the projected_upside_pct forecast itself is systematically over/under-
+    optimistic relative to realized returns -- not just whether the
+    composite Score ranks outcomes correctly (see _score_ic_stats above)."""
+    n = len(subset)
+    if n < min_samples:
+        return {
+            "count": n,
+            "information_coefficient": None,
+            "mean_bias_pct": None,
+            "median_bias_pct": None,
+            "overoptimism_rate": None,
+        }
+
+    projected = [float(r["projected_upside_pct"]) for r in subset]
+    returns = [float(r["actual_return_pct"]) for r in subset]
+    ic = _pearson_correlation(projected, returns)
+
+    # bias = actual - projected; negative => the realized return fell short
+    # of the projected upside (over-optimistic forecast), positive => the
+    # forecast was conservative relative to what actually happened.
+    biases = sorted(actual - proj for proj, actual in zip(projected, returns, strict=True))
+    mean_bias = sum(biases) / n
+    mid = n // 2
+    median_bias = biases[mid] if n % 2 == 1 else (biases[mid - 1] + biases[mid]) / 2
+    overoptimism_rate = round(sum(1 for b in biases if b < 0) / n * 100, 1)
+
+    return {
+        "count": n,
+        "information_coefficient": round(ic, 4) if ic is not None else None,
+        "mean_bias_pct": round(mean_bias, 2),
+        "median_bias_pct": round(median_bias, 2),
+        "overoptimism_rate": overoptimism_rate,
+    }
+
+
+def compute_upside_validation_stats(min_samples: int = 5) -> dict:
+    """Correlate recorded projected_upside_pct forecasts against realized
+    forward returns, once predictions are resolved.
+
+    Complements compute_score_validation_stats, which only tests the
+    composite 0-100 Score's rank-ordering power against outcomes -- this
+    tests the upside forecast number itself (the raw "+N% upside" figures
+    surfaced in the profit-opportunities report, e.g. an aggressive
+    long-horizon projection) for systematic bias, not just directional
+    correlation. Reports:
+      - information_coefficient: Pearson correlation between projected
+        upside and realized return (positive => bigger projected upside
+        tends to precede bigger realized returns).
+      - mean_bias_pct / median_bias_pct: average/median (actual - projected)
+        gap; a large negative value flags systematic over-optimism.
+      - overoptimism_rate: % of resolved predictions where the realized
+        return fell short of the projected upside.
+
+    Returns {"overall": {...}, "by_horizon": {horizon: {...}}}. Any bucket
+    with fewer than `min_samples` resolved predictions returns None values
+    rather than a misleadingly precise statistic from a tiny sample.
+    """
+    # Only resolved rows are loaded -- see compute_score_validation_stats above.
+    resolved_rows = _load_by_status("resolved")
+    resolved = [
+        r for r in resolved_rows if r.get("projected_upside_pct") is not None and r.get("actual_return_pct") is not None
+    ]
+
+    by_horizon = {
+        h: _upside_calibration_stats([r for r in resolved if r.get("horizon") == h], min_samples) for h in HORIZON_DAYS
+    }
+    return {
+        "overall": _upside_calibration_stats(resolved, min_samples),
         "by_horizon": by_horizon,
     }
 
@@ -563,7 +757,11 @@ def compute_subscore_correlation_stats(min_samples: int = 10) -> dict:
     down-weighting or consolidating them; this function only measures the
     correlation; deciding what to do about it is a follow-up.
     """
-    records = _load_all()
+    # Only rows with a recorded sub_scores blob are loaded (pending or
+    # resolved alike -- see the docstring above), skipping every record from
+    # before sub-score recording existed and any scan source that doesn't
+    # populate it.
+    records = _load_with_subscores()
     subscore_rows = [r["sub_scores"] for r in records if isinstance(r.get("sub_scores"), dict)]
 
     field_names = sorted(set(SUBSCORE_ROW_FIELDS.values()))
