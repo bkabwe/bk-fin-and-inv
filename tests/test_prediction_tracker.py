@@ -17,9 +17,9 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         tmp_dir = Path(self._tmp.name)
-        self.predictions_file = tmp_dir / "predictions.json"
+        self.predictions_db_file = tmp_dir / "predictions.db"
         patcher_dir = patch.object(prediction_tracker, "DATA_DIR", tmp_dir)
-        patcher_file = patch.object(prediction_tracker, "PREDICTIONS_FILE", self.predictions_file)
+        patcher_file = patch.object(prediction_tracker, "PREDICTIONS_DB_FILE", self.predictions_db_file)
         patcher_dir.start()
         patcher_file.start()
         self.addCleanup(patcher_dir.stop)
@@ -43,12 +43,12 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         defaults.update(overrides)
         return prediction_tracker.record_prediction(**defaults)
 
-    # -- persistence / atomic write -----------------------------------
+    # -- persistence / SQLite storage -----------------------------------
 
     def test_record_prediction_persists_to_disk_and_round_trips(self):
         pid = self._record()
         self.assertIsNotNone(pid)
-        self.assertTrue(self.predictions_file.exists())
+        self.assertTrue(self.predictions_db_file.exists())
 
         records = prediction_tracker.get_all_predictions()
         self.assertEqual(len(records), 1)
@@ -78,7 +78,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         first = self._record()
         records = prediction_tracker.get_all_predictions()
         records[0]["status"] = "resolved"
-        prediction_tracker._save_all(records)
+        prediction_tracker._update_record(records[0])
 
         second = self._record()
 
@@ -93,7 +93,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         records = prediction_tracker.get_all_predictions()
         records[0]["target_date"] = "2020-01-10"
         records[0]["scan_date"] = "2020-01-01"
-        prediction_tracker._save_all(records)
+        prediction_tracker._update_record(records[0])
 
         frame = pd.DataFrame(
             {"Close": [108.0, 112.0]},
@@ -115,7 +115,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         self._record()
         records = prediction_tracker.get_all_predictions()
         records[0]["target_date"] = "2999-01-01"
-        prediction_tracker._save_all(records)
+        prediction_tracker._update_record(records[0])
 
         summary = prediction_tracker.resolve_pending_predictions()
 
@@ -127,7 +127,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         self._record()
         records = prediction_tracker.get_all_predictions()
         records[0]["target_date"] = "2020-01-01"
-        prediction_tracker._save_all(records)
+        prediction_tracker._update_record(records[0])
 
         with patch("modules.data_fetcher.get_stock_data", return_value=pd.DataFrame()):
             summary = prediction_tracker.resolve_pending_predictions()
@@ -141,7 +141,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         self._record()
         records = prediction_tracker.get_all_predictions()
         records[0]["target_date"] = (date.today() - timedelta(days=2)).isoformat()
-        prediction_tracker._save_all(records)
+        prediction_tracker._update_record(records[0])
 
         with patch("modules.data_fetcher.get_stock_data", return_value=pd.DataFrame()):
             summary = prediction_tracker.resolve_pending_predictions()
@@ -159,7 +159,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         for i, rec in enumerate(records):
             rec["status"] = "resolved"
             rec["actual_return_pct"] = float(i)
-        prediction_tracker._save_all(records)
+            prediction_tracker._update_record(rec)
 
         stats = prediction_tracker.compute_score_validation_stats(min_samples=5)
 
@@ -183,7 +183,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
             rec["status"] = "resolved"
             rec["actual_return_pct"] = sample["actual_return_pct"]
             rec["hit_target"] = sample["hit_target"]
-        prediction_tracker._save_all(records)
+            prediction_tracker._update_record(rec)
 
         stats = prediction_tracker.compute_score_validation_stats(min_samples=5)
 
@@ -202,7 +202,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         for i, rec in enumerate(records):
             rec["status"] = "resolved"
             rec["actual_return_pct"] = float(i)
-        prediction_tracker._save_all(records)
+            prediction_tracker._update_record(rec)
 
         stats = prediction_tracker.compute_upside_validation_stats(min_samples=5)
 
@@ -227,7 +227,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         for rec, sample in zip(records, samples, strict=False):
             rec["status"] = "resolved"
             rec["actual_return_pct"] = sample["actual_return_pct"]
-        prediction_tracker._save_all(records)
+            prediction_tracker._update_record(rec)
 
         stats = prediction_tracker.compute_upside_validation_stats(min_samples=5)
 
@@ -255,7 +255,7 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         for rec, sample in zip(records, samples, strict=False):
             rec["status"] = "resolved"
             rec["actual_return_pct"] = sample["actual_return_pct"]
-        prediction_tracker._save_all(records)
+            prediction_tracker._update_record(rec)
 
         stats = prediction_tracker.compute_upside_validation_stats(min_samples=5)
 

@@ -32,10 +32,10 @@ class ApiRoutesTests(unittest.TestCase):
             patch.object(notifications, "NOTIFICATIONS_FILE", self.notifications_file),
         ]
 
-        self.predictions_file = tmp_dir / "predictions.json"
+        self.predictions_db_file = tmp_dir / "predictions.db"
         prediction_tracker_patchers = [
             patch.object(prediction_tracker, "DATA_DIR", tmp_dir),
-            patch.object(prediction_tracker, "PREDICTIONS_FILE", self.predictions_file),
+            patch.object(prediction_tracker, "PREDICTIONS_DB_FILE", self.predictions_db_file),
         ]
 
         for patcher in [*notifications_patchers, *prediction_tracker_patchers]:

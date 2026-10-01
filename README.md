@@ -372,7 +372,7 @@ job — one per ticker-partitioned shard declared in the manifest, or a single
 job for older/unsharded manifests — that scans/filters its slice of tickers
 without truncating or recording), and `reduce` (merges every shard's partial
 results, truncates to the final top 75, records the profit-opportunity picks
-into `data/predictions.json` for later grading exactly once, attaches
+into `data/predictions.db` for later grading exactly once, attaches
 screener/profit-opportunity top 75 CSVs, and emails the report). The grading
 workflows run `scripts/grading_report.py` to evaluate the exact prior recorded
 scan batch using both point-in-time resolution and max-price-since-scan
@@ -426,7 +426,7 @@ recipient.
 ### Track-record bugfix: Stock Analysis no longer auto-records predictions
 
 Viewing a ticker on the Stock Analysis page no longer writes passive
-`stock_analysis` predictions into `data/predictions.json`. Track-record entries
+`stock_analysis` predictions into `data/predictions.db`. Track-record entries
 are now created only from deliberate profit-opportunity scans (interactive or
 scheduled), which keeps Track Record totals free of browse-noise.
 
@@ -676,7 +676,7 @@ later without ad-hoc notes or copy/paste.
 `list_experiment_runs()` surfaces recent runs as plain dicts, and
 `compare_latest_two_runs()` computes per-model numeric deltas such as
 `models.lightgbm.mean_rmse` between the two most recent runs for the same
-`(run_name, horizon)` pair. Unlike `data/predictions.json`, this database is
+`(run_name, horizon)` pair. Unlike `data/predictions.db`, this database is
 intentionally local/derived developer state for iterative experimentation, so
 it is gitignored rather than committed back by CI.
 
@@ -871,10 +871,29 @@ Returns the full predictions list, optionally filtered by `status`
 (`pending`, `resolved`, `unresolved_no_data`).
 
 ### Storage
-Predictions are persisted to `data/predictions.json` using the same
-atomic-write pattern (tempfile + `os.replace`) used by the portfolio and
-watchlist modules. Unlike other `data/*.json` files (which hold personal
-portfolio/watchlist data and stay untracked), `data/predictions.json` is
-explicitly un-ignored in `.gitignore` and is committed back to the repository
-by the `scan-email-*` and `grading-report-*` GitHub Actions workflows after
-each run, so prediction history survives across ephemeral CI filesystems.
+Predictions are persisted to `data/predictions.db`, a SQLite database (see
+`modules/prediction_tracker.py`). Unlike other `data/*.json` files (which
+hold personal portfolio/watchlist data and stay untracked), `data/predictions.db`
+is explicitly un-ignored in `.gitignore` and is committed back to the
+repository by the `scan-email-*` and `grading-report-*` GitHub Actions
+workflows after each run, so prediction history survives across ephemeral CI
+filesystems. `.gitattributes` marks it binary so git never attempts a
+line-based diff/3-way merge on it; the workflows' push-retry loop runs
+`git rebase --abort` (instead of blindly retrying) if a rebase ever fails,
+since a genuine concurrent-write conflict on a binary file can't be
+auto-resolved the way a JSON conflict sometimes could.
+
+Earlier versions of this module stored predictions as a flat
+`data/predictions.json` file, with every write (even recording one new
+prediction) loading and re-serializing the entire, ever-growing history.
+SQLite lets `record_prediction`/`resolve_pending_predictions` issue targeted
+INSERT/UPDATE statements against only the rows they touch, and lets the
+read-heavy validation stats (`compute_score_validation_stats`,
+`compute_upside_validation_stats`, `compute_subscore_correlation_stats`)
+`SELECT` only the (resolved, or sub-score-bearing) rows they need instead of
+materializing the full history in Python — so these all stay cheap as
+prediction history keeps growing. The historical `data/predictions.json` file
+is kept in the repo as a frozen snapshot (no longer written to); a one-time
+`scripts/migrate_predictions_to_sqlite.py` backfilled it into
+`data/predictions.db` and can be re-run safely (it's idempotent, keyed on
+each record's existing `id`).
