@@ -158,6 +158,24 @@ class LightGBMModelTests(unittest.TestCase):
         self.assertIn(30, examples)
         self.assertIs(feature_mock.call_args.kwargs["shared_macro_table"], shared_macro)
 
+    def test_build_examples_for_ticker_passes_sector_and_shared_sector_table_to_feature_builder(self):
+        price_data = _sample_price_data(length=120)
+        shared_sector_table = pd.DataFrame({"XLK_return_21d": np.linspace(0.0, 0.05, num=120)}, index=price_data.index)
+        with (
+            patch("modules.lightgbm_model.get_stock_data", return_value=price_data),
+            patch("modules.lightgbm_model.build_feature_table", return_value=_sample_feature_table(length=120)) as feature_mock,
+        ):
+            examples = lightgbm_model.build_return_training_examples_for_ticker(
+                "AAPL",
+                horizons=(30,),
+                sector="Technology",
+                shared_sector_return_table=shared_sector_table,
+            )
+
+        self.assertIn(30, examples)
+        self.assertEqual(feature_mock.call_args.kwargs["sector"], "Technology")
+        self.assertIs(feature_mock.call_args.kwargs["shared_sector_return_table"], shared_sector_table)
+
     def test_training_examples_exclude_extreme_forward_return_labels_and_keep_surrounding_examples(self):
         price_data = _sample_price_data(length=100)
         anomalous_date = price_data.index[20]

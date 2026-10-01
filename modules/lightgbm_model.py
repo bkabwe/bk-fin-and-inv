@@ -144,9 +144,22 @@ def build_return_training_examples(
     feature_table: pd.DataFrame | None = None,
     lookback_days: int = 1260,
     horizons: tuple[int, ...] = RETURN_HORIZONS,
+    *,
+    sector: str | None = None,
+    shared_sector_return_table: pd.DataFrame | None = None,
 ) -> dict[int, tuple[pd.DataFrame, pd.Series]]:
     """Build per-horizon (X, y) datasets where y is forward return."""
-    raw_features = feature_table if feature_table is not None else build_feature_table(ticker, price_data, lookback_days=lookback_days)
+    raw_features = (
+        feature_table
+        if feature_table is not None
+        else build_feature_table(
+            ticker,
+            price_data,
+            lookback_days=lookback_days,
+            sector=sector,
+            shared_sector_return_table=shared_sector_return_table,
+        )
+    )
     features = prepare_lightgbm_feature_frame(raw_features)
     if features.empty:
         logger.warning("LightGBM training examples skipped for %s: empty feature table", str(ticker).upper())
@@ -213,6 +226,8 @@ def build_return_training_examples_for_ticker(
     horizons: tuple[int, ...] = RETURN_HORIZONS,
     *,
     shared_macro_table: pd.DataFrame | None = None,
+    sector: str | None = None,
+    shared_sector_return_table: pd.DataFrame | None = None,
 ) -> dict[int, tuple[pd.DataFrame, pd.Series]]:
     """Build examples by reusing the existing Polygon-backed get_stock_data flow."""
     price_data = get_stock_data(ticker, period=period, interval=interval)
@@ -224,6 +239,8 @@ def build_return_training_examples_for_ticker(
         price_data,
         lookback_days=lookback_days,
         shared_macro_table=shared_macro_table,
+        sector=sector,
+        shared_sector_return_table=shared_sector_return_table,
     )
     return build_return_training_examples(
         ticker=ticker,

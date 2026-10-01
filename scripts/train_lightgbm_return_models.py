@@ -8,6 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from modules.data_fetcher import get_stock_info
 from modules.lightgbm_model import (
     RETURN_HORIZONS,
     build_return_training_examples_for_ticker,
@@ -74,12 +75,18 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     ticker = str(args.ticker).upper()
+    sector = None
+    try:
+        sector = get_stock_info(ticker).get("sector")
+    except Exception as exc:  # noqa: BLE001 - sector is a best-effort enrichment, not required to train
+        print(f"Warning: could not fetch sector for {ticker} ({exc}); training without sector-relative features.")
     training_examples = build_return_training_examples_for_ticker(
         ticker=ticker,
         period=args.period,
         interval=args.interval,
         lookback_days=int(args.lookback_days),
         horizons=tuple(int(value) for value in args.horizons),
+        sector=sector,
     )
     models = train_return_models(
         training_examples,

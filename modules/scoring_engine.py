@@ -659,6 +659,8 @@ def _live_lightgbm_price_projections(
     ticker: str,
     data: pd.DataFrame | None,
     current_price: float,
+    *,
+    sector: str | None = None,
 ) -> tuple[dict[int, float], list[str], list[str]]:
     if not LIGHTGBM_AVAILABLE:
         return {}, [], ["LightGBM: package not installed"]
@@ -677,7 +679,7 @@ def _live_lightgbm_price_projections(
         )
 
     try:
-        feature_table = build_feature_table(ticker, data, lookback_days=len(data))
+        feature_table = build_feature_table(ticker, data, lookback_days=len(data), sector=sector)
     except Exception as exc:
         return {}, [], [f"LightGBM: feature table unavailable ({exc})"]
     if feature_table is None or feature_table.empty:
@@ -820,6 +822,7 @@ def _get_price_projections_core(
         ticker,
         data,
         current_price,
+        sector=info.get("sector"),
     )
     models_used.extend(lightgbm_models_used)
     models_skipped.extend(lightgbm_models_skipped)

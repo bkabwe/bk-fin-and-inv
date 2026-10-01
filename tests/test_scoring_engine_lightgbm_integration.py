@@ -380,6 +380,51 @@ class ScoringEngineLightGBMIntegrationTests(unittest.TestCase):
         self.assertTrue(result["short_term_lightgbm_backtested"])
         self.assertTrue(result["medium_term_lightgbm_backtested"])
 
+    def test_live_projection_forwards_info_sector_to_feature_builder(self):
+        data = _sample_projection_data()
+        info = {
+            "exchange": "NASDAQ",
+            "marketCap": 5_000_000_000,
+            "currentPrice": float(data["Close"].iloc[-1]),
+            "sector": "Technology",
+        }
+        technical = {
+            "resistance_levels": [135.0],
+            "indicators": {"bb_high": 134.0},
+        }
+
+        with (
+            patch("modules.scoring_engine.LIGHTGBM_AVAILABLE", True),
+            patch("modules.scoring_engine._load_live_lightgbm_manifest", return_value={}),
+            patch("modules.scoring_engine.load_return_models", return_value={30: object(), 180: object()}),
+            patch("modules.scoring_engine.predict_forward_return", return_value=0.05),
+            patch("modules.scoring_engine.build_feature_table", return_value=_sample_feature_table(data)) as feature_mock,
+            patch(
+                "modules.scoring_engine.run_walk_forward",
+                return_value={
+                    "arima_rmse": 2.0,
+                    "trend_rmse": 1.0,
+                    "lightgbm_rmse": 0.9,
+                    "n_windows": 4,
+                    "arima_windows": 4,
+                    "trend_windows": 4,
+                    "lightgbm_windows": 4,
+                },
+            ),
+            patch("modules.scoring_engine.LinearRegression", _FakeLinearRegression),
+            patch("modules.scoring_engine._garch_confidence_from_returns", return_value=(None, None)),
+            patch("modules.scoring_engine.analyze_technical", return_value=technical),
+            patch(
+                "modules.scoring_engine.get_macro_regime",
+                return_value={"risk_free_rate": 0.045, "bullish_sectors": [], "bearish_sectors": [], "market_regime": "neutral"},
+            ),
+            patch("modules.scoring_engine.analyze_fundamentals", return_value={"metrics": {}, "fundamental_score": 50}),
+        ):
+            scoring_engine._get_price_projections_core("AAPL", info=info, data=data)
+
+        feature_mock.assert_called_once()
+        self.assertEqual(feature_mock.call_args.kwargs["sector"], "Technology")
+
     def test_live_projection_uses_fixed_fallback_weight_when_only_one_horizon_has_backtest_evidence(self):
         data = _sample_projection_data()
         info = {"exchange": "NASDAQ", "marketCap": 5_000_000_000, "currentPrice": float(data["Close"].iloc[-1])}

@@ -465,6 +465,34 @@ combines:
 - Shared macro features from FRED (`DGS10`, `CPIAUCSL`, `FEDFUNDS`) as 5-day/
   30-day delta and percent-change metrics only (raw levels are used internally
   to compute these but are not exposed as features)
+- Cross-sectional sector relative-strength features (`modules/sector_returns.py`):
+  each ticker's trailing 21d/63d return alongside its own-sector SPDR ETF's
+  trailing return over the same window (`sector_return_21d`/`sector_return_63d`),
+  plus the ticker's excess return over that ETF (`sector_relative_return_21d`/
+  `sector_relative_return_63d`) -- a genuinely cross-sectional signal ("is this
+  stock outperforming its own sector lately?") that none of the other
+  single-ticker technical/fundamental/macro features can express. Ticker sector
+  labels are normalized via `modules.fundamental_analysis.normalize_sector_name`
+  before being mapped to one of the 11 standard Select Sector SPDR ETFs
+  (e.g. Technology → XLK, Financials → XLF); an unresolvable sector, or
+  unavailable ETF data, yields an all-NaN feature block (not an error) so the
+  output schema stays identical regardless of per-ticker sector coverage. The
+  sector-ETF return table can be fetched once and shared across a whole batch
+  run (`shared_sector_return_table`, mirroring the `shared_macro_table`
+  pattern above) instead of being re-fetched per ticker.
+  **Scope note**: sector is wired into live scoring (`modules/scoring_engine.py`,
+  via the ticker's already-fetched `info["sector"]`) and the single-ticker
+  `scripts/train_lightgbm_return_models.py` CLI, but is **not** wired into the
+  bulk `scripts/lightgbm_batch_pipeline.py` discover/train-shard pipeline --
+  that pipeline's `discover()` phase never fetches per-ticker `sector` today,
+  and adding it would reintroduce one extra API call per ticker across the
+  entire scan universe (thousands of tickers), the same per-ticker-call cost
+  this pipeline's existing liquidity-filter design deliberately avoids. This
+  is a known, intentional gap, not a silent omission: models trained via the
+  primary production batch pipeline do not currently see this feature; only
+  live-scoring-path models and single-ticker CLI-trained models do. It is also
+  not wired into `modules/backtester.py`'s walk-forward LightGBM evaluation
+  path, which does not fetch per-ticker `info`/sector at all.
 
 Design principle: feature assembly is TTL-cached incrementally and decoupled from
 scan cadence so repeated scans avoid unnecessary recomputation/refetching.
