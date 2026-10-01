@@ -167,6 +167,52 @@ def _weighted_median(weighted_values: list[tuple[float, int]]) -> float | None:
     return round(float(expanded[-1][0]), 6)
 
 
+_TRANSACTION_COST_MODELS = ("arima", "trend", "lightgbm", "buy_and_hold")
+
+
+def _pool_transaction_cost_summaries(per_ticker: list[dict], model: str) -> dict | None:
+    """Pool one model's per-ticker transaction_cost_evaluation summaries
+    (each already a _summarize_transaction_cost_windows-style dict) into a
+    single cross-ticker summary, window-count-weighted like the RMSE pooling
+    above. hit_rate is instead weighted by each ticker's number of actual
+    trades (trade_rate * n_windows), since it is a rate over trades, not
+    windows.
+    """
+    net_return_values: list[tuple[float, int]] = []
+    trade_rate_values: list[tuple[float, int]] = []
+    hit_rate_values: list[tuple[float, int]] = []
+    total_windows = 0
+    for row in per_ticker:
+        evaluation = row.get("transaction_cost_evaluation")
+        if not evaluation:
+            continue
+        model_summary = evaluation.get(model)
+        if not model_summary:
+            continue
+        windows = int(model_summary.get("n_windows", 0) or 0)
+        if windows <= 0:
+            continue
+        total_windows += windows
+        net_return_mean = model_summary.get("net_return_mean")
+        if net_return_mean is not None:
+            net_return_values.append((float(net_return_mean), windows))
+        trade_rate = model_summary.get("trade_rate")
+        if trade_rate is not None:
+            trade_rate_values.append((float(trade_rate), windows))
+            hit_rate = model_summary.get("hit_rate")
+            if hit_rate is not None:
+                n_trades = max(1, int(round(trade_rate * windows)))
+                hit_rate_values.append((float(hit_rate), n_trades))
+    if total_windows == 0:
+        return None
+    return {
+        "windows_evaluated": int(total_windows),
+        "net_return_mean": _weighted_mean(net_return_values),
+        "trade_rate": _weighted_mean(trade_rate_values),
+        "hit_rate": _weighted_mean(hit_rate_values),
+    }
+
+
 def summarize_backtest_results(per_ticker: list[dict]) -> dict:
     models = ["arima", "trend", "lightgbm"]
     if any(("naive_rmse" in row or "naive_windows" in row) for row in per_ticker):
@@ -236,7 +282,7 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
     ]
     if "naive" in models:
         significance_tests.append(diebold_mariano_test(per_ticker, "lightgbm", "naive"))
-    return {
+    result = {
         "total_tickers": int(len(per_ticker)),
         "models": model_summary,
         "lightgbm_wins_vs_both": {
@@ -251,6 +297,22 @@ def summarize_backtest_results(per_ticker: list[dict]) -> dict:
         },
         "significance_tests": significance_tests,
     }
+    if any(row.get("transaction_cost_evaluation") for row in per_ticker):
+        transaction_cost_bps = next(
+            (
+                row["transaction_cost_evaluation"]["transaction_cost_bps"]
+                for row in per_ticker
+                if row.get("transaction_cost_evaluation")
+            ),
+            None,
+        )
+        result["transaction_cost_evaluation"] = {
+            "transaction_cost_bps": transaction_cost_bps,
+            "models": {
+                model: _pool_transaction_cost_summaries(per_ticker, model) for model in _TRANSACTION_COST_MODELS
+            },
+        }
+    return result
 
 
 def _format_per_ticker_rmse(row: dict, model: str, width: int) -> str:
@@ -304,6 +366,8 @@ def run_lightgbm_backtest_comparison(
     evaluate_naive_baseline: bool = False,
     lightgbm_diagnostics: bool = False,
     evaluate_path_rmse: bool = False,
+    evaluate_transaction_cost_aware: bool = False,
+    transaction_cost_bps: float = 10.0,
 ) -> dict:
     config = get_walk_forward_window_config(horizon)
     resolved_period = str(period or config.default_period)
@@ -334,6 +398,8 @@ def run_lightgbm_backtest_comparison(
             evaluate_naive_baseline=evaluate_naive_baseline,
             lightgbm_diagnostics=lightgbm_diagnostics,
             evaluate_path_rmse=evaluate_path_rmse,
+            evaluate_transaction_cost_aware=evaluate_transaction_cost_aware,
+            transaction_cost_bps=transaction_cost_bps,
         )
         per_ticker.append({"ticker": ticker, **result})
 
@@ -405,5 +471,28 @@ def format_comparison_summary(summary: dict) -> str:
                 f"  {test.get('model_a')} vs {test.get('model_b')}: mean_diff={test.get('mean_diff'):.8f} "
                 f"t={test.get('t_statistic')} p={p_value if p_value is not None else 'n/a'} "
                 f"({verdict} at 5%, n={n_tickers} tickers)"
+            )
+    transaction_cost_evaluation = summary.get("transaction_cost_evaluation")
+    if transaction_cost_evaluation:
+        cost_bps = transaction_cost_evaluation.get("transaction_cost_bps")
+        lines.extend(
+            [
+                "",
+                f"Transaction-cost-aware net returns (long/flat rule, {cost_bps:.1f}bps round-trip cost):",
+                "Model        Trade Rate  Net Return (mean)  Hit Rate  Windows",
+                "-----------  ----------  ------------------  --------  -------",
+            ]
+        )
+        for model in _TRANSACTION_COST_MODELS:
+            values = (transaction_cost_evaluation.get("models") or {}).get(model) or {}
+            trade_rate = values.get("trade_rate")
+            net_return_mean = values.get("net_return_mean")
+            hit_rate = values.get("hit_rate")
+            lines.append(
+                f"{model:<11}  "
+                f"{(f'{trade_rate:.2%}' if trade_rate is not None else 'n/a'):>10}  "
+                f"{(f'{net_return_mean:.4%}' if net_return_mean is not None else 'n/a'):>18}  "
+                f"{(f'{hit_rate:.2%}' if hit_rate is not None else 'n/a'):>8}  "
+                f"{int(values.get('windows_evaluated', 0)):>7}"
             )
     return "\n".join(lines)

@@ -9,6 +9,7 @@ import pandas as pd
 from modules import backtester
 from modules.backtest_comparison import (
     diebold_mariano_test,
+    format_comparison_summary,
     format_per_ticker_diagnostics_table,
     run_lightgbm_backtest_comparison,
     select_sample_tickers,
@@ -571,6 +572,120 @@ class WalkForwardLightGBMTests(unittest.TestCase):
         self.assertEqual(backtester._path_rmse(np.array([100.0]), np.array([100.0])), float("inf"))
 
 
+class TransactionCostAwareSignalTests(unittest.TestCase):
+    def test_non_positive_predicted_return_stays_flat_with_zero_cost(self):
+        signal, net_return = backtester._transaction_cost_signal_and_return(
+            predicted_return=-0.01, realized_return=0.05, transaction_cost_bps=10.0
+        )
+        self.assertEqual(signal, 0)
+        self.assertEqual(net_return, 0.0)
+
+    def test_positive_predicted_return_trades_and_nets_out_cost(self):
+        signal, net_return = backtester._transaction_cost_signal_and_return(
+            predicted_return=0.02, realized_return=0.05, transaction_cost_bps=10.0
+        )
+        self.assertEqual(signal, 1)
+        self.assertAlmostEqual(net_return, 0.05 - 0.0010, places=8)
+
+    def test_summarize_windows_computes_trade_rate_net_return_and_hit_rate(self):
+        summary = backtester._summarize_transaction_cost_windows(
+            signals=[1, 0, 1, 1], net_returns=[0.02, 0.0, -0.01, 0.03]
+        )
+        self.assertEqual(summary["n_windows"], 4)
+        self.assertAlmostEqual(summary["trade_rate"], 0.75, places=6)
+        self.assertAlmostEqual(summary["net_return_mean"], float(np.mean([0.02, 0.0, -0.01, 0.03])), places=6)
+        # Among the 3 traded windows, 2 (0.02 and 0.03) were net-of-cost profitable.
+        self.assertAlmostEqual(summary["hit_rate"], 2.0 / 3.0, places=6)
+
+    def test_summarize_windows_hit_rate_none_when_no_trades_taken(self):
+        summary = backtester._summarize_transaction_cost_windows(signals=[0, 0], net_returns=[0.0, 0.0])
+        self.assertEqual(summary["trade_rate"], 0.0)
+        self.assertIsNone(summary["hit_rate"])
+
+    def test_summarize_windows_empty_input_yields_none_summary(self):
+        summary = backtester._summarize_transaction_cost_windows(signals=[], net_returns=[])
+        self.assertEqual(summary["n_windows"], 0)
+        self.assertIsNone(summary["trade_rate"])
+        self.assertIsNone(summary["net_return_mean"])
+        self.assertIsNone(summary["hit_rate"])
+
+
+class WalkForwardTransactionCostAwareTests(unittest.TestCase):
+    def setUp(self):
+        if hasattr(backtester.run_walk_forward, "clear"):
+            backtester.run_walk_forward.clear()
+
+    def test_disabled_by_default(self):
+        data = _realistic_price_frame(length=252)
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            result = backtester.run_walk_forward("AAPL-TC-DEFAULT", data, evaluate_lightgbm=False)
+
+        self.assertNotIn("transaction_cost_evaluation", result)
+
+    @unittest.skipUnless(backtester.SKLEARN_AVAILABLE, "scikit-learn not installed")
+    def test_reports_trend_and_buy_and_hold_summaries_with_an_uptrend(self):
+        data = _realistic_price_frame(length=252)
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            result = backtester.run_walk_forward(
+                "AAPL-TC-TREND",
+                data,
+                evaluate_lightgbm=False,
+                evaluate_transaction_cost_aware=True,
+                transaction_cost_bps=10.0,
+            )
+
+        evaluation = result["transaction_cost_evaluation"]
+        self.assertEqual(evaluation["transaction_cost_bps"], 10.0)
+        # A clear uptrend should make the log-linear trend model predict a
+        # positive terminal return on every window, i.e. always trade.
+        self.assertEqual(evaluation["trend"]["trade_rate"], 1.0)
+        self.assertIsNotNone(evaluation["trend"]["net_return_mean"])
+        self.assertIsNotNone(evaluation["trend"]["hit_rate"])
+        # Buy-and-hold always trades by construction.
+        self.assertEqual(evaluation["buy_and_hold"]["trade_rate"], 1.0)
+        self.assertGreater(evaluation["buy_and_hold"]["n_windows"], 0)
+        # ARIMA/LightGBM are disabled in this fixture, so they report the
+        # empty-input summary shape rather than being omitted.
+        self.assertEqual(evaluation["arima"]["n_windows"], 0)
+        self.assertEqual(evaluation["lightgbm"]["n_windows"], 0)
+
+    def test_higher_transaction_cost_reduces_net_return_for_same_trades(self):
+        data = _realistic_price_frame(length=252)
+
+        with (
+            patch("modules.backtester.ARIMA_AVAILABLE", False),
+            patch("modules.backtester.LIGHTGBM_AVAILABLE", False),
+        ):
+            low_cost = backtester.run_walk_forward(
+                "AAPL-TC-LOWCOST",
+                data,
+                evaluate_lightgbm=False,
+                evaluate_transaction_cost_aware=True,
+                transaction_cost_bps=1.0,
+            )
+            high_cost = backtester.run_walk_forward(
+                "AAPL-TC-HIGHCOST",
+                data,
+                evaluate_lightgbm=False,
+                evaluate_transaction_cost_aware=True,
+                transaction_cost_bps=200.0,
+            )
+
+        low_net = low_cost["transaction_cost_evaluation"]["buy_and_hold"]["net_return_mean"]
+        high_net = high_cost["transaction_cost_evaluation"]["buy_and_hold"]["net_return_mean"]
+        self.assertIsNotNone(low_net)
+        self.assertIsNotNone(high_net)
+        self.assertGreater(low_net, high_net)
+
+
 class BacktestComparisonSummaryTests(unittest.TestCase):
     def test_summarize_backtest_results(self):
         rows = [
@@ -811,6 +926,109 @@ class BacktestComparisonSummaryTests(unittest.TestCase):
         tests_by_pair = {(test["model_a"], test["model_b"]) for test in summary["significance_tests"]}
         self.assertIn(("lightgbm", "arima"), tests_by_pair)
         self.assertIn(("lightgbm", "trend"), tests_by_pair)
+
+    def test_summarize_backtest_results_omits_transaction_cost_evaluation_when_absent(self):
+        rows = [{"ticker": "AAA", "arima_rmse": 1.0, "trend_rmse": 1.0, "lightgbm_rmse": 1.0, "n_windows": 1}]
+        summary = summarize_backtest_results(rows)
+        self.assertNotIn("transaction_cost_evaluation", summary)
+
+    def test_summarize_backtest_results_pools_transaction_cost_evaluation_across_tickers(self):
+        rows = [
+            {
+                "ticker": "AAA",
+                "arima_rmse": 1.0,
+                "trend_rmse": 1.0,
+                "lightgbm_rmse": 1.0,
+                "transaction_cost_evaluation": {
+                    "transaction_cost_bps": 10.0,
+                    "trend": {"n_windows": 4, "trade_rate": 1.0, "net_return_mean": 0.02, "hit_rate": 1.0},
+                    "buy_and_hold": {"n_windows": 4, "trade_rate": 1.0, "net_return_mean": 0.02, "hit_rate": 1.0},
+                    "arima": {"n_windows": 0, "trade_rate": None, "net_return_mean": None, "hit_rate": None},
+                    "lightgbm": {"n_windows": 0, "trade_rate": None, "net_return_mean": None, "hit_rate": None},
+                },
+            },
+            {
+                "ticker": "BBB",
+                "arima_rmse": 1.0,
+                "trend_rmse": 1.0,
+                "lightgbm_rmse": 1.0,
+                "transaction_cost_evaluation": {
+                    "transaction_cost_bps": 10.0,
+                    "trend": {"n_windows": 2, "trade_rate": 0.5, "net_return_mean": -0.01, "hit_rate": 0.0},
+                    "buy_and_hold": {"n_windows": 2, "trade_rate": 1.0, "net_return_mean": -0.005, "hit_rate": 0.5},
+                    "arima": {"n_windows": 0, "trade_rate": None, "net_return_mean": None, "hit_rate": None},
+                    "lightgbm": {"n_windows": 0, "trade_rate": None, "net_return_mean": None, "hit_rate": None},
+                },
+            },
+        ]
+        summary = summarize_backtest_results(rows)
+        evaluation = summary["transaction_cost_evaluation"]
+        self.assertEqual(evaluation["transaction_cost_bps"], 10.0)
+        trend = evaluation["models"]["trend"]
+        self.assertEqual(trend["windows_evaluated"], 6)
+        # Window-count-weighted mean: (0.02*4 + -0.01*2) / 6
+        self.assertAlmostEqual(trend["net_return_mean"], (0.02 * 4 + -0.01 * 2) / 6, places=6)
+        self.assertIsNone(evaluation["models"]["arima"])
+        self.assertIsNone(evaluation["models"]["lightgbm"])
+        self.assertIsNotNone(evaluation["models"]["buy_and_hold"])
+
+    def test_format_comparison_summary_omits_transaction_cost_section_when_absent(self):
+        rows = [{"ticker": "AAA", "arima_rmse": 1.0, "trend_rmse": 1.0, "lightgbm_rmse": 1.0, "n_windows": 1}]
+        summary = summarize_backtest_results(rows)
+        rendered = format_comparison_summary(summary)
+        self.assertNotIn("Transaction-cost-aware", rendered)
+
+    def test_format_comparison_summary_renders_transaction_cost_section_when_present(self):
+        rows = [
+            {
+                "ticker": "AAA",
+                "arima_rmse": 1.0,
+                "trend_rmse": 1.0,
+                "lightgbm_rmse": 1.0,
+                "transaction_cost_evaluation": {
+                    "transaction_cost_bps": 10.0,
+                    "trend": {"n_windows": 4, "trade_rate": 1.0, "net_return_mean": 0.02, "hit_rate": 1.0},
+                    "buy_and_hold": {"n_windows": 4, "trade_rate": 1.0, "net_return_mean": 0.02, "hit_rate": 1.0},
+                    "arima": {"n_windows": 0, "trade_rate": None, "net_return_mean": None, "hit_rate": None},
+                    "lightgbm": {"n_windows": 0, "trade_rate": None, "net_return_mean": None, "hit_rate": None},
+                },
+            }
+        ]
+        summary = summarize_backtest_results(rows)
+        rendered = format_comparison_summary(summary)
+        self.assertIn("Transaction-cost-aware", rendered)
+        self.assertIn("10.0bps", rendered)
+        self.assertIn("trend", rendered)
+        self.assertIn("buy_and_hold", rendered)
+        self.assertIn("n/a", rendered)  # arima/lightgbm had no trades
+
+
+class ComparisonCliTransactionCostFlagTests(unittest.TestCase):
+    def test_build_parser_defaults_transaction_cost_flags_off(self):
+        import sys
+        from pathlib import Path
+
+        scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from compare_lightgbm_backtest import build_parser
+
+        args = build_parser().parse_args([])
+        self.assertFalse(args.transaction_cost_aware)
+        self.assertEqual(args.transaction_cost_bps, 10.0)
+
+    def test_build_parser_parses_transaction_cost_flags(self):
+        import sys
+        from pathlib import Path
+
+        scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from compare_lightgbm_backtest import build_parser
+
+        args = build_parser().parse_args(["--transaction-cost-aware", "--transaction-cost-bps", "25"])
+        self.assertTrue(args.transaction_cost_aware)
+        self.assertEqual(args.transaction_cost_bps, 25.0)
 
 
 class DieboldMarianoTests(unittest.TestCase):

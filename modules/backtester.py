@@ -63,6 +63,43 @@ def _path_rmse(actual: np.ndarray, pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((actual_returns - pred_returns) ** 2)))
 
 
+def _transaction_cost_signal_and_return(
+    predicted_return: float,
+    realized_return: float,
+    transaction_cost_bps: float,
+) -> tuple[int, float]:
+    """Simulate one window of a simple long-only, long-or-flat trading rule:
+    go long if the model's predicted terminal return is positive, otherwise
+    stay flat (no trade, no return, no cost). Returns ``(signal, net_return)``
+    where ``signal`` is 1 (long) or 0 (flat) and ``net_return`` is the
+    realized terminal return minus a round-trip transaction cost, charged
+    only on windows where a trade is actually taken.
+    """
+    if predicted_return <= 0:
+        return 0, 0.0
+    cost = float(transaction_cost_bps) / 10_000.0
+    return 1, float(realized_return - cost)
+
+
+def _summarize_transaction_cost_windows(signals: list[int], net_returns: list[float]) -> dict:
+    """Aggregate a model's per-window (signal, net_return) pairs from
+    _transaction_cost_signal_and_return into summary statistics: how often
+    the rule traded (trade_rate), the mean net-of-cost return per window
+    across the whole evaluation period including flat windows
+    (net_return_mean), and, among windows where a trade was actually taken,
+    the fraction that were profitable net of cost (hit_rate).
+    """
+    if not net_returns:
+        return {"n_windows": 0, "trade_rate": None, "net_return_mean": None, "hit_rate": None}
+    trade_returns = [net for signal, net in zip(signals, net_returns, strict=True) if signal == 1]
+    return {
+        "n_windows": int(len(net_returns)),
+        "trade_rate": round(float(np.mean(signals)), 6),
+        "net_return_mean": round(float(np.mean(net_returns)), 6),
+        "hit_rate": (round(float(np.mean([1.0 if net > 0 else 0.0 for net in trade_returns])), 6) if trade_returns else None),
+    }
+
+
 # Keep synchronized with rolling/min_period windows in modules.feature_engineering._technical_features.
 _LIGHTGBM_FEATURE_WARMUP_DAYS = max((10, 30, 12, 26, 14, 20))
 DEFAULT_WALK_FORWARD_HORIZON = 30
@@ -162,6 +199,8 @@ def run_walk_forward(
     lightgbm_diagnostics: bool = False,
     evaluate_arima: bool = True,
     evaluate_path_rmse: bool = False,
+    evaluate_transaction_cost_aware: bool = False,
+    transaction_cost_bps: float = 10.0,
 ) -> dict:
     """Walk-forward RMSE comparison across ARIMA/trend/LightGBM (and optionally
     a naive baseline) for a single ticker/horizon.
@@ -178,6 +217,20 @@ def run_walk_forward(
     terminal-point accuracy" limitation below with a real supplementary
     metric rather than leaving it purely documented.
 
+    ``evaluate_transaction_cost_aware`` (opt-in) additionally simulates, per
+    model and per window, a simple long-or-flat trading rule (go long if the
+    model's predicted terminal return is positive, else stay flat) with a
+    configurable round-trip ``transaction_cost_bps`` cost charged only on
+    windows that actually trade, plus a buy-and-hold baseline that always
+    trades. This directly addresses the "no transaction costs or slippage"
+    limitation below with a real net-of-cost evaluation layer (see
+    ``_transaction_cost_signal_and_return``/``_summarize_transaction_cost_windows``)
+    rather than leaving it purely documented. Results land in
+    ``result["transaction_cost_evaluation"]`` as
+    ``{"transaction_cost_bps", "arima", "trend", "lightgbm", "buy_and_hold"}``,
+    each of the model entries a ``{"n_windows", "trade_rate", "net_return_mean",
+    "hit_rate"}`` summary.
+
     KNOWN LIMITATIONS (documented, not yet addressed):
 
     - **RMSE-metric geometry favors terminal-point accuracy.** Every model's
@@ -189,11 +242,10 @@ def run_walk_forward(
       one model's win rate on its own. Pass ``evaluate_path_rmse=True`` for a
       supplementary path-level metric (not just terminal-return RMSE) that
       gives a fuller comparison.
-    - **No transaction costs or slippage.** These RMSE comparisons measure
-      price-forecast accuracy only, not net-of-cost tradeable returns. A
-      model "beating" another on RMSE here is directional-accuracy evidence,
-      not proof of profitability after costs; a P&L-style, cost-aware
-      evaluation would be a separate, additional validation layer.
+    - **RMSE alone doesn't capture tradeable profitability net of costs.**
+      Pass ``evaluate_transaction_cost_aware=True`` for a simple long/flat,
+      cost-aware net-return evaluation layered on top of (not replacing) the
+      RMSE comparison above.
     """
     default = {
         "arima_rmse": 1.0,
@@ -213,6 +265,8 @@ def run_walk_forward(
         default["naive_windows"] = 0
     if lightgbm_diagnostics:
         default["lightgbm_diagnostics"] = {"per_window": [], "prediction_stats": None}
+    if evaluate_transaction_cost_aware:
+        default["transaction_cost_evaluation"] = None
     try:
         config = get_walk_forward_window_config(horizon)
         minimum_required_rows = max(120, int(config.train_len + config.test_len))
@@ -234,6 +288,14 @@ def run_walk_forward(
         trend_path_errors: list[float] = []
         lightgbm_path_errors: list[float] = []
         lightgbm_diagnostic_rows: list[dict[str, float | int]] = []
+        arima_tc_signals: list[int] = []
+        arima_tc_net_returns: list[float] = []
+        trend_tc_signals: list[int] = []
+        trend_tc_net_returns: list[float] = []
+        lightgbm_tc_signals: list[int] = []
+        lightgbm_tc_net_returns: list[float] = []
+        buy_and_hold_tc_signals: list[int] = []
+        buy_and_hold_tc_net_returns: list[float] = []
         lightgbm_horizon = int(config.horizon)
 
         # Select the ARIMA (p,d,q) order once per horizon from the earliest
@@ -268,6 +330,15 @@ def run_walk_forward(
 
             test_vals = test.values.astype(float)
 
+            if evaluate_transaction_cost_aware:
+                entry_price = float(train.iloc[-1])
+                if entry_price > 0:
+                    buy_and_hold_realized_return = (float(test_vals[-1]) / entry_price) - 1.0
+                    buy_and_hold_tc_signals.append(1)
+                    buy_and_hold_tc_net_returns.append(
+                        float(buy_and_hold_realized_return - (float(transaction_cost_bps) / 10_000.0))
+                    )
+
             if evaluate_arima and ARIMA_AVAILABLE:
                 try:
                     order = shared_arima_order if shared_arima_order is not None else _select_arima_order(train)
@@ -276,6 +347,16 @@ def run_walk_forward(
                     arima_errors.append(_rmse(test_vals, pred_arr))
                     if evaluate_path_rmse:
                         arima_path_errors.append(_path_rmse(test_vals, pred_arr))
+                    if evaluate_transaction_cost_aware:
+                        entry_price = float(train.iloc[-1])
+                        if entry_price > 0:
+                            predicted_return = (float(pred_arr[-1]) / entry_price) - 1.0
+                            realized_return = (float(test_vals[-1]) / entry_price) - 1.0
+                            signal, net_return = _transaction_cost_signal_and_return(
+                                predicted_return, realized_return, transaction_cost_bps
+                            )
+                            arima_tc_signals.append(signal)
+                            arima_tc_net_returns.append(net_return)
                 except Exception as exc:
                     logger.warning(
                         "ARIMA backtest window failed for %s at start=%d: %s: %s",
@@ -295,6 +376,16 @@ def run_walk_forward(
                     trend_errors.append(_rmse(test_vals, pred))
                     if evaluate_path_rmse:
                         trend_path_errors.append(_path_rmse(test_vals, pred))
+                    if evaluate_transaction_cost_aware:
+                        entry_price = float(train.iloc[-1])
+                        if entry_price > 0:
+                            predicted_return = (float(pred[-1]) / entry_price) - 1.0
+                            realized_return = (float(test_vals[-1]) / entry_price) - 1.0
+                            signal, net_return = _transaction_cost_signal_and_return(
+                                predicted_return, realized_return, transaction_cost_bps
+                            )
+                            trend_tc_signals.append(signal)
+                            trend_tc_net_returns.append(net_return)
                 except Exception:
                     pass
 
@@ -427,6 +518,12 @@ def run_walk_forward(
                     lightgbm_errors.append(_rmse(test_vals, pred_path.astype(float)))
                     if evaluate_path_rmse:
                         lightgbm_path_errors.append(_path_rmse(test_vals, pred_path.astype(float)))
+                    if evaluate_transaction_cost_aware:
+                        signal, net_return = _transaction_cost_signal_and_return(
+                            float(predicted_return), float(realized_return), transaction_cost_bps
+                        )
+                        lightgbm_tc_signals.append(signal)
+                        lightgbm_tc_net_returns.append(net_return)
                 except Exception as exc:
                     logger.warning(
                         "LightGBM backtest window failed for %s at start=%d horizon=%sd: %s: %s",
@@ -473,6 +570,14 @@ def run_walk_forward(
             result["lightgbm_diagnostics"] = {
                 "per_window": lightgbm_diagnostic_rows,
                 "prediction_stats": prediction_stats,
+            }
+        if evaluate_transaction_cost_aware:
+            result["transaction_cost_evaluation"] = {
+                "transaction_cost_bps": float(transaction_cost_bps),
+                "arima": _summarize_transaction_cost_windows(arima_tc_signals, arima_tc_net_returns),
+                "trend": _summarize_transaction_cost_windows(trend_tc_signals, trend_tc_net_returns),
+                "lightgbm": _summarize_transaction_cost_windows(lightgbm_tc_signals, lightgbm_tc_net_returns),
+                "buy_and_hold": _summarize_transaction_cost_windows(buy_and_hold_tc_signals, buy_and_hold_tc_net_returns),
             }
         logger.info("Walk-forward backtest complete for %s: %s", ticker.upper(), result)
         return result

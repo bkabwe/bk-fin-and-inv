@@ -265,13 +265,22 @@ rather than guesswork:
   `significance_tests` list (LightGBM vs. ARIMA/Trend/naive) and
   `format_comparison_summary()` prints it. Needs at least 2 tickers with
   overlapping coverage to estimate variance.
-- **No transaction costs or slippage in backtest RMSE**: backtests measure
-  price-forecast RMSE, not net-of-cost tradeable returns. Treat backtest wins
-  as directional-accuracy evidence only, not proof of after-cost
-  profitability. A proper fix is a distinct, larger-scope evaluation
-  framework (simulating net-of-cost tradeable returns from a trading rule),
-  not a tweak to the existing RMSE comparison, so it remains a documented
-  gap rather than a quick change.
+- **Transaction-cost-aware backtest evaluation is opt-in**: the default
+  backtest RMSE comparison still measures price-forecast error, not net-of-cost
+  tradeable returns. `run_walk_forward(..., evaluate_transaction_cost_aware=True,
+  transaction_cost_bps=10.0)` additionally simulates a simple long/flat trading
+  rule per model (trade when the model's predicted return is positive, apply a
+  round-trip cost in basis points on each trade) alongside a buy-and-hold
+  baseline, reporting `trade_rate`/`net_return_mean`/`hit_rate` per model.
+  `modules.backtest_comparison.run_lightgbm_backtest_comparison()` and
+  `summarize_backtest_results()` pool these per-ticker summaries
+  (window-count-weighted, with `hit_rate` weighted by trade count), and
+  `scripts/compare_lightgbm_backtest.py --transaction-cost-aware
+  --transaction-cost-bps 10` prints the pooled result. This remains a
+  simplified long/flat simulation (no position sizing, shorting, or realistic
+  slippage model beyond a flat bps assumption), so treat it as a directional
+  sanity check on after-cost viability rather than a full trading-strategy
+  backtest.
 - **LightGBM hyperparameters (`n_estimators=250, learning_rate=0.05,
   num_leaves=31`) are fixed, not tuned**: a proper sweep is constrained by
   the same small training windows noted above (as few as ~30 embargoed rows

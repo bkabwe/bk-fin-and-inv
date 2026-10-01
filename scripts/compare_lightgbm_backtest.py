@@ -74,6 +74,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--transaction-cost-aware",
+        action="store_true",
+        help=(
+            "Also simulate a simple long/flat trading rule per model with a round-trip transaction cost "
+            "(see --transaction-cost-bps), reporting net-of-cost return/trade-rate/hit-rate plus a "
+            "buy-and-hold baseline, directly addressing the 'no transaction costs or slippage' RMSE limitation"
+        ),
+    )
+    parser.add_argument(
+        "--transaction-cost-bps",
+        type=float,
+        default=10.0,
+        help="Round-trip transaction cost in basis points applied to each simulated trade (default: 10.0)",
+    )
+    parser.add_argument(
         "--record-experiment",
         type=str,
         default=None,
@@ -112,6 +127,8 @@ def main() -> None:
         evaluate_naive_baseline=True,
         lightgbm_diagnostics=True,
         evaluate_path_rmse=bool(args.path_rmse),
+        evaluate_transaction_cost_aware=bool(args.transaction_cost_aware),
+        transaction_cost_bps=float(args.transaction_cost_bps),
     )
     config = output["window_config"]
     print(
@@ -141,6 +158,8 @@ def main() -> None:
                 "interval": args.interval,
                 "window_config": config,
                 "evaluate_path_rmse": bool(args.path_rmse),
+                "evaluate_transaction_cost_aware": bool(args.transaction_cost_aware),
+                "transaction_cost_bps": float(args.transaction_cost_bps),
             },
             metrics=output["summary"],
             sample_tickers=output["sample_tickers"],
