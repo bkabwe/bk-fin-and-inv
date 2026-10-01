@@ -73,6 +73,50 @@ class PolygonClientTests(unittest.TestCase):
 
         self.assertEqual([row["ticker"] for row in tickers], ["PINKX"])
 
+    def test_get_grouped_daily_bars_maps_ticker_to_close_and_volume(self):
+        payload = {
+            "results": [
+                {"T": "AAPL", "c": 150.0, "v": 50_000_000},
+                {"T": "ZZZZ", "c": 1.0, "v": 500},
+            ]
+        }
+
+        with patch("modules.polygon_client._request_json", return_value=payload) as request_mock:
+            bars = polygon_client.get_grouped_daily_bars("2024-01-05")
+
+        called_path = request_mock.call_args.args[0]
+        self.assertIn("/v2/aggs/grouped/locale/us/market/stocks/2024-01-05", called_path)
+        self.assertEqual(bars["AAPL"], {"close": 150.0, "volume": 50_000_000.0})
+        self.assertEqual(bars["ZZZZ"], {"close": 1.0, "volume": 500.0})
+
+    def test_get_grouped_daily_bars_returns_empty_dict_for_no_results(self):
+        with patch("modules.polygon_client._request_json", return_value={"results": []}):
+            bars = polygon_client.get_grouped_daily_bars("2024-01-06")
+
+        self.assertEqual(bars, {})
+
+    def test_get_latest_grouped_daily_bars_walks_back_to_first_non_empty_day(self):
+        call_count = {"n": 0}
+
+        def _fake_grouped(trading_date: str):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                return {}
+            return {"AAPL": {"close": 150.0, "volume": 1000.0}}
+
+        with patch("modules.polygon_client.get_grouped_daily_bars", side_effect=_fake_grouped):
+            bars = polygon_client.get_latest_grouped_daily_bars(lookback_days=10)
+
+        self.assertEqual(bars, {"AAPL": {"close": 150.0, "volume": 1000.0}})
+        self.assertEqual(call_count["n"], 3)
+
+    def test_get_latest_grouped_daily_bars_returns_empty_after_exhausting_lookback(self):
+        with patch("modules.polygon_client.get_grouped_daily_bars", return_value={}) as grouped_mock:
+            bars = polygon_client.get_latest_grouped_daily_bars(lookback_days=3)
+
+        self.assertEqual(bars, {})
+        self.assertEqual(grouped_mock.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
