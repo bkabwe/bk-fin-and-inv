@@ -11,9 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from modules.data_fetcher import get_sp500_tickers
 from modules.logger import get_logger
-from modules import sentiment_analysis
 
 logger = get_logger(__name__)
 DATA_DIR = PROJECT_ROOT / "data"
@@ -24,6 +22,19 @@ SENTIMENT_SNAPSHOT_DIR = SNAPSHOT_DIR / "sentiment"
 
 def _today_iso() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _fetch_sp500_tickers() -> list[str]:
+    from modules.data_fetcher import get_sp500_tickers
+
+    return get_sp500_tickers()
+
+
+def _analyze_sentiment(ticker: str) -> dict[str, Any]:
+    from modules.sentiment_analysis import analyze_sentiment
+
+    result = analyze_sentiment(ticker)
+    return result if isinstance(result, dict) else {}
 
 
 def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -103,7 +114,7 @@ def _write_sentiment_snapshot(snapshot_date: str, tickers: list[str]) -> int:
     written = 0
     for ticker in tickers:
         try:
-            sentiment = sentiment_analysis.analyze_sentiment(ticker)
+            sentiment = _analyze_sentiment(ticker)
         except Exception as exc:  # pragma: no cover - exercised via unit test
             logger.warning("Sentiment snapshot failed for %s: %s", ticker, exc)
             continue
@@ -137,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     snapshot_date = _today_iso()
-    universe_tickers = get_sp500_tickers()
+    universe_tickers = _fetch_sp500_tickers()
 
     if _snapshot_exists(UNIVERSE_SNAPSHOT_FILE, snapshot_date):
         logger.info("Universe snapshot for %s already exists at %s; skipping.", snapshot_date, UNIVERSE_SNAPSHOT_FILE)

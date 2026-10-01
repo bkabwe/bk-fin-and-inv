@@ -45,7 +45,7 @@ class SnapshotUniverseTests(unittest.TestCase):
     def test_first_run_creates_daily_universe_snapshot(self):
         with (
             patch.object(snapshot_universe, "_today_iso", return_value="2026-10-01"),
-            patch.object(snapshot_universe, "get_sp500_tickers", return_value=["AAPL", "MSFT"]),
+            patch.object(snapshot_universe, "_fetch_sp500_tickers", return_value=["AAPL", "MSFT"]),
         ):
             exit_code = snapshot_universe.main([])
 
@@ -64,7 +64,7 @@ class SnapshotUniverseTests(unittest.TestCase):
     def test_second_run_same_day_does_not_duplicate_snapshot(self):
         with (
             patch.object(snapshot_universe, "_today_iso", return_value="2026-10-01"),
-            patch.object(snapshot_universe, "get_sp500_tickers", return_value=["AAPL", "MSFT"]),
+            patch.object(snapshot_universe, "_fetch_sp500_tickers", return_value=["AAPL", "MSFT"]),
         ):
             first_exit_code = snapshot_universe.main([])
             second_exit_code = snapshot_universe.main([])
@@ -97,12 +97,8 @@ class SnapshotUniverseTests(unittest.TestCase):
 
         with (
             patch.object(snapshot_universe, "_today_iso", return_value="2026-10-01"),
-            patch.object(snapshot_universe, "get_sp500_tickers", return_value=["AAPL", "MSFT"]),
-            patch.object(
-                snapshot_universe.sentiment_analysis,
-                "analyze_sentiment",
-                side_effect=lambda ticker: sentiment_payloads[ticker],
-            ),
+            patch.object(snapshot_universe, "_fetch_sp500_tickers", return_value=["AAPL", "MSFT"]),
+            patch.object(snapshot_universe, "_analyze_sentiment", side_effect=lambda ticker: sentiment_payloads[ticker]),
         ):
             exit_code = snapshot_universe.main(["--with-sentiment", "--tickers", "tsla", "NVDA"])
 
@@ -161,8 +157,8 @@ class SnapshotUniverseTests(unittest.TestCase):
 
         with (
             patch.object(snapshot_universe, "_today_iso", return_value="2026-10-01"),
-            patch.object(snapshot_universe, "get_sp500_tickers", return_value=["AAPL", "MSFT"]),
-            patch.object(snapshot_universe.sentiment_analysis, "analyze_sentiment", side_effect=_sentiment_side_effect),
+            patch.object(snapshot_universe, "_fetch_sp500_tickers", return_value=["AAPL", "MSFT"]),
+            patch.object(snapshot_universe, "_analyze_sentiment", side_effect=_sentiment_side_effect),
         ):
             exit_code = snapshot_universe.main(["--with-sentiment", "--tickers", "TSLA", "MSFT"])
 

@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from modules.backtester import run_walk_forward
+from modules.backtester import get_walk_forward_window_config, run_walk_forward
 from modules.data_fetcher import get_stock_data, get_stock_info
 from modules.feature_engineering import build_feature_table
 from modules.fundamental_analysis import analyze_fundamentals, classify_market_cap_tier, normalize_sector_name
@@ -77,6 +77,34 @@ LIGHTGBM_MAX_ADAPTIVE_SHARE_CAP = 0.70
 # (see modules/backtester.py); the 180d horizon (4 windows/ticker) lands
 # partway between the min and max caps.
 LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS = 6
+
+# --- Per-row projection confidence (separate from the composite 0-100 Score) ---
+#
+# The composite Score is a general attractiveness/quality signal (technical +
+# fundamental + sentiment + macro); it is mathematically independent of how
+# much a *specific* upside/target-price projection should be trusted (a
+# newly-public mega-cap can legitimately score well on Score while its upside
+# number rests on very little evidence). These constants drive a dedicated
+# 0-100 "projection confidence" computed per horizon from (a) how closely the
+# raw pre-blend ensemble components agree with each other and (b) how much
+# backtest/history evidence backs the projection -- see
+# _ensemble_agreement_score/_evidence_depth_score/_projection_confidence.
+_CONFIDENCE_AGREEMENT_CV_SCALE = 0.20  # relative stdev (coefficient of variation) at/above which agreement bottoms out at 0.0
+_CONFIDENCE_SINGLE_COMPONENT_AGREEMENT = 0.75  # neutral score when <2 components exist, so disagreement is undefined rather than measurably good/bad
+_CONFIDENCE_EVIDENCE_WEIGHT = 0.5  # 50/50 blend between ensemble agreement and evidence depth
+
+# Shrinkage applied to the raw blended projection toward current_price (the
+# same "no-change" prior modules.backtester's naive baseline already
+# compares against) in proportion to (1 - confidence/100). This is a
+# self-contained alternative to shrinking toward a cross-sectional
+# sector/market-cap-mean prior: computing a true cross-sectional mean would
+# require aggregating projections across every other ticker scanned in the
+# same run, which isn't available inside a single-ticker analyze_stock()
+# call (see README's cross-sectional-features follow-up item for that larger,
+# separately-scoped project). _SHRINKAGE_MIN_RETAINED_MOVE floors how much of
+# the raw directional move survives even at zero confidence, so shrinkage
+# only dampens reach rather than ever fully erasing direction.
+_SHRINKAGE_MIN_RETAINED_MOVE = 0.50
 
 # Fixed fundamentals-model weight budgets for the medium/long-term price
 # projection ensembles in _get_price_projections_core. These used to be
@@ -321,6 +349,103 @@ def _confidence_bounds(
         low = min(low, cap_value)
         high = min(high, cap_value)
     return round(low, 2), round(max(low, high), 2)
+
+
+def _required_history_days(horizon_days: int) -> int:
+    """Price-history rows needed for a full walk-forward train+test window at
+    `horizon_days`, reusing modules.backtester's own window configuration so
+    "how much evidence backs this projection" and "how much evidence the
+    backtester itself requires" never drift apart. Falls back to the raw
+    horizon length for unsupported horizons (defensive; every horizon this
+    module calls with is currently backed by a config)."""
+    try:
+        config = get_walk_forward_window_config(horizon_days)
+        return max(int(config.train_len) + int(config.test_len), 1)
+    except ValueError:
+        return max(int(horizon_days), 1)
+
+
+def _is_thin_history(horizon_days: int, history_days: int) -> bool:
+    """True when `history_days` of price history falls short of a complete
+    walk-forward train+test window for `horizon_days` -- e.g. a recent IPO
+    that hasn't accumulated enough daily bars yet. Used to flag/discount
+    confidence for thin-history tickers (see _evidence_depth_score) before
+    they're eligible for upside-ranked output."""
+    return int(history_days) < _required_history_days(horizon_days)
+
+
+def _ensemble_agreement_score(values: list[float], projection: float | None) -> float:
+    """0.0-1.0 score for how closely the raw (pre-blend) ensemble component
+    values agree with each other, relative to the blended projection. 1.0 =
+    tight agreement; 0.0 = component spread at/above
+    _CONFIDENCE_AGREEMENT_CV_SCALE (20%) of the projection. Returns the
+    neutral _CONFIDENCE_SINGLE_COMPONENT_AGREEMENT when fewer than two
+    components are available, since disagreement is undefined rather than
+    measurably good or bad in that case."""
+    if not values or len(values) < 2 or not projection:
+        return _CONFIDENCE_SINGLE_COMPONENT_AGREEMENT
+    arr = np.array([float(v) for v in values], dtype=float)
+    coefficient_of_variation = float(np.std(arr)) / abs(float(projection))
+    return max(0.0, 1.0 - min(coefficient_of_variation / _CONFIDENCE_AGREEMENT_CV_SCALE, 1.0))
+
+
+def _evidence_depth_score(
+    horizon_days: int,
+    history_days: int,
+    lightgbm_windows: int | None,
+    *,
+    includes_lightgbm: bool,
+) -> float:
+    """0.0-1.0 score for how much walk-forward/backtest evidence backs this
+    horizon's projection -- independent of whether the raw ensemble
+    components happen to agree with each other. Combines price-history depth
+    relative to this horizon's own walk-forward train+test window (so a
+    thin-history ticker scores low here even if its few available models
+    happen to agree) with LightGBM backtest window replication depth when
+    LightGBM contributes to this horizon's ensemble."""
+    required_history = _required_history_days(horizon_days)
+    history_ratio = max(0.0, min(1.0, float(history_days) / float(required_history)))
+    if not includes_lightgbm:
+        return history_ratio
+    window_ratio = min(1.0, max(int(lightgbm_windows or 0), 0) / float(LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS))
+    return 0.5 * history_ratio + 0.5 * window_ratio
+
+
+def _projection_confidence(
+    values: list[float],
+    projection: float | None,
+    *,
+    horizon_days: int,
+    history_days: int,
+    lightgbm_windows: int | None,
+    includes_lightgbm: bool,
+) -> int:
+    """0-100 confidence score for a single horizon's blended price
+    projection -- how much to trust *this specific* upside number, as
+    opposed to the composite 0-100 Score (general attractiveness/quality,
+    mathematically independent of forecast confidence). Blends
+    _ensemble_agreement_score and _evidence_depth_score 50/50. Returns 0 when
+    there is no own blended projection for this horizon (nothing to measure
+    confidence in)."""
+    if projection is None:
+        return 0
+    agreement = _ensemble_agreement_score(values, projection)
+    evidence = _evidence_depth_score(horizon_days, history_days, lightgbm_windows, includes_lightgbm=includes_lightgbm)
+    blended = (1.0 - _CONFIDENCE_EVIDENCE_WEIGHT) * agreement + _CONFIDENCE_EVIDENCE_WEIGHT * evidence
+    return int(round(max(0.0, min(1.0, blended)) * 100))
+
+
+def _apply_confidence_shrinkage(projection: float, current_price: float, confidence: int) -> float:
+    """Shrink `projection` toward current_price (the no-change baseline) in
+    proportion to (1 - confidence/100), retaining at least
+    _SHRINKAGE_MIN_RETAINED_MOVE of the raw directional move even at zero
+    confidence. Low-confidence extreme point estimates (e.g. a thin-history
+    ticker with disagreeing models) get pulled toward "no change" rather than
+    passed straight through at full magnitude; high-confidence projections
+    pass through essentially unchanged."""
+    confidence_fraction = max(0.0, min(1.0, confidence / 100.0))
+    retained_fraction = _SHRINKAGE_MIN_RETAINED_MOVE + (1.0 - _SHRINKAGE_MIN_RETAINED_MOVE) * confidence_fraction
+    return current_price + (projection - current_price) * retained_fraction
 
 
 def _cap_target(value: float, current_price: float, cap_value: float | None) -> float:
@@ -676,6 +801,12 @@ def _get_price_projections_core(
             "data_quality": "Limited",
             "short_term_lightgbm_backtested": False,
             "medium_term_lightgbm_backtested": False,
+            "short_term_confidence": 0,
+            "medium_term_confidence": 0,
+            "long_term_confidence": 0,
+            "short_term_thin_history": True,
+            "medium_term_thin_history": True,
+            "long_term_thin_history": True,
         }
 
     models_used: list[str] = []
@@ -871,6 +1002,44 @@ def _get_price_projections_core(
         ]
     )
 
+    # Per-horizon projection confidence (0-100): how much to trust *this
+    # specific* upside number, separate from the composite Score. Computed
+    # from the raw pre-blend ensemble values/projection above (before
+    # shrinkage/capping touch the final point estimate), then used to shrink
+    # the blended projection toward current_price in proportion to
+    # (1 - confidence) -- see _projection_confidence/_apply_confidence_shrinkage.
+    history_days = int(len(close)) if close is not None else 0
+    short_confidence = _projection_confidence(
+        short_values,
+        short_projection,
+        horizon_days=30,
+        history_days=history_days,
+        lightgbm_windows=(backtest or {}).get("lightgbm_windows"),
+        includes_lightgbm=30 in lightgbm_projections,
+    )
+    medium_confidence = _projection_confidence(
+        medium_values,
+        medium_projection,
+        horizon_days=180,
+        history_days=history_days,
+        lightgbm_windows=(medium_backtest or {}).get("lightgbm_windows"),
+        includes_lightgbm=180 in lightgbm_projections,
+    )
+    long_confidence = _projection_confidence(
+        long_values,
+        long_projection,
+        horizon_days=720,
+        history_days=history_days,
+        lightgbm_windows=None,
+        includes_lightgbm=False,
+    )
+    if short_projection is not None:
+        short_projection = _apply_confidence_shrinkage(short_projection, current_price, short_confidence)
+    if medium_projection is not None:
+        medium_projection = _apply_confidence_shrinkage(medium_projection, current_price, medium_confidence)
+    if long_projection is not None:
+        long_projection = _apply_confidence_shrinkage(long_projection, current_price, long_confidence)
+
     short_projection = _cap_target(short_projection or current_price, current_price, cap_value)
     medium_projection = _cap_target(medium_projection or short_projection, current_price, cap_value)
     long_projection = _cap_target(long_projection or medium_projection, current_price, cap_value)
@@ -1008,6 +1177,18 @@ def _get_price_projections_core(
         "data_quality": data_quality,
         "short_term_lightgbm_backtested": short_term_lightgbm_backtested,
         "medium_term_lightgbm_backtested": medium_term_lightgbm_backtested,
+        # Per-horizon projection confidence (0-100): how much to trust *this*
+        # upside number, not the composite Score -- see _projection_confidence.
+        "short_term_confidence": short_confidence,
+        "medium_term_confidence": medium_confidence,
+        "long_term_confidence": long_confidence,
+        # Thin-history flags: True when price history falls short of a full
+        # walk-forward train+test window for that horizon (e.g. a recent
+        # IPO). Consumers that rank by upside should discount or exclude
+        # these rows -- see _is_thin_history.
+        "short_term_thin_history": _is_thin_history(30, history_days),
+        "medium_term_thin_history": _is_thin_history(180, history_days),
+        "long_term_thin_history": _is_thin_history(720, history_days),
     }
 
 
