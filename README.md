@@ -246,12 +246,47 @@ rather than guesswork:
   walk-forward comparison converts every model's forecast into a smooth
   geometric curve toward one terminal-return guess before computing RMSE,
   which structurally advantages models optimized directly for terminal
-  return (like LightGBM) over general-purpose extrapolators (ARIMA/trend). A
-  supplementary path-level metric would give a fuller comparison.
+  return (like LightGBM) over general-purpose extrapolators (ARIMA/trend).
+  `run_walk_forward(..., evaluate_path_rmse=True)` now adds a supplementary
+  **path-level RMSE** (`arima_path_rmse`/`trend_path_rmse`/
+  `lightgbm_path_rmse`) that compares day-over-day log returns instead of
+  price levels, directly penalizing LightGBM's artificially smooth
+  interpolated path against the noisier real walk — see `_path_rmse()` in
+  `modules/backtester.py`. It is opt-in (off by default) since it adds
+  per-window computation; `scripts/compare_lightgbm_backtest.py --path-rmse`
+  enables it from the CLI.
+- **Window counts are small — raw RMSE deltas aren't statistical proof**:
+  per-ticker walk-forward window counts can be as low as 1-4, too few to
+  trust a raw "LightGBM RMSE is lower" claim as evidence of real skill
+  rather than noise. `modules.backtest_comparison.diebold_mariano_test()`
+  now pools one (RMSE² difference) observation per ticker across the
+  comparison and runs a paired t-test against zero, reporting a p-value and
+  significance flag; `summarize_backtest_results()` includes a
+  `significance_tests` list (LightGBM vs. ARIMA/Trend/naive) and
+  `format_comparison_summary()` prints it. Needs at least 2 tickers with
+  overlapping coverage to estimate variance.
 - **No transaction costs or slippage in backtest RMSE**: backtests measure
   price-forecast RMSE, not net-of-cost tradeable returns. Treat backtest wins
   as directional-accuracy evidence only, not proof of after-cost
   profitability.
+- **Long-horizon projections do not account for dividends**: price history
+  from Polygon is split-adjusted but **not** dividend-adjusted (see "Data
+  Sources" below), so projected upside for dividend-paying names is a pure
+  price-return estimate. This caveat compounds at longer horizons — a 720d
+  projection accumulates roughly 2 years of foregone/ignored dividend
+  compounding, whereas a 30d projection barely feels it. No total-return
+  adjustment is applied; treat long-horizon upside numbers for
+  high-dividend-yield names as a price-only lower bound on total return.
+- **No earnings-date/event-risk awareness**: forecasts do not flag or
+  discount confidence for tickers with an earnings release inside the
+  projection horizon, even though earnings prints are a major source of
+  short-horizon price-path discontinuity that a smooth technical/LightGBM
+  projection cannot anticipate. This is a known gap rather than an
+  oversight: Polygon's earnings-calendar endpoint
+  (`/vX/reference/earnings`) requires an Advanced-tier subscription, one
+  level above the Starter plan this app is built against (see "Optional
+  environment variables" above), so this remains blocked on a data-source
+  upgrade rather than an engineering task.
 
 ## Testing & CI
 
@@ -632,6 +667,83 @@ later without ad-hoc notes or copy/paste.
 `(run_name, horizon)` pair. Unlike `data/predictions.json`, this database is
 intentionally local/derived developer state for iterative experimentation, so
 it is gitignored rather than committed back by CI.
+
+### Per-horizon projection confidence, shrinkage, and thin-history flags
+
+Each of the short/medium/long-term price projections now carries its own
+0-100 **projection confidence** (`short_term_confidence`,
+`medium_term_confidence`, `long_term_confidence` in
+`modules/scoring_engine.py`), computed from ensemble model agreement/
+dispersion and backtest-window evidence depth — deliberately kept separate
+from the composite 0-100 `Score`, since a stock can score well on
+fundamentals/technicals while its *projection* for a given horizon is
+backed by thin evidence (e.g. a recent IPO, or a horizon with only 1-2
+backtest windows).
+
+That confidence number does two things:
+
+- **Shrinkage**: `_apply_confidence_shrinkage()` pulls each horizon's point
+  projection back toward the current price in proportion to
+  `(1 - confidence/100)`, so a low-confidence extreme forecast (large
+  magnitude, thin evidence) is damped rather than passed through at full
+  size, while a high-confidence forecast is left mostly intact. This is
+  separate from (and on top of) the existing GARCH/market-cap confidence
+  **band**-widening, which affects the displayed range, not the point
+  estimate itself.
+- **Thin-history flag**: `_is_thin_history(horizon_days, history_days)`
+  marks `short_term_thin_history`/`medium_term_thin_history`/
+  `long_term_thin_history` as `True` when available price history is too
+  short relative to the horizon to trust that horizon's projection at all.
+
+### Risk-adjusted upside and diversification cap
+
+The Profit Opportunities scan (`modules/profit_opportunities.py`) now
+surfaces a **Confidence Score** column (the relevant horizon's projection
+confidence above) and a **Risk-Adjusted Upside** column
+(`projected upside % ÷ confidence-band width %`, floored at a minimum band
+width to avoid dividing by a near-zero band), rewarding upside that comes
+with a tight projection range over the same upside wrapped in a wide one.
+Both the scheduled scan report (`scripts/scan_email_report.py`) and
+`modules/screener.py` also now carry a **Sector** field used by a new
+`_apply_diversification_cap()` (max `DEFAULT_MAX_PER_SECTOR = 15` per
+sector) applied to every ranked cut, and `_exclude_thin_history()` drops
+thin-history rows from the qualifying pool before ranking. The scheduled
+report is now split into **three** top-75 rankings over the same qualifying
+pool: by projected upside, by overall score, and by risk-adjusted upside —
+not just the original "by upside"/"by score" pair.
+
+### Upside-forecast validation (beyond the composite Score)
+
+`compute_score_validation_stats()` in `modules/prediction_tracker.py` only
+ever tested the composite 0-100 `Score`'s rank-ordering power against
+realized outcomes. The new `compute_upside_validation_stats()` instead
+tests the raw `projected_upside_pct` forecast number itself against
+`actual_return_pct` once predictions resolve — reporting an information
+coefficient (Pearson correlation between projected and realized return),
+mean/median bias (a large negative gap flags systematic over-optimism in
+large upside projections), and an over-optimism rate. `scripts/
+grading_report.py` now surfaces this alongside the existing score
+validation stats.
+
+### Liquidity/tradability filter for scan universes
+
+`get_sp500_tickers()`, `get_nasdaq_tickers()`, `get_nyseamerican_tickers()`,
+and `get_otc_tickers()` in `modules/data_fetcher.py` previously had no
+liquidity floor, so thinly-traded names with little realistic tradability
+could enter the scan universe. `filter_tickers_by_liquidity()` now drops
+tickers whose trailing average dollar volume falls below a floor
+(`DEFAULT_MIN_AVG_DOLLAR_VOLUME = $1M/day` for the major exchanges,
+`DEFAULT_MIN_AVG_DOLLAR_VOLUME_OTC = $100K/day` for OTC, since OTC names are
+structurally much lower-volume and a $1M floor would eliminate nearly the
+whole OTC universe). To avoid thousands of per-ticker API calls, the filter
+is backed by a new bulk `get_grouped_daily_bars()` / `get_latest_grouped_
+daily_bars()` pair in `modules/polygon_client.py`, which fetches close +
+volume for **every** US ticker on the latest trading day in a single
+Polygon call (`/v2/aggs/grouped/locale/us/market/stocks/{date}`), walking
+back up to 10 days to skip weekends/holidays. The filter fails open (keeps
+the unfiltered list) on any fetch error or empty response, and keeps (does
+not drop) tickers missing from the bars response (e.g. very recent IPOs),
+treating "no data" as not evidence of illiquidity.
 
 ---
 
