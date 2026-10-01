@@ -596,6 +596,43 @@ Share count and cost basis are **not** auto-adjusted (to avoid silent
 corruption of user data), but the warning makes it clear that manual
 review is needed.
 
+
+### Point-in-time universe/sentiment snapshots
+
+The repo now includes `scripts/snapshot_universe.py` plus a daily
+`.github/workflows/snapshot-universe.yml` job that appends the current
+`get_sp500_tickers()` membership list to
+`data/snapshots/universe_membership.jsonl`. This does **not** remove the
+existing survivorship-bias caveat overnight — historical backtests still only
+know today's membership until enough dated snapshots accumulate — but it starts
+building the point-in-time index-membership history that a future
+survivorship-bias-aware training/backtest path can consume instead of
+retroactively scraping Wikipedia's current table.
+
+The same script also has an opt-in `--with-sentiment` mode that writes one
+JSONL summary per ticker under `data/snapshots/sentiment/YYYY-MM-DD.jsonl`,
+using `analyze_sentiment()`'s FinBERT + market-signal output. The scheduled
+workflow intentionally leaves that heavier path off for now so the daily run
+stays fast, but the plumbing is now in place to begin accumulating a dated
+sentiment archive instead of only re-computing whatever headlines happen to be
+available at scan time.
+
+### Experiment tracking for backtest runs
+
+The repo now includes `modules/experiment_tracker.py`, a lightweight SQLite
+store at `data/experiments.db` for recording walk-forward/backtest comparison
+runs: run name, horizon, optional explicit git commit, serialized config,
+serialized summary metrics, and optional sample tickers. This addresses the
+current gap where research runs are easy to print once but awkward to compare
+later without ad-hoc notes or copy/paste.
+
+`list_experiment_runs()` surfaces recent runs as plain dicts, and
+`compare_latest_two_runs()` computes per-model numeric deltas such as
+`models.lightgbm.mean_rmse` between the two most recent runs for the same
+`(run_name, horizon)` pair. Unlike `data/predictions.json`, this database is
+intentionally local/derived developer state for iterative experimentation, so
+it is gitignored rather than committed back by CI.
+
 ---
 
 ## Prediction Track Record

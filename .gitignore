@@ -3,6 +3,9 @@ data/portfolio.json
 data/watchlist.json
 data/notifications.json
 data/*.json
+# Local/derived experiment-tracking state is for a developer's own
+# iteration loop, unlike data/predictions.json which CI commits back.
+data/experiments.db
 data/lightgbm_return_models/
 
 # Prediction tracker state is committed by CI so scan/grading runs share
