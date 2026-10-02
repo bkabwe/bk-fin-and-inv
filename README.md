@@ -37,7 +37,7 @@ brew install libomp
 - `FRED_API_KEY` — optional FRED (Federal Reserve Economic Data) API key used to
   fetch macro series (`VIXCLS`, `DGS10`, `CPIAUCSL`, `FEDFUNDS`) used for regime
   context and feature engineering, replacing Polygon's separate paid Indices add-on
-  requirement for `I:VIX`. Get a free key at
+  requirement for `I:VIX` and `I:TNX`. Get a free key at
   https://fred.stlouisfed.org/docs/api/api_key.html
 - `SEC_EDGAR_CONTACT_EMAIL` — optional contact email embedded in SEC EDGAR
   `User-Agent` headers. If unset, the app uses a placeholder and logs a warning;
