@@ -21,11 +21,17 @@ if str(REPO_ROOT) not in sys.path:
 
 from modules.data_fetcher import get_stock_data
 from modules.email_reports import (
+    StyledSection,
     csv_attachment,
+    render_callout,
     render_html_table,
     render_legend,
     render_metric_tiles,
+    render_panel,
+    render_paragraph,
     render_report_html,
+    render_row_title,
+    render_subheading,
     send_brevo_email,
 )
 from modules.fred_client import get_macro_feature_table
@@ -37,6 +43,7 @@ from modules.lightgbm_batch import (
     shard_asset_urls_by_index,
 )
 from modules.prediction_tracker import SUBSCORE_ROW_FIELDS, record_predictions_from_scan
+from modules.price_format import format_price
 from modules.profit_opportunities import (
     DEFAULT_FAST_SCREEN_MARGIN,
     HORIZON_SETTINGS as _ALL_HORIZON_SETTINGS,
@@ -350,7 +357,9 @@ def _format_value(value: Any, *, currency: bool = False, pct: bool = False) -> s
     except Exception:
         return str(value)
     if currency:
-        return f"${number:,.2f}"
+        # Sub-dollar tickers keep the 4-6 decimals the projections are rounded
+        # to (price_format.price_decimals); whole cents would blur them.
+        return format_price(number)
     if pct:
         return f"{number:,.2f}%"
     return f"{number:,.2f}"
@@ -361,6 +370,7 @@ def _preview_rows(df: pd.DataFrame, columns: list[str], *, limit: int = PREVIEW_
     records = preview.to_dict("records") if not preview.empty else []
     formatted = []
     for row in records:
+        rating = row.get("Risk-Adjusted Rating")
         formatted.append(
             {
                 **row,
@@ -368,26 +378,52 @@ def _preview_rows(df: pd.DataFrame, columns: list[str], *, limit: int = PREVIEW_
                 "Current Price": _format_value(row.get("Current Price"), currency=True),
                 "Target Price": _format_value(row.get("Target Price"), currency=True),
                 "Projected Upside %": _format_value(row.get("Projected Upside %"), pct=True),
+                "Forecast Range %": _format_value(row.get("Forecast Range %"), pct=True),
                 "Risk-Adjusted Upside": _format_value(row.get("Risk-Adjusted Upside")),
+                # The CSV carries the threshold ("Strong (0.60+)"); the email
+                # badge stays short and the legend below spells out the tiers.
+                "Risk-Adjusted Rating": str(rating).split(" (")[0] if isinstance(rating, str) and rating else rating,
             }
         )
     return formatted
 
 
-def _profit_subsection(
+SCREENER_COLUMNS = ["Ticker", "Company", "Score", "Recommendation", "Current Price", "Target Price"]
+PROFIT_COLUMNS = ["Ticker", "Company", "Score", "Current Price", "Target Price", "Projected Upside %", "Risk-Adjusted Upside"]
+# The risk-adjusted ranking also shows the two numbers its ratio is built from
+# (upside and the forecast range) plus the tier it falls in.
+RISK_ADJUSTED_COLUMNS = [
+    "Ticker",
+    "Company",
+    "Score",
+    "Current Price",
+    "Target Price",
+    "Projected Upside %",
+    "Forecast Range %",
+    "Risk-Adjusted Upside",
+    "Risk-Adjusted Rating",
+]
+
+
+def _stat_tiles(tiles: list[dict[str, str]]) -> StyledSection:
+    return StyledSection(render_metric_tiles(tiles))
+
+
+def _profit_sections(
     title: str,
-    sort_label: str,
+    description: str,
     results: pd.DataFrame,
     profit_stats: dict[str, int],
     horizon: str,
     *,
+    columns: list[str],
     show_recorded_tile: bool = False,
-) -> str:
+) -> list[StyledSection]:
+    """A stat-tile strip plus a top-10 table panel for one profit ranking."""
     top = results.iloc[0] if not results.empty else None
     avg_upside = float(results["Projected Upside %"].mean()) if not results.empty else None
     median_upside = float(results["Projected Upside %"].median()) if not results.empty else None
 
-    columns = ["Ticker", "Company", "Score", "Current Price", "Target Price", "Projected Upside %", "Risk-Adjusted Upside"]
     tiles = [
         {"label": "Top ticker", "value": str(top["Ticker"]) if top is not None else "—"},
         {
@@ -400,17 +436,16 @@ def _profit_subsection(
             {"label": "Passed fast-screen", "value": str(int(profit_stats.get("passed_fast_screen_count") or 0))},
             {"label": "Recorded predictions", "value": str(int(profit_stats.get("recorded_count") or 0))},
             {
-                "label": "LightGBM-unconfirmed dropped",
+                "label": "Dropped: no LightGBM",
                 "value": str(int(profit_stats.get("lightgbm_unconfirmed_count") or 0)),
             },
             {
-                "label": "Thin-history dropped",
+                "label": "Dropped: thin history",
                 "value": str(int(profit_stats.get("thin_history_dropped_count") or 0)),
             },
             *tiles,
         ]
 
-    legend_html = ""
     if horizon != "short_term":
         # Confidence (Full/Limited/Technical Only) is derived from a
         # ticker-wide models_used list that includes models the short-term
@@ -424,20 +459,166 @@ def _profit_subsection(
                 "value": str(int((results["Confidence"] == "Full").sum())) if not results.empty else "0",
             }
         )
-        legend_html = (
-            '<div style="margin-top:14px;"><div style="color:#a9bdd7;font-size:12px;text-transform:uppercase;'
-            'letter-spacing:0.06em;margin-bottom:6px;">Confidence legend</div>'
-            f"{render_legend([{'label': 'Full', 'description': 'Trend and fundamental/DCF models all contributed to the projection — highest-confidence tier.'}, {'label': 'Limited', 'description': 'Partial model coverage (e.g. missing fundamentals or a fitted trend) — treat with more caution.'}, {'label': 'Technical Only', 'description': 'Speculative/OTC ticker with no fundamental EPS data — projection is technical-trend only, higher risk.'}])}"
-            "</div>"
-        )
 
-    return (
-        f'<h3 style="margin:18px 0 8px 0;color:#f4fff8;">{title}</h3>'
-        f'<p style="margin:0 0 12px 0;color:#a9bdd7;">Ranked by {sort_label}, all LightGBM-backtest-confirmed for '
-        f"{HORIZON_SETTINGS[horizon]['label']}. Top 10 preview below; full top 75 is attached as CSV.</p>"
-        f"{render_metric_tiles(tiles)}"
-        f'<div style="margin-top:18px;">{render_html_table(columns, _preview_rows(results, columns))}</div>'
-        f"{legend_html}"
+    return [
+        _stat_tiles(tiles),
+        render_panel(
+            title,
+            render_html_table(columns, _preview_rows(results, columns)),
+            description=description,
+        ),
+    ]
+
+
+def _risk_adjusted_guide() -> StyledSection:
+    """Plain-language explanation of Risk-Adjusted Upside for the email (the
+    same text lives in the README's "Risk-adjusted upside" section)."""
+    body = "".join(
+        [
+            render_subheading("What it is"),
+            render_paragraph(
+                "Projected upside divided by the width of the forecast range around the target. It asks how much of "
+                "the model's uncertainty is on the upside: a big expected gain inside a narrow range scores high, "
+                "a small gain inside a wide range scores low."
+            ),
+            render_callout("Risk-Adjusted Upside = Projected Upside % ÷ Forecast Range %"),
+            render_paragraph(
+                "**Forecast Range %** = (Target High − Target Low) ÷ Current Price × 100. The range is the model's "
+                "forecast band and always contains both today's price and the target; a range narrower than 1% "
+                "counts as 1% so the ratio cannot blow up."
+            ),
+            render_subheading("Possible range: 0 to 1"),
+            render_paragraph(
+                "Because the range includes the target itself, the ratio can never exceed 1.00. **1.00** means the "
+                "whole range is upside, **0.50** means the range is twice as wide as the expected gain, **0.10** "
+                "means ten times as wide."
+            ),
+            render_legend(
+                [
+                    {
+                        "label": "Strong (0.60+)",
+                        "style_key": "strong",
+                        "description": "Most of the forecast range is upside: the expected gain is large relative to the uncertainty.",
+                    },
+                    {
+                        "label": "Moderate (0.30 to <0.60)",
+                        "style_key": "moderate",
+                        "description": "A real gain, but the range is roughly 1.7× to 3.3× as wide as the gain.",
+                    },
+                    {
+                        "label": "Weak (<0.30)",
+                        "style_key": "weak",
+                        "description": "The range is more than about 3× the gain: a small or noisy upside for the risk taken, typical of very volatile stocks.",
+                    },
+                ]
+            ),
+            render_subheading("Keep in mind"),
+            render_paragraph(
+                "It is a ratio of model outputs, not a probability of profit or a return forecast, so it is only as "
+                "trustworthy as the target behind it. The biggest capped upsides (+200%) often have ranges that "
+                "barely extend past the target, so this ranking overlaps the by-upside list. Read it together with "
+                "Score and the Basis column in the CSV. Each CSV also carries Forecast Range % and Risk-Adjusted "
+                "Rating next to the number."
+            ),
+        ]
+    )
+    return render_panel("Risk-adjusted upside: how to read it", body)
+
+
+def _basis_guide(horizon: str) -> StyledSection:
+    """Explain what feeds the Target Price (the CSV `Basis` column), including
+    the fixed 20% Resistance weight at the short-term horizon."""
+    if horizon == "short_term":
+        body = "".join(
+            [
+                render_paragraph(
+                    "The short-term target is a weighted blend of three inputs. The CSV Basis column shows the "
+                    "weights used for each ticker, e.g. Trend(37%) + LightGBM(43%) + Resistance(20%)."
+                ),
+                render_legend(
+                    [
+                        {
+                            "label": "Trend",
+                            "style_key": "pending",
+                            "description": "Extrapolates the stock's recent price trend about 30 days ahead.",
+                        },
+                        {
+                            "label": "LightGBM",
+                            "style_key": "full",
+                            "description": "The per-ticker machine-learning return model from the promoted batch. Trend and LightGBM share 80% of the weight in proportion to their walk-forward backtest accuracy (lower error, larger weight).",
+                        },
+                        {
+                            "label": "Resistance",
+                            "style_key": "technical only",
+                            "description": "The nearest technical resistance above the price (or the upper Bollinger Band, whichever is higher). It always gets a fixed 20%: a prior, not a backtested model, which is why it never changes.",
+                        },
+                    ]
+                ),
+                render_paragraph(
+                    "**Why Resistance is always 20%:** it is a hard-coded weight, not a fitted one. Resistance can "
+                    "only sit at or above today's price, so it can only pull targets up, and further for volatile "
+                    "stocks whose Bollinger bands are wide. Treat short-term upside figures as optimistic."
+                ),
+            ]
+        )
+        title = "How the short-term target is built"
+    else:
+        body = "".join(
+            [
+                render_paragraph(
+                    "The medium-term target is a weighted blend of four inputs. The CSV Basis column shows the "
+                    "weights used for each ticker, e.g. Trend(25%) + LightGBM(25%) + Fundamental(30%) + DCF+Comps(20%)."
+                ),
+                render_legend(
+                    [
+                        {
+                            "label": "Trend",
+                            "style_key": "pending",
+                            "description": "Extrapolates the stock's recent price trend about 180 days ahead.",
+                        },
+                        {
+                            "label": "LightGBM",
+                            "style_key": "full",
+                            "description": "The per-ticker machine-learning return model from the promoted batch. Trend and LightGBM together share 50% of the weight in proportion to their walk-forward backtest accuracy.",
+                        },
+                        {
+                            "label": "Fundamental",
+                            "style_key": "limited",
+                            "description": "Fair value from EPS × P/E. Fixed 30% weight.",
+                        },
+                        {
+                            "label": "DCF+Comps",
+                            "style_key": "technical only",
+                            "description": "Graham-style DCF cross-checked against sector P/E comparables. Fixed 20% weight.",
+                        },
+                    ]
+                ),
+            ]
+        )
+        title = "How the medium-term target is built"
+    return render_panel(title, body)
+
+
+def _confidence_guide() -> StyledSection:
+    # Confidence (Full/Limited/Technical Only) is only shown for medium term.
+    return render_panel(
+        "Confidence: how to read it",
+        render_legend(
+            [
+                {
+                    "label": "Full",
+                    "description": "Trend and fundamental/DCF models all contributed to the projection — highest-confidence tier.",
+                },
+                {
+                    "label": "Limited",
+                    "description": "Partial model coverage (e.g. missing fundamentals or a fitted trend) — treat with more caution.",
+                },
+                {
+                    "label": "Technical Only",
+                    "description": "Speculative/OTC ticker with no fundamental EPS data — projection is technical-trend only, higher risk.",
+                },
+            ]
+        ),
     )
 
 
@@ -453,36 +634,81 @@ def build_scan_report(
     run_date: str,
 ) -> str:
     current_run = (manifest or {}).get("current_run") or {}
+    label = HORIZON_SETTINGS[horizon]["label"]
     screener_top = screener_results.iloc[0] if not screener_results.empty else None
     screener_avg_score = float(screener_results["Score"].mean()) if not screener_results.empty else None
     screener_median_score = float(screener_results["Score"].median()) if not screener_results.empty else None
 
-    sections = [
-        (
-            f"<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Screener top 75</h2>"
-            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Score-based scan for {HORIZON_SETTINGS[horizon]['label']} workflows. Top 10 preview below; full top 75 is attached as CSV.</p>"
-            f"{render_metric_tiles([{'label': 'Passed fast-screen', 'value': str(int(screener_results.attrs.get('fully_analyzed_count') or 0))}, {'label': 'Fast-filtered', 'value': str(int(screener_results.attrs.get('fast_filtered_count') or 0))}, {'label': 'Top ticker', 'value': str(screener_top['Ticker']) if screener_top is not None else '—'}, {'label': 'Avg / median score', 'value': ('—' if screener_avg_score is None else f'{screener_avg_score:.1f} / {screener_median_score:.1f}')}, {'label': 'High-confidence picks', 'value': str(int((screener_results['Score'] >= 80).sum())) if not screener_results.empty else '0'}])}"
-            f"<div style=\"margin-top:18px;\">{render_html_table(['Ticker', 'Company', 'Score', 'Recommendation', 'Current Price', 'Target Price'], _preview_rows(screener_results, ['Ticker', 'Company', 'Score', 'Recommendation', 'Current Price', 'Target Price']))}</div>"
-        ),
-        (
-            f"<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Profit opportunities top 75</h2>"
-            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Split into three rankings over the same qualifying pool for {HORIZON_SETTINGS[horizon]['label']}: by projected upside, by overall score, and by risk-adjusted upside (upside ÷ confidence-band width). Each list applies a max-{DEFAULT_MAX_PER_SECTOR}-per-sector diversification cap. Full top 75 of each is attached as CSV.</p>"
-            + _profit_subsection(
-                "By upside", "projected upside %", profit_by_upside, profit_stats, horizon, show_recorded_tile=True
-            )
-            + _profit_subsection("By score", "overall score", profit_by_score, profit_stats, horizon)
-            + _profit_subsection("By risk-adjusted upside", "risk-adjusted upside", profit_by_risk_adjusted, profit_stats, horizon)
-        ),
+    screener_tiles = [
+        {"label": "Passed fast-screen", "value": str(int(screener_results.attrs.get("fully_analyzed_count") or 0))},
+        {"label": "Fast-filtered", "value": str(int(screener_results.attrs.get("fast_filtered_count") or 0))},
+        {"label": "Top ticker", "value": str(screener_top["Ticker"]) if screener_top is not None else "—"},
+        {
+            "label": "Avg / median score",
+            "value": "—" if screener_avg_score is None else f"{screener_avg_score:.1f} / {screener_median_score:.1f}",
+        },
+        {
+            "label": "High-confidence picks",
+            "value": str(int((screener_results["Score"] >= 80).sum())) if not screener_results.empty else "0",
+        },
     ]
 
+    preview_note = f"Top {PREVIEW_LIMIT} shown; the full top {TOP_RESULTS_LIMIT} is attached as CSV."
+    sections: list[str] = [
+        render_row_title("Screener"),
+        _stat_tiles(screener_tiles),
+        render_panel(
+            f"Top {PREVIEW_LIMIT} by score",
+            render_html_table(SCREENER_COLUMNS, _preview_rows(screener_results, SCREENER_COLUMNS)),
+            description=(
+                f"Score-based scan for {label} workflows. Score runs 0–100 and maps to the recommendation tiers "
+                f"(80+ Strong Buy, 65+ Buy, 50+ Take Small Position, 35+ Monitor, below that Do Not Buy / Avoid). "
+                f"{preview_note}"
+            ),
+        ),
+        render_row_title("Profit opportunities"),
+        *_profit_sections(
+            "By projected upside",
+            f"Ranked by projected upside % to the target price for {label}, all LightGBM-backtest-confirmed. "
+            f"Each list applies a max-{DEFAULT_MAX_PER_SECTOR}-per-sector diversification cap. {preview_note}",
+            profit_by_upside,
+            profit_stats,
+            horizon,
+            columns=PROFIT_COLUMNS,
+            show_recorded_tile=True,
+        ),
+        *_profit_sections(
+            "By overall score",
+            f"Ranked by overall score (0–100) over the same qualifying pool. {preview_note}",
+            profit_by_score,
+            profit_stats,
+            horizon,
+            columns=PROFIT_COLUMNS,
+        ),
+        *_profit_sections(
+            "By risk-adjusted upside",
+            "Ranked by projected upside ÷ forecast range (0–1; higher = more of the range is upside). "
+            f"Explained below. {preview_note}",
+            profit_by_risk_adjusted,
+            profit_stats,
+            horizon,
+            columns=RISK_ADJUSTED_COLUMNS,
+        ),
+        render_row_title("How to read this report"),
+        _risk_adjusted_guide(),
+        _basis_guide(horizon),
+    ]
+    if horizon != "short_term":
+        sections.append(_confidence_guide())
+
     return render_report_html(
-        title=f"{HORIZON_SETTINGS[horizon]['label']} scan report",
+        title=f"{label} scan report",
         subtitle=f"Run date {run_date} · ticker pool {len(tickers)} · manifest-trained universe from the promoted LightGBM release",
         metrics=[
             {"label": "Tickers scanned", "value": str(len(tickers))},
-            {"label": "Newly trained", "value": str(len(current_run.get('trained_tickers') or []))},
-            {"label": "Carried forward", "value": str(len(current_run.get('carried_forward_tickers') or []))},
-            {"label": "Dropped stale", "value": str(len(current_run.get('dropped_stale_tickers') or []))},
+            {"label": "Newly trained", "value": str(len(current_run.get("trained_tickers") or []))},
+            {"label": "Carried forward", "value": str(len(current_run.get("carried_forward_tickers") or []))},
+            {"label": "Dropped stale", "value": str(len(current_run.get("dropped_stale_tickers") or []))},
         ],
         sections=sections,
     )

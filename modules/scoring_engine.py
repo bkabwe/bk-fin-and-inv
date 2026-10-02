@@ -28,6 +28,7 @@ from modules.lightgbm_batch import (
 from modules.logger import get_logger
 from modules.longterm_analysis import analyze_longterm_technical_score
 from modules.macro_regime import get_macro_regime
+from modules.price_format import price_decimals, round_price
 from modules.sentiment_analysis import analyze_sentiment
 from modules.technical_analysis import analyze_technical, relative_strength_vs_spy
 
@@ -292,7 +293,8 @@ def _apply_market_cap_confidence_padding(
     padding = current_price * padding_ratio
     widened_low = max(0.0, low - padding)
     widened_high = high + padding
-    return round(widened_low, 2), round(max(widened_low, widened_high), 2)
+    decimals = price_decimals(current_price)
+    return round(widened_low, decimals), round(max(widened_low, widened_high), decimals)
 
 
 def _weighted_ensemble(components: list[tuple[str, float | None, float]]) -> tuple[float | None, str, list[float]]:
@@ -348,7 +350,8 @@ def _confidence_bounds(
     if cap_value is not None:
         low = min(low, cap_value)
         high = min(high, cap_value)
-    return round(low, 2), round(max(low, high), 2)
+    decimals = price_decimals(current_price)
+    return round(low, decimals), round(max(low, high), decimals)
 
 
 def _required_history_days(horizon_days: int) -> int:
@@ -452,7 +455,7 @@ def _cap_target(value: float, current_price: float, cap_value: float | None) -> 
     target = max(float(value), current_price)
     if cap_value is not None:
         target = min(target, cap_value)
-    return round(target, 2)
+    return round(target, price_decimals(current_price))
 
 
 def _lightgbm_adaptive_share_cap(lightgbm_windows: int | None) -> float:
@@ -1154,7 +1157,7 @@ def _get_price_projections_core(
     )
 
     return {
-        "current_price": round(current_price, 2),
+        "current_price": round_price(current_price),
         "short_term_target": short_projection,
         "short_term_low": short_low,
         "short_term_high": short_high,
