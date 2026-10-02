@@ -46,6 +46,7 @@ from modules.profit_opportunities import (
 )
 from modules.scoring_engine import analyze_stock, fast_screen_score
 from modules.screener import DEFAULT_FAST_SCREEN_MARGIN as SCREENER_FAST_SCREEN_MARGIN, screener_row_from_analysis
+from modules.sentiment_analysis import warm_up_finbert
 
 # Scheduled scans only cover short/medium term horizons; keep the same
 # restricted subset here (rather than the full three-horizon superset in
@@ -901,6 +902,14 @@ def _run_discover(args: argparse.Namespace) -> int:
 def _run_scan_shard(args: argparse.Namespace) -> int:
     manifest = json.loads(Path(args.manifest_file).read_text(encoding="utf-8"))
     macro_table = joblib.load(Path(args.macro_file))
+    # Load FinBERT once, here on the main thread, before `run_scan_shard`
+    # fans tickers out to its worker pool: the first `transformers` import
+    # isn't thread-safe, and doing it up front also surfaces a model-load
+    # problem in the shard log immediately instead of mid-scan.
+    if warm_up_finbert():
+        print("FinBERT sentiment model loaded", flush=True)
+    else:
+        print("FinBERT sentiment model unavailable; headline sentiment will be retried, else neutral", flush=True)
     partial = run_scan_shard(args.horizon, manifest, macro_table, int(args.shard_index), int(args.shard_count))
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

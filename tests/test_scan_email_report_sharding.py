@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import tempfile
 import unittest
@@ -658,6 +659,57 @@ class DiscoverScanInputsTests(unittest.TestCase):
             scan_email_report.discover_scan_inputs(
                 None, Path(tmp_dir) / "manifest.json", Path(tmp_dir) / "macro.joblib"
             )
+
+
+class RunScanShardCommandTests(unittest.TestCase):
+    def _args(self, tmp_dir: str) -> argparse.Namespace:
+        manifest_path = Path(tmp_dir) / "manifest.json"
+        manifest_path.write_text(json.dumps(_manifest_with_shards(2, {"AAPL": 0})), encoding="utf-8")
+        macro_path = Path(tmp_dir) / "macro.joblib"
+        joblib.dump(pd.DataFrame({"vix": [15.0]}), macro_path)
+        return argparse.Namespace(
+            horizon="short_term",
+            manifest_file=str(manifest_path),
+            macro_file=str(macro_path),
+            shard_index=0,
+            shard_count=2,
+            output=str(Path(tmp_dir) / "partials" / "shard-0.joblib"),
+        )
+
+    def test_loads_finbert_once_before_the_shard_worker_pool_starts(self):
+        calls: list[str] = []
+
+        def _warm_up() -> bool:
+            calls.append("warm_up")
+            return True
+
+        def _run_shard(*args, **kwargs) -> dict:
+            calls.append("run_scan_shard")
+            return {"shard_index": 0}
+
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch("scripts.scan_email_report.warm_up_finbert", side_effect=_warm_up),
+            patch("scripts.scan_email_report.run_scan_shard", side_effect=_run_shard),
+        ):
+            args = self._args(tmp_dir)
+            exit_code = scan_email_report._run_scan_shard(args)
+            written = joblib.load(args.output)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, ["warm_up", "run_scan_shard"])
+        self.assertEqual(written, {"shard_index": 0})
+
+    def test_still_scans_when_finbert_is_unavailable(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch("scripts.scan_email_report.warm_up_finbert", return_value=False),
+            patch("scripts.scan_email_report.run_scan_shard", return_value={"shard_index": 0}) as run_shard,
+        ):
+            exit_code = scan_email_report._run_scan_shard(self._args(tmp_dir))
+
+        self.assertEqual(exit_code, 0)
+        run_shard.assert_called_once()
 
 
 class BuildParserSubcommandTests(unittest.TestCase):
