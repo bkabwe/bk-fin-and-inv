@@ -406,6 +406,18 @@ account does, non-Google accounts in Gmail do not). Keep the HTML under
 Gmail's ~102KB clipping limit (`tests/test_scan_report_html.py` enforces it).
 The scan report must keep exactly four CSV attachments.
 
+Each scan report closes with a **Glossary** (`_glossary_sections` in
+`scripts/scan_email_report.py`, rendered by `render_glossary`) that defines the
+Score and its parts, the Trend/LightGBM/Resistance/Fundamental/DCF+Comps
+ensemble and its weights, Target Price, Target Low/High, Forecast Range,
+Confidence Score, the stat-tile counts and the CSV columns that a CSV cannot
+document itself, with the formulas behind each. It is horizon-aware (the
+short-term report explains Resistance, the medium-term one Fundamental and
+DCF+Comps) and restates figures from the scoring code, so
+`GlossaryFiguresStayInSyncTests` in `tests/test_scan_report_html.py` fails when
+a threshold, weight or window changes without the glossary. It is the last
+section, so it is what Gmail would clip first: keep entries compact.
+
 Shard count is manifest-driven, set by `--scan-shard-count` at promote time
 (`scripts/lightgbm_batch_pipeline.py`'s `DEFAULT_SCAN_SHARD_COUNT`, currently
 16, chosen to fit within a single wave under the account's GitHub Actions

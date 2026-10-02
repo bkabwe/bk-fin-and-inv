@@ -19,11 +19,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from modules.backtester import get_walk_forward_window_config
 from modules.data_fetcher import get_stock_data
 from modules.email_reports import (
     StyledSection,
     csv_attachment,
     render_callout,
+    render_glossary,
     render_html_table,
     render_legend,
     render_metric_tiles,
@@ -622,6 +624,252 @@ def _confidence_guide() -> StyledSection:
     )
 
 
+def _glossary_sections(horizon: str) -> list[StyledSection]:
+    """The closing "Glossary": what each term, model and count in the email and
+    its CSVs means, and how it is calculated. It is the last thing in the HTML,
+    so it is the first thing Gmail would clip (~102KB): keep the entries compact
+    and horizon-aware. The figures mirror modules.scoring_engine and
+    modules.backtester; a test keeps them in sync."""
+    short_term = horizon == "short_term"
+    fundamental_points, sentiment_points = (30, 20) if short_term else (36, 14)
+    projection_days = 30 if short_term else 180
+    window = get_walk_forward_window_config(projection_days)
+    model_budget = 80 if short_term else 50
+
+    score_and_market = [
+        {
+            "term": "Score",
+            "definition": (
+                "A 0–100 rating of how attractive the stock looks: technical signals (trend, momentum, volume, patterns, "
+                f"strength vs SPY, breakouts) up to 50 points, fundamentals up to {fundamental_points}, news sentiment up to "
+                f"{sentiment_points}. Then add the market regime (+3 risk-on, −5 risk-off), sector trend (±3), small-cap risk "
+                "(−3 Small, −5 Micro) and up to +20 for long-term uptrends."
+            ),
+        },
+        {
+            "term": "Fundamentals",
+            "definition": (
+                f"A 0–100 grade scaled to {fundamental_points} points: starts at 50 and moves with P/E vs the sector, PEG, "
+                "EPS, earnings growth, debt-to-equity and return on equity."
+            ),
+        },
+        {
+            "term": "Sentiment",
+            "definition": (
+                "FinBERT, a language model trained on financial text, rates each recent headline positive, neutral or "
+                f"negative; the −1 to +1 average becomes 0–{sentiment_points} points. Neutral ({sentiment_points // 2}) "
+                "applies if FinBERT can't load."
+            ),
+        },
+        {
+            "term": "Recommendation",
+            "definition": (
+                "80+ Strong Buy, 65–79 Buy, 50–64 Take Small Position, 35–49 Monitor, 20–34 Do Not Buy, under 20 Avoid. "
+                "The screener lists 50+."
+            ),
+        },
+        {
+            "term": "Time Horizon",
+            "definition": (
+                "The setup type, not the email's horizon: Long-Term Hold (uptrend, fundamentals 65+), Short-Term "
+                "Opportunity (MACD above its signal line, no uptrend), else Medium-Term Setup."
+            ),
+        },
+        {
+            "term": "Macro regime",
+            "definition": (
+                "VIX under 15 = risk-on, over 25 = risk-off. In between, 4+ of SPY and five sector ETFs with a 20-day average "
+                "above their 50-day = risk-on, 4+ below = risk-off, else neutral. The 10-year Treasury yield is the DCF's "
+                "risk-free rate."
+            ),
+        },
+        {
+            "term": "Sector Trend",
+            "definition": (
+                "Bullish or Bearish when the stock's sector ETF (tech, financials, energy, health care, industrials) has its "
+                "20-day average above or below its 50-day; else Neutral."
+            ),
+        },
+        {
+            "term": "Market Cap Tier",
+            "definition": (
+                "Micro under $300M, Small to $2B, Mid to $10B, Large to $200B, Mega above. Micro and Small lose Score "
+                "points and get wider ranges."
+            ),
+        },
+        {
+            "term": "Long-Term Stage",
+            "definition": (
+                "Stage 1 Basing, 2 Advancing, 3 Topping or 4 Declining, from price vs the 150- and 200-day averages and "
+                "relative strength. Long-Term Hold setups only."
+            ),
+        },
+    ]
+
+    target_price = [
+        {
+            "term": "Ensemble",
+            "definition": (
+                "Independent forecasts blended into one Target Price so no single model decides it: the sum of weight × "
+                "forecast. The CSV Basis column lists each ticker's weights."
+            ),
+        },
+        {
+            "term": "Trend",
+            "definition": (
+                f"Log-linear and quadratic regressions on the last 200 daily closes, averaged, extended {projection_days} "
+                "trading days."
+            ),
+        },
+        {
+            "term": "LightGBM",
+            "definition": (
+                "A machine-learning model (gradient-boosted trees) trained per ticker on technical, fundamental and macro "
+                "data to predict its forward return; retrained weekly."
+            ),
+        },
+    ]
+    if short_term:
+        target_price.append(
+            {
+                "term": "Resistance",
+                "definition": (
+                    "The highest of the nearest price ceiling above today's price, the upper Bollinger Band and the price "
+                    "itself. Fixed 20% weight: a prior, not a fitted model."
+                ),
+            }
+        )
+    else:
+        target_price += [
+            {
+                "term": "Fundamental",
+                "definition": (
+                    "Fair value = EPS × P/E. The SEC feed has only trailing EPS and derives P/E from today's price, so this "
+                    "equals today's price: effectively a fixed 30% “no change” anchor. Skipped without positive EPS."
+                ),
+            },
+            {
+                "term": "DCF+Comps",
+                "definition": (
+                    "Average of a Graham-style DCF, EPS × (8.5 + 2 × growth %) × 4.4 ÷ the 10-year yield %, and comparables, "
+                    "EPS × the sector's typical P/E. Fixed 20% weight."
+                ),
+            },
+        ]
+    target_price += [
+        {
+            "term": "Walk-forward backtest",
+            "definition": (
+                "Train on one stretch of history, test on the next unseen stretch, roll forward and repeat "
+                f"({window.train_len} days to train, {window.test_len} to test). RMSE, the root-mean-square error, is the "
+                "typical miss; lower is better."
+            ),
+        },
+        {
+            "term": "Model weights",
+            "definition": (
+                f"Trend and LightGBM share {model_budget}% of the weight in proportion to 1 ÷ RMSE; LightGBM's share of that is "
+                "capped at 50% (one backtest window), rising to 70% (six or more)."
+            ),
+        },
+        {
+            "term": "Target Price",
+            "definition": (
+                "The ensemble forecast, pulled toward today's price when confidence is low (half the move is kept at zero "
+                "confidence), floored at the current price and capped at 3× it. The screener's Target Price is always the "
+                "short-term one."
+            ),
+        },
+        {
+            "term": "Projected Upside %",
+            "definition": (
+                "(Target − Current) ÷ Current × 100; never negative, as targets are floored at the current price. The "
+                f"profit lists keep {DEFAULT_MIN_UPSIDE_PCT:g}%+."
+            ),
+        },
+    ]
+
+    forecast_range = [
+        {
+            "term": "Target Low / High",
+            "definition": (
+                "Lowest and highest of the Target Price, today's price, each model's forecast and a GARCH band, widened by "
+                "10% (Micro) or 5% (Small) of the price each side. GARCH models volatility clustering: fit to daily returns "
+                "it forecasts the daily volatility σ, and the band is price × e^(±1.96σ)."
+            ),
+        },
+        {
+            "term": "Forecast Range %",
+            "definition": (
+                "(Target High − Target Low) ÷ Current × 100. Risk-Adjusted Upside = Projected Upside % ÷ this, from 0 to 1 "
+                "(guide above)."
+            ),
+        },
+        {
+            "term": "Confidence Score",
+            "definition": (
+                "CSV only. 0–100 trust in one target: half model agreement (100 if the forecasts coincide, 0 if their spread "
+                "reaches 20% of the blended forecast), half evidence depth (price history vs the backtest window, and "
+                "LightGBM backtest windows out of 6)." + ("" if short_term else " Not the Full / Limited label above.")
+            ),
+        },
+    ]
+
+    counts_and_columns = [
+        {
+            "term": "Newly trained, Carried forward, Dropped stale",
+            "definition": (
+                "From the weekly training run: retrained this week; earlier model kept (up to 4 weeks); model missing or "
+                "too old, left out."
+            ),
+        },
+        {
+            "term": "Passed fast-screen, Fast-filtered",
+            "definition": (
+                "A quick technical check runs first; passers get the full analysis (GARCH, backtests, LightGBM), the rest "
+                "are filtered out as unlikely to qualify."
+            ),
+        },
+        {
+            "term": "Dropped: no LightGBM, thin history",
+            "definition": (
+                "Left out of the profit lists: no per-ticker LightGBM backtest behind the forecast, or less price history "
+                "than one walk-forward window (a recent IPO, say)."
+            ),
+        },
+        {
+            "term": "Recorded predictions",
+            "definition": "New predictions (price, target and range) saved so the grading reports can check them later.",
+        },
+        {
+            "term": "High-confidence picks",
+            "definition": "Screener: Score 80+." if short_term else "Screener: Score 80+. Profit lists: Confidence = Full.",
+        },
+        {
+            "term": "Entry Price, Stop Loss, % from Entry",
+            "definition": (
+                "Entry = lowest of the nearest support below the price, the lower Bollinger Band and the price. Stop Loss = "
+                "Entry − 1.5 × ATR (14-day average true range). % from Entry = (Current − Entry) ÷ Entry × 100."
+            ),
+        },
+    ]
+
+    return [
+        render_row_title("Glossary"),
+        render_panel(
+            "",
+            render_glossary(
+                {
+                    "Score and market context": score_and_market,
+                    "Target price and ensemble": target_price,
+                    "Forecast range and confidence": forecast_range,
+                    "Report counts and CSV columns": counts_and_columns,
+                }
+            ),
+        ),
+    ]
+
+
 def build_scan_report(
     manifest: dict[str, Any],
     tickers: list[str],
@@ -700,6 +948,7 @@ def build_scan_report(
     ]
     if horizon != "short_term":
         sections.append(_confidence_guide())
+    sections.extend(_glossary_sections(horizon))
 
     return render_report_html(
         title=f"{label} scan report",

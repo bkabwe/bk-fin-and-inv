@@ -5,7 +5,7 @@ import html
 import math
 import os
 import re
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 import requests
 
@@ -306,6 +306,44 @@ def render_callout(text: str) -> str:
     )
 
 
+def render_glossary(groups: Mapping[str, Iterable[dict[str, str]]]) -> str:
+    """Render glossary entries as one compact two-column table. `groups` maps a
+    heading to its entries (dicts with a ``term`` and a ``definition``;
+    ``**bold**`` spans are allowed in the definition). Markup is kept minimal on
+    purpose -- the glossary sits at the very bottom of a report that has to stay
+    under Gmail's ~102KB clipping limit, where it would be the first part
+    clipped. Phones that honor <style> stack each definition under its term
+    (see ``.bk-gloss`` in _RESPONSIVE_CSS)."""
+    rows: list[str] = []
+    for title, entries in groups.items():
+        group_rows: list[str] = []
+        for index, entry in enumerate(entries):
+            term = html.escape(str(entry.get("term") or ""))
+            definition = _inline_markup(str(entry.get("definition") or ""))
+            stripe = f' style="background:{_ROW_ALT_BG};"' if index % 2 else ""
+            # The first term cell sizes the whole column.
+            width = ' width="150"' if not rows and not group_rows else ""
+            group_rows.append(
+                f'<tr valign="top"{stripe}><th align="left"{width}>{term}</th><td>{definition}</td></tr>'
+            )
+        if group_rows and title:
+            gap = 16 if rows else 4
+            rows.append(
+                f'<tr><th colspan="2" align="left" style="padding-top:{gap}px;font-size:12px;'
+                f'text-transform:uppercase;border-bottom:1px solid {_PANEL_BORDER};">{html.escape(title)}</th></tr>'
+            )
+        rows.extend(group_rows)
+    if not rows:
+        return ""
+    # cellpadding is an HTML attribute, so it survives clients that ignore
+    # <style>; color/size/line-height are inherited by every cell.
+    return (
+        '<table class="bk-gloss" role="presentation" cellpadding="7" cellspacing="0" border="0" width="100%" '
+        f'style="width:100%;border-collapse:collapse;color:{_TEXT_BODY};font-size:13px;line-height:1.5;">'
+        f'{"".join(rows)}</table>'
+    )
+
+
 _MIN_TILE_SLOTS = 4
 
 
@@ -450,6 +488,9 @@ _RESPONSIVE_CSS = """
   .bk-panel-body { padding: 8px !important; }
   .bk-table th, .bk-table td { padding: 5px 6px !important; font-size: 12px !important; }
   .bk-hide-sm { display: none !important; }
+  .bk-gloss, .bk-gloss tbody, .bk-gloss tr, .bk-gloss th, .bk-gloss td { display: block !important; width: auto !important; }
+  .bk-gloss th { padding: 8px 6px 2px 6px !important; }
+  .bk-gloss td { padding: 0 6px 8px 6px !important; }
 }
 """
 

@@ -12,6 +12,7 @@ from modules.email_reports import (
     csv_attachment,
     parse_recipients,
     render_callout,
+    render_glossary,
     render_html_table,
     render_legend,
     render_metric_tiles,
@@ -341,6 +342,56 @@ class RenderLegendLayoutTests(unittest.TestCase):
         self.assertIn(f"color:{email_reports._GREEN}", html_out)
 
 
+class RenderGlossaryTests(unittest.TestCase):
+    GROUPS = {
+        "First group": [
+            {"term": "Alpha", "definition": "First **bold** meaning"},
+            {"term": "Beta", "definition": "Second meaning"},
+        ],
+        "Second group": [{"term": "Gamma", "definition": "Third meaning"}],
+    }
+
+    def test_renders_one_table_with_a_heading_per_group_and_a_row_per_entry(self):
+        html_out = render_glossary(self.GROUPS)
+        self.assertEqual(html_out.count("<table"), 1)
+        self.assertIn('class="bk-gloss"', html_out)
+        self.assertEqual(html_out.count("<tr"), 5)  # two group headings + three entries
+        for expected in ("First group", "Second group", ">Alpha</th>", ">Beta</th>", ">Gamma</th>", "Third meaning"):
+            self.assertIn(expected, html_out)
+        self.assertLess(html_out.index("First group"), html_out.index(">Alpha</th>"))
+        self.assertLess(html_out.index(">Beta</th>"), html_out.index("Second group"))
+        self.assertLess(html_out.index("Second group"), html_out.index(">Gamma</th>"))
+
+    def test_escapes_headings_terms_and_definitions_but_keeps_bold_markup(self):
+        html_out = render_glossary({"<b>g</b>": [{"term": "<i>t</i>", "definition": "a **b** <script>x</script>"}]})
+        for raw in ("<b>g</b>", "<i>t</i>", "<script>"):
+            self.assertNotIn(raw, html_out)
+        self.assertIn("&lt;i&gt;t&lt;/i&gt;", html_out)
+        self.assertIn("&lt;b&gt;g&lt;/b&gt;", html_out)
+        self.assertIn(">b</strong>", html_out)
+
+    def test_alternate_rows_are_striped_and_only_the_first_term_cell_sets_the_column_width(self):
+        html_out = render_glossary(self.GROUPS)
+        self.assertEqual(html_out.count(f"background:{email_reports._ROW_ALT_BG}"), 1)
+        self.assertEqual(html_out.count('width="150"'), 1)
+        self.assertLess(html_out.index('width="150"'), html_out.index(">Alpha</th>"))
+
+    def test_nothing_to_show_renders_nothing(self):
+        self.assertEqual(render_glossary({}), "")
+        self.assertEqual(render_glossary({"Empty": []}), "")
+
+    def test_untitled_group_has_no_heading_row(self):
+        html_out = render_glossary({"": [{"term": "A", "definition": "b"}]})
+        self.assertEqual(html_out.count("<tr"), 1)
+
+    def test_terms_are_inherited_from_the_table_so_every_row_stays_small(self):
+        # Every glossary row repeats, and the section sits at the very end of an
+        # email Gmail clips at ~102KB, so per-row markup has to stay minimal.
+        rows = [{"term": f"T{i}", "definition": "d"} for i in range(40)]
+        per_row = len(render_glossary({"G": rows}).encode("utf-8")) / len(rows)
+        self.assertLess(per_row, 100)
+
+
 class ResponsiveDashboardTests(unittest.TestCase):
     def _report(self, **overrides):
         kwargs = {
@@ -390,6 +441,11 @@ class ResponsiveDashboardTests(unittest.TestCase):
         html_out = self._report()
         self.assertTrue(html_out.startswith("<!DOCTYPE html>"))
         self.assertIn('<meta charset="utf-8">', html_out)
+
+    def test_phones_stack_each_glossary_definition_under_its_term(self):
+        phone_css = email_reports._RESPONSIVE_CSS.split("@media only screen", 1)[1]
+        self.assertIn(".bk-gloss", phone_css)
+        self.assertIn("display: block", phone_css.split(".bk-gloss", 1)[1])
 
 
 class SendBrevoEmailTests(unittest.TestCase):
