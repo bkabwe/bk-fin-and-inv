@@ -318,7 +318,7 @@ def finalize_profit_results(
     drop_columns = ["_rsi", "_lightgbm_backtested", "_thin_history", *SUBSCORE_ROW_FIELDS]
     if horizon == "short_term":
         # Confidence (Full/Limited/Technical Only) is derived from a
-        # ticker-wide models_used list that includes Fundamental Fair Value
+        # ticker-wide models_used list that includes the DCF+Comps estimate
         # even though the short-term ensemble never uses it -- the label is
         # effectively meaningless at this horizon, so it's dropped from the
         # short-term dashboard/attachment (medium-term keeps it).
@@ -568,8 +568,8 @@ def _basis_guide(horizon: str) -> StyledSection:
         body = "".join(
             [
                 render_paragraph(
-                    "The medium-term target is a weighted blend of four inputs. The CSV Basis column shows the "
-                    "weights used for each ticker, e.g. Trend(25%) + LightGBM(25%) + Fundamental(30%) + DCF+Comps(20%)."
+                    "The medium-term target is a weighted blend of three inputs. The CSV Basis column shows the "
+                    "weights used for each ticker, e.g. Trend(40%) + LightGBM(40%) + DCF+Comps(20%)."
                 ),
                 render_legend(
                     [
@@ -581,12 +581,7 @@ def _basis_guide(horizon: str) -> StyledSection:
                         {
                             "label": "LightGBM",
                             "style_key": "full",
-                            "description": "The per-ticker machine-learning return model from the promoted batch. Trend and LightGBM together share 50% of the weight in proportion to their walk-forward backtest accuracy.",
-                        },
-                        {
-                            "label": "Fundamental",
-                            "style_key": "limited",
-                            "description": "Fair value from EPS × P/E. Fixed 30% weight.",
+                            "description": "The per-ticker machine-learning return model from the promoted batch. Trend and LightGBM together share 80% of the weight in proportion to their walk-forward backtest accuracy.",
                         },
                         {
                             "label": "DCF+Comps",
@@ -634,7 +629,6 @@ def _glossary_sections(horizon: str) -> list[StyledSection]:
     fundamental_points, sentiment_points = (30, 20) if short_term else (36, 14)
     projection_days = 30 if short_term else 180
     window = get_walk_forward_window_config(projection_days)
-    model_budget = 80 if short_term else 50
     # The cap grows 4 points per backtest window; the 30d backtest fits up to 6 windows, the 180d one only 5.
     lightgbm_cap_top = "70% (six or more)" if short_term else f"66% (five, the most the {projection_days}-day backtest can fit)"
 
@@ -744,13 +738,6 @@ def _glossary_sections(horizon: str) -> list[StyledSection]:
     else:
         target_price += [
             {
-                "term": "Fundamental",
-                "definition": (
-                    "Fair value = EPS × P/E. The SEC feed has only trailing EPS and derives P/E from today's price, so this "
-                    "equals today's price: effectively a fixed 30% “no change” anchor. Skipped without positive EPS."
-                ),
-            },
-            {
                 "term": "DCF+Comps",
                 "definition": (
                     "Average of a Graham-style DCF, EPS × (8.5 + 2 × growth %) × 4.4 ÷ the 10-year yield %, and comparables, "
@@ -770,7 +757,7 @@ def _glossary_sections(horizon: str) -> list[StyledSection]:
         {
             "term": "Model weights",
             "definition": (
-                f"Trend and LightGBM share {model_budget}% of the weight in proportion to 1 ÷ RMSE; LightGBM's share of that is "
+                "Trend and LightGBM share 80% of the weight in proportion to 1 ÷ RMSE; LightGBM's share of that is "
                 f"capped at 50% (one backtest window), rising to {lightgbm_cap_top}."
             ),
         },
@@ -797,7 +784,8 @@ def _glossary_sections(horizon: str) -> list[StyledSection]:
             "definition": (
                 "Lowest and highest of the Target Price, today's price, each model's forecast and a GARCH band, widened by "
                 "10% (Micro) or 5% (Small) of the price each side. GARCH models volatility clustering: fit to daily returns "
-                "it forecasts the daily volatility σ, and the band is price × e^(±1.96σ)."
+                f"it forecasts each day's variance; summed over the {projection_days} days that gives the horizon's σ, and the "
+                "band is price × e^(±1.96σ)."
             ),
         },
         {

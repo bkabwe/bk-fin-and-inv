@@ -12,6 +12,7 @@ import requests
 from modules.env import load_environment
 from modules.logger import get_logger
 from modules.sec_edgar_client import get_fundamentals_info_adapter
+from modules.sic_sector_map import sector_from_sic
 from modules.validators import sanitize_ticker
 
 load_environment()
@@ -589,6 +590,9 @@ def build_info_adapter(ticker: str) -> dict[str, Any]:
     - trailingPE/trailingEps/debtToEquity/returnOnEquity/growth metrics: computed from SEC EDGAR filings
       via modules.sec_edgar_client and mapped into Yahoo-compatible field names
     - forwardPE/forwardEps/analyst fields: intentionally unavailable from SEC filings and left None
+    - sector: Polygon only exposes a SIC code, so it is mapped to the standard sector names via
+      modules.sic_sector_map (None when the code is missing or unmapped); the SIC description is
+      kept as industry
     - currentPrice: previous-day close from /v2/aggs/ticker/{ticker}/prev (Starter plan constraint)
     """
     clean_ticker = _sanitize_polygon_symbol(ticker)
@@ -621,7 +625,11 @@ def build_info_adapter(ticker: str) -> dict[str, Any]:
         "symbol": clean_ticker,
         "shortName": overview.get("name") or clean_ticker,
         "longName": overview.get("name") or clean_ticker,
-        "sector": overview.get("sic_description") or overview.get("sector"),
+        # Polygon has no sector field, only a SIC code/description; map the code onto the
+        # standard sector names the sector features key on (see modules/sic_sector_map.py)
+        # and keep the raw SIC description as the industry.
+        "sector": sector_from_sic(overview.get("sic_code")) or overview.get("sector"),
+        "industry": overview.get("sic_description"),
         "marketCap": _safe_float(overview.get("market_cap")),
         "exchange": overview.get("primary_exchange"),
         "fullExchangeName": overview.get("primary_exchange"),

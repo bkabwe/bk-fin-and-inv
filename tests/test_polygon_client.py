@@ -118,5 +118,46 @@ class PolygonClientTests(unittest.TestCase):
         self.assertEqual(grouped_mock.call_count, 3)
 
 
+class BuildInfoAdapterSectorTests(unittest.TestCase):
+    # Each test uses its own ticker symbol because build_info_adapter is
+    # TTL-cached per ticker for the life of the process.
+    def _adapter_info(self, ticker: str, overview: dict) -> dict:
+        with (
+            patch("modules.polygon_client.get_ticker_overview", return_value=overview),
+            patch("modules.polygon_client.get_previous_close", return_value=100.0),
+            patch("modules.polygon_client.get_fundamentals_info_adapter", return_value={}),
+            patch("modules.polygon_client.get_reference_dividends", return_value=[]),
+        ):
+            return polygon_client.build_info_adapter(ticker)
+
+    def test_sector_is_the_standard_name_mapped_from_the_sic_code(self):
+        # Regression test: the raw SIC description used to be returned as the
+        # sector, which matches none of the standard sector names, so the
+        # sector P/E benchmark, sector momentum and sector-ETF features all
+        # silently did nothing.
+        info = self._adapter_info(
+            "SICSOFTTEST",
+            {"name": "Soft Co", "sic_code": "7372", "sic_description": "SERVICES-PREPACKAGED SOFTWARE"},
+        )
+
+        self.assertEqual(info["sector"], "Technology")
+        self.assertEqual(info["industry"], "SERVICES-PREPACKAGED SOFTWARE")
+
+    def test_sector_is_none_when_the_sic_code_is_missing_or_unmapped(self):
+        for ticker, overview in (
+            ("SICMISSINGTEST", {"name": "Fund", "sic_description": "SOME DESCRIPTION"}),
+            ("SICUNMAPPEDTEST", {"name": "Shell", "sic_code": "9995", "sic_description": "NON-OPERATING ESTABLISHMENTS"}),
+        ):
+            with self.subTest(ticker=ticker):
+                info = self._adapter_info(ticker, overview)
+                self.assertIsNone(info["sector"])
+                self.assertEqual(info["industry"], overview["sic_description"])
+
+    def test_an_explicit_overview_sector_is_used_when_the_sic_code_has_no_mapping(self):
+        info = self._adapter_info("SICFALLBACKTEST", {"name": "Odd Co", "sector": "Utilities"})
+
+        self.assertEqual(info["sector"], "Utilities")
+
+
 if __name__ == "__main__":
     unittest.main()

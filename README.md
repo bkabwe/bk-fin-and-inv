@@ -123,7 +123,7 @@ on macOS or don't use Homebrew's `redis` service.
 - Notification bell with unread count + mark-all-read
 - Technical analysis (SMA/EMA, RSI, MACD, Stochastic, Bollinger, ATR, OBV, support/resistance, classic patterns)
 - Unified score + recommendation engine with entry/target/stop-loss suggestions
-- Multi-model projected price targets (log-linear/log-polynomial trend + LightGBM return models for 30d/180d when saved models exist + fundamental fair value + DCF + technical resistance + analyst target, with GARCH confidence bounds)
+- Multi-model projected price targets (log-linear/log-polynomial trend + LightGBM return models for 30d/180d when saved models exist + a DCF/comparables valuation + technical resistance, with horizon-cumulative GARCH confidence bounds)
 - Prophet was removed from the ensemble after walk-forward backtests consistently showed materially higher RMSE on stock series (which generally lack the strong recurring seasonality Prophet is designed for). ARIMA was later removed too: on its own it isn't reliable for the dynamism of stock markets, and live scoring's adaptive weighting already favored trend/LightGBM over it. `modules/backtester.py`'s walk-forward comparison tooling (`scripts/compare_lightgbm_backtest.py`) still supports an opt-in ARIMA evaluation for offline research.
 
 ## Data Sources
@@ -138,7 +138,9 @@ on macOS or don't use Homebrew's `redis` service.
   paid Indices plan and returned HTTP 403 on the Stocks-only plan)
 - Additional macro feature series: FRED `DGS10` (10Y Treasury), `CPIAUCSL` (CPI),
   and `FEDFUNDS` (Fed Funds Rate), including 5-day/30-day deltas and percent changes
-- Reference/profile fields (name/sector/market-cap): Polygon ticker overview
+- Reference/profile fields (name/market-cap/SIC code): Polygon ticker overview. Polygon has
+  no sector field, so the sector is derived from the SIC code
+  (`modules/sic_sector_map.py`, see the caveat below)
 - Fundamentals/ratios (P/E, EPS, ROE, debt-to-equity, growth): SEC EDGAR
   Company Facts XBRL API (10-K/10-Q filing data)
 - Splits/dividends: Polygon `/v3/reference/splits` and `/v3/reference/dividends`
@@ -237,6 +239,17 @@ rather than guesswork:
   a `valuation_estimate` used by the scoring ensemble, so a single dated
   heuristic no longer drives that ensemble slot alone — but neither input is
   a modern multi-stage DCF, so this remains a documented simplification.
+- **Sector labels come from an approximate SIC crosswalk**: Polygon's ticker
+  overview carries a SIC code but no sector, so `modules/sic_sector_map.py`
+  maps SIC code ranges onto the 11 standard sector names that the sector P/E
+  benchmarks, sector-ETF trend and relative-strength features, and the
+  scan reports' per-sector diversification cap all key on (an unmapped or
+  missing code leaves the sector empty, which those consumers treat as
+  unknown). SIC is an industry classification from a different era than
+  GICS, so some names land one sector off (e.g. data-processing companies such
+  as Alphabet and Meta map to Technology rather than Communication Services,
+  and business-services names such as Visa to Industrials). A per-ticker
+  override table would be the fix if that ever matters in practice.
 - **Sector P/E benchmarks now have a manual refresh path**: `SECTOR_BENCHMARK_PE`
   in `modules/fundamental_analysis.py` remains a hardcoded static fallback,
   but `scripts/refresh_sector_pe.py` can be run periodically (manually, or via
@@ -408,12 +421,12 @@ The scan report must keep exactly four CSV attachments.
 
 Each scan report closes with a **Glossary** (`_glossary_sections` in
 `scripts/scan_email_report.py`, rendered by `render_glossary`) that defines the
-Score and its parts, the Trend/LightGBM/Resistance/Fundamental/DCF+Comps
+Score and its parts, the Trend/LightGBM/Resistance/DCF+Comps
 ensemble and its weights, Target Price, Target Low/High, Forecast Range,
 Confidence Score, the stat-tile counts and the CSV columns that a CSV cannot
 document itself, with the formulas behind each. It is horizon-aware (the
-short-term report explains Resistance, the medium-term one Fundamental and
-DCF+Comps) and restates figures from the scoring code, so
+short-term report explains Resistance, the medium-term one DCF+Comps) and
+restates figures from the scoring code, so
 `GlossaryFiguresStayInSyncTests` in `tests/test_scan_report_html.py` fails when
 a threshold, weight or window changes without the glossary. It is the last
 section, so it is what Gmail would clip first: keep entries compact.
@@ -796,7 +809,12 @@ not just the original "by upside"/"by score" pair.
 
 `Risk-Adjusted Upside = Projected Upside % ÷ Forecast Range %`, where
 `Forecast Range % = (Target High − Target Low) ÷ Current Price × 100` (a range
-narrower than 1% counts as 1%). The forecast range always contains both
+narrower than 1% counts as 1%). The range's volatility component is the 95%
+price band implied by the GARCH(1,1) forecast over the whole horizon: the
+per-day variances are summed over the 30 or 180 days, so it widens with the
+square root of the horizon (price × e^(±1.96σ), about e^(±0.21) at 30 days and
+e^(±0.53) at 180 days for a stock with 2% daily volatility) rather than
+showing a single day's move. The forecast range always contains both
 today's price and the target, so a valid value lies between **0 and 1**:
 `1.00` means the whole range is upside, `0.50` means the range is twice as
 wide as the expected gain, `0.10` means ten times as wide. The CSVs add a
@@ -822,6 +840,28 @@ Trend and LightGBM split the other 80% by walk-forward accuracy. It is a prior,
 not a backtested model, and because it can only sit at or above the current
 price it pulls short-term targets upward, so treat short-term upside as
 optimistic.
+
+#### How the medium-term target is weighted
+
+The medium-term (180d) target blends Trend, LightGBM and **DCF+Comps** (the
+average of the Graham-style DCF and the sector-P/E comparables estimate).
+DCF+Comps keeps a fixed 20% weight (`DCF+Comps(20%)` in the `Basis` column);
+Trend and LightGBM split the other 80% by walk-forward accuracy, exactly as at
+30d. The 720d projection shown in the Streamlit app and API is Trend 75% and
+DCF+Comps 25%.
+
+The blends used to include a second fixed input, a "Fundamental Fair Value"
+of EPS × P/E (30% medium, 35% long). The SEC EDGAR adapter has only trailing
+EPS and derives trailing P/E as the latest close ÷ EPS, so that product was
+always just today's price: a hidden "no change" anchor that pulled every
+medium/long-term target back toward the current price while being reported as
+a fundamentals model (it also kept the "every model is below the price"
+`Bearish` outlook from triggering in practice, since one input always sat at
+the price). It was removed rather than relabelled,
+and its weight was reassigned explicitly to the Trend/LightGBM pool (the
+DCF+Comps weights did not change). Re-introduce a fundamentals input only once
+a source with a genuinely independent valuation (e.g. forward EPS and a forward
+P/E) is wired in.
 
 ### Upside-forecast validation (beyond the composite Score)
 

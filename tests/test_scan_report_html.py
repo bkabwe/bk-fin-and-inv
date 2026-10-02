@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import html
+import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -119,7 +121,11 @@ class ScanReportContentTests(unittest.TestCase):
         html_out = _build("medium_term")
         self.assertIn("How the medium-term target is built", html_out)
         self.assertNotIn("Why Resistance is always 20%", html_out)
-        self.assertIn("Fixed 30% weight", html_out)
+        self.assertIn("weighted blend of three inputs", html_out)
+        self.assertIn("Trend(40%) + LightGBM(40%) + DCF+Comps(20%)", html_out)
+        self.assertIn("Trend and LightGBM together share 80% of the weight", html_out)
+        self.assertNotIn("Fundamental(", html_out)
+        self.assertNotIn("Fixed 30% weight", html_out)
         self.assertIn("Fixed 20% weight", html_out)
         self.assertIn("Confidence: how to read it", html_out)
         self.assertIn("Technical Only", html_out)
@@ -233,33 +239,43 @@ class ScanReportGlossaryTests(unittest.TestCase):
         self.assertNotIn("Full / Limited", glossary)
         self.assertNotIn(">Confidence</th>", glossary)
 
-    def test_medium_term_glossary_explains_fundamental_and_dcf_comps_but_not_resistance(self):
+    def test_medium_term_glossary_explains_dcf_comps_but_not_resistance_or_a_fundamental_component(self):
         glossary = _glossary_html(_build("medium_term"))
-        self.assertIn(">Fundamental</th>", glossary)
         self.assertIn(">DCF+Comps</th>", glossary)
+        self.assertNotIn(">Fundamental</th>", glossary)
+        self.assertIn(">Fundamentals</th>", glossary)  # the 0-100 grade inside the Score is a different thing
         self.assertNotIn(">Resistance</th>", glossary)
         self.assertIn("Not the Full / Limited label above", glossary)
         self.assertIn("Profit lists: Confidence = Full", glossary)
 
-    def test_says_plainly_that_the_fundamental_component_lands_on_todays_price(self):
-        # The SEC feed has no forward EPS/P/E and derives trailing P/E from the
-        # latest close, so "EPS x P/E" is just the price. If a real valuation
-        # source is ever wired in, the Fundamental entry has to change with it.
+    def test_no_longer_presents_eps_times_pe_as_a_fundamental_component(self):
+        # The SEC feed has no forward EPS/P/E and derives trailing P/E from the latest close, so "EPS x P/E"
+        # is just today's price. It used to sit in the medium/long-term ensembles as a hidden "no change"
+        # anchor labelled "Fundamental"; neither the ensemble nor the guides carry it any more. If a real
+        # valuation source is ever wired in, bring the component (and its guide entries) back deliberately.
         facts = {"facts": {"us-gaap": {"EarningsPerShareDiluted": {"units": {"USD/shares": [{"end": "2024-12-31", "val": 5, "form": "10-K"}]}}}}}
         info = sec_edgar_client.build_fundamentals_info_adapter(facts, current_price=100)
         self.assertIsNone(info["forwardEps"])
         self.assertIsNone(info["forwardPE"])
         self.assertAlmostEqual(info["trailingEps"] * info["trailingPE"], 100.0)
 
-        glossary = html.unescape(_glossary_html(_build("medium_term")))
-        self.assertIn("equals today's price", glossary)
-        self.assertIn("no change", glossary)
+        self.assertFalse(hasattr(scoring_engine, "MEDIUM_TERM_FUNDAMENTAL_WEIGHT"))
+        self.assertFalse(hasattr(scoring_engine, "LONG_TERM_FUNDAMENTAL_WEIGHT"))
+        for horizon in ("short_term", "medium_term"):
+            with self.subTest(horizon=horizon):
+                html_out = html.unescape(_build(horizon))
+                self.assertNotIn(">Fundamental</th>", html_out)
+                self.assertNotIn("Fundamental(", html_out)
+                self.assertNotIn("EPS × P/E", html_out)
+                self.assertNotIn("“no change” anchor", html_out)
 
-    def test_describes_the_garch_band_as_a_daily_volatility_band_not_a_30_day_interval(self):
-        glossary = _glossary_html(_build("short_term"))
-        self.assertIn("daily volatility", glossary)
-        self.assertIn("e^(±1.96σ)", glossary)
-        self.assertNotIn("95% interval", glossary)
+    def test_describes_the_garch_band_as_volatility_summed_over_the_horizon(self):
+        for horizon, days in (("short_term", 30), ("medium_term", 180)):
+            glossary = html.unescape(_glossary_html(_build(horizon)))
+            with self.subTest(horizon=horizon):
+                self.assertIn(f"summed over the {days} days that gives the horizon's σ", glossary)
+                self.assertIn("e^(±1.96σ)", glossary)
+                self.assertNotIn("daily volatility σ", glossary)
 
     def test_only_explains_counts_that_the_report_actually_shows(self):
         for horizon in ("short_term", "medium_term"):
@@ -349,7 +365,7 @@ class GlossaryFiguresStayInSyncTests(unittest.TestCase):
         backtest = {"n_windows": 6, "trend_rmse": 10.0, "lightgbm_rmse": 0.1}
         for horizon, horizon_days, budget, cap_text in (
             ("short_term", 30, 0.80, "70% (six or more)"),
-            ("medium_term", 180, 0.50, "66% (five, the most the 180-day backtest can fit)"),
+            ("medium_term", 180, 0.80, "66% (five, the most the 180-day backtest can fit)"),
         ):
             glossary = _glossary_html(_build(horizon))
             window = get_walk_forward_window_config(horizon_days)
@@ -369,8 +385,18 @@ class GlossaryFiguresStayInSyncTests(unittest.TestCase):
 
     def test_fixed_medium_term_weights_match_the_ensemble_code(self):
         glossary = _glossary_html(_build("medium_term"))
-        self.assertIn(f"fixed {round(scoring_engine.MEDIUM_TERM_FUNDAMENTAL_WEIGHT * 100)}%", glossary)
         self.assertIn(f"Fixed {round(scoring_engine.MEDIUM_TERM_DCF_WEIGHT * 100)}% weight", glossary)
+
+    def test_garch_band_matches_the_scoring_code(self):
+        # A flat 4 (%^2) daily variance (2% daily volatility) accumulates to sqrt(4 x days) % over the horizon.
+        forecast = SimpleNamespace(variance=pd.DataFrame([[4.0] * 720]))
+        for horizon, days in (("short_term", 30), ("medium_term", 180)):
+            with self.subTest(horizon=horizon), patch.object(scoring_engine, "ARCH_AVAILABLE", True):
+                self.assertIn(f"summed over the {days} days", _glossary_html(_build(horizon)))
+                low, high = scoring_engine._garch_confidence_from_returns(100.0, np.zeros(100), days, forecast=forecast)
+                sigma = math.sqrt(4.0 * days) / 100.0
+                self.assertAlmostEqual(low, 100.0 * math.exp(-1.96 * sigma))
+                self.assertAlmostEqual(high, 100.0 * math.exp(1.96 * sigma))
 
     def test_walk_forward_windows_match_the_backtester(self):
         for horizon, horizon_days in (("short_term", 30), ("medium_term", 180)):
