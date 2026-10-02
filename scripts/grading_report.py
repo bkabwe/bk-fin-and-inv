@@ -10,7 +10,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from modules.email_reports import render_html_table, render_metric_tiles, render_report_html, send_brevo_email
+from modules.email_reports import (
+    StyledSection,
+    render_html_table,
+    render_metric_tiles,
+    render_panel,
+    render_paragraph,
+    render_report_html,
+    render_row_title,
+    send_brevo_email,
+)
 from modules.prediction_tracker import (
     HORIZON_DAYS,
     compute_max_price_since_scan,
@@ -19,6 +28,7 @@ from modules.prediction_tracker import (
     get_all_predictions,
     resolve_pending_predictions,
 )
+from modules.price_format import format_price
 
 HORIZON_LABELS = {
     "short_term": "Short-Term (1–4 weeks)",
@@ -32,9 +42,8 @@ def _target_scan_date(horizon: str, today: date | None = None) -> date:
 
 
 def _format_currency(value: Any) -> str:
-    if value is None:
-        return "—"
-    return f"${float(value):,.2f}"
+    # Sub-dollar scan/target prices keep 4-6 decimals (price_format.price_decimals).
+    return format_price(value)
 
 
 def _format_pct(value: Any) -> str:
@@ -160,21 +169,16 @@ def build_grading_report(
     )
     callouts = ""
     if best and worst:
-        callouts = (
-            f"<p style=\"margin:18px 0 0 0;color:#dce8f7;\"><strong>Best performer:</strong> {best['Ticker']} "
-            f"({_format_pct(best.get('Actual Return %'))}) &nbsp;|&nbsp; <strong>Worst performer:</strong> "
-            f"{worst['Ticker']} ({_format_pct(worst.get('Actual Return %'))})</p>"
+        callouts = render_paragraph(
+            f"**Best performer:** {best['Ticker']} ({_format_pct(best.get('Actual Return %'))})  |  "
+            f"**Worst performer:** {worst['Ticker']} ({_format_pct(worst.get('Actual Return %'))})"
         )
-    sections = [
-        (
-            f"<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Batch highlights</h2>"
-            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Grading the profit-opportunities scan recorded on {scan_date.isoformat()} against data available through {grading_date.isoformat()}.</p>"
-            f"{highlight_tiles}"
-            f"{callouts}"
-        ),
-        (
-            "<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Graded predictions</h2>"
-            "<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Point-in-time resolution and max-favorable-excursion are shown side by side for the exact recorded scan batch.</p>"
+    sections: list[str] = [
+        render_row_title("Batch highlights"),
+        StyledSection(highlight_tiles),
+        render_panel(
+            "Graded predictions",
+            callouts
             + render_html_table(
                 [
                     "Ticker",
@@ -192,56 +196,71 @@ def build_grading_report(
                     "Status",
                 ],
                 preview_rows,
-            )
+            ),
+            description=(
+                f"Grading the profit-opportunities scan recorded on {scan_date.isoformat()} against data available "
+                f"through {grading_date.isoformat()}. Point-in-time resolution and max-favorable-excursion are shown "
+                "side by side for the exact recorded scan batch."
+            ),
         ),
     ]
 
     score_stats = (score_validation or {}).get("overall") or {}
     if score_stats.get("count"):
         ic = score_stats.get("information_coefficient")
+        sections.append(render_row_title("Score validation (all-time, this horizon)"))
         sections.append(
-            "<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Score validation (all-time, this horizon)</h2>"
-            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Does a higher composite score actually precede a better outcome? "
-            f"Computed across all {int(score_stats['count'])} resolved {HORIZON_LABELS[horizon]} predictions to date, not just this batch.</p>"
-            + render_metric_tiles(
-                [
-                    {"label": "Information coefficient", "value": "—" if ic is None else f"{ic:.3f}"},
-                    {
-                        "label": "Top-third hit rate",
-                        "value": "—" if score_stats.get("precision_at_top_third") is None else f"{score_stats['precision_at_top_third']:.1f}%",
-                    },
-                    {
-                        "label": "Bottom-third hit rate",
-                        "value": "—" if score_stats.get("precision_at_bottom_third") is None else f"{score_stats['precision_at_bottom_third']:.1f}%",
-                    },
-                ]
+            render_panel(
+                "Does a higher score precede a better outcome?",
+                render_metric_tiles(
+                    [
+                        {"label": "Information coefficient", "value": "—" if ic is None else f"{ic:.3f}"},
+                        {
+                            "label": "Top-third hit rate",
+                            "value": "—" if score_stats.get("precision_at_top_third") is None else f"{score_stats['precision_at_top_third']:.1f}%",
+                        },
+                        {
+                            "label": "Bottom-third hit rate",
+                            "value": "—" if score_stats.get("precision_at_bottom_third") is None else f"{score_stats['precision_at_bottom_third']:.1f}%",
+                        },
+                    ]
+                ),
+                description=(
+                    f"Computed across all {int(score_stats['count'])} resolved {HORIZON_LABELS[horizon]} "
+                    "predictions to date, not just this batch."
+                ),
             )
         )
 
     upside_stats = (upside_validation or {}).get("overall") or {}
     if upside_stats.get("count"):
         upside_ic = upside_stats.get("information_coefficient")
+        sections.append(render_row_title("Upside forecast validation (all-time, this horizon)"))
         sections.append(
-            "<h2 style=\"margin:0 0 10px 0;color:#f4fff8;\">Upside forecast validation (all-time, this horizon)</h2>"
-            f"<p style=\"margin:0 0 16px 0;color:#a9bdd7;\">Is the projected upside % itself systematically over-optimistic, "
-            f"not just directionally correlated with outcomes? Computed across all {int(upside_stats['count'])} resolved "
-            f"{HORIZON_LABELS[horizon]} predictions to date, not just this batch.</p>"
-            + render_metric_tiles(
-                [
-                    {"label": "Information coefficient", "value": "—" if upside_ic is None else f"{upside_ic:.3f}"},
-                    {
-                        "label": "Mean bias (actual − projected)",
-                        "value": "—" if upside_stats.get("mean_bias_pct") is None else f"{upside_stats['mean_bias_pct']:.2f}%",
-                    },
-                    {
-                        "label": "Median bias (actual − projected)",
-                        "value": "—" if upside_stats.get("median_bias_pct") is None else f"{upside_stats['median_bias_pct']:.2f}%",
-                    },
-                    {
-                        "label": "Over-optimism rate",
-                        "value": "—" if upside_stats.get("overoptimism_rate") is None else f"{upside_stats['overoptimism_rate']:.1f}%",
-                    },
-                ]
+            render_panel(
+                "Is the projected upside systematically over-optimistic?",
+                render_metric_tiles(
+                    [
+                        {"label": "Information coefficient", "value": "—" if upside_ic is None else f"{upside_ic:.3f}"},
+                        {
+                            "label": "Mean bias (actual − projected)",
+                            "value": "—" if upside_stats.get("mean_bias_pct") is None else f"{upside_stats['mean_bias_pct']:.2f}%",
+                        },
+                        {
+                            "label": "Median bias (actual − projected)",
+                            "value": "—" if upside_stats.get("median_bias_pct") is None else f"{upside_stats['median_bias_pct']:.2f}%",
+                        },
+                        {
+                            "label": "Over-optimism rate",
+                            "value": "—" if upside_stats.get("overoptimism_rate") is None else f"{upside_stats['overoptimism_rate']:.1f}%",
+                        },
+                    ]
+                ),
+                description=(
+                    "Is the projected upside % itself systematically over-optimistic, not just directionally "
+                    f"correlated with outcomes? Computed across all {int(upside_stats['count'])} resolved "
+                    f"{HORIZON_LABELS[horizon]} predictions to date, not just this batch."
+                ),
             )
         )
 

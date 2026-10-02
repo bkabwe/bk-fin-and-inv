@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -172,6 +174,90 @@ class FinbertPipelineLoaderTests(unittest.TestCase):
         pipeline_ctor.assert_called_once()
         self.assertIs(first, fake_pipeline)
         self.assertIs(second, fake_pipeline)
+
+    def test_concurrent_cold_start_loads_the_model_exactly_once(self):
+        # Regression: the headless scan shards call the loader from a worker
+        # thread pool on a cold process. The first `transformers` import is not
+        # thread-safe, and the old unlocked `lru_cache` loader both raced on it
+        # ("cannot import name 'pipeline' from 'transformers'") and cached the
+        # resulting None for the rest of the run. Loading must be serialized.
+        fake_pipeline = Mock(name="finbert_pipeline")
+        thread_count = 8
+        barrier = threading.Barrier(thread_count)
+        results: list[object] = [None] * thread_count
+
+        def _slow_ctor(*args, **kwargs):
+            time.sleep(0.05)
+            return fake_pipeline
+
+        def _worker(index: int) -> None:
+            barrier.wait()
+            results[index] = self.sentiment_analysis._load_finbert_pipeline()
+
+        with patch("transformers.pipeline", side_effect=_slow_ctor) as pipeline_ctor:
+            threads = [threading.Thread(target=_worker, args=(i,)) for i in range(thread_count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+
+        pipeline_ctor.assert_called_once()
+        self.assertTrue(all(result is fake_pipeline for result in results))
+
+    def test_failed_load_is_not_cached_permanently(self):
+        fake_pipeline = Mock(name="finbert_pipeline")
+        with (
+            patch.object(self.sentiment_analysis, "FINBERT_RETRY_COOLDOWN_SECONDS", 0.0),
+            patch(
+                "transformers.pipeline",
+                side_effect=[ImportError("cannot import name 'pipeline' from 'transformers'"), fake_pipeline],
+            ) as pipeline_ctor,
+        ):
+            first = self.sentiment_analysis._load_finbert_pipeline()
+            second = self.sentiment_analysis._load_finbert_pipeline()
+            third = self.sentiment_analysis._load_finbert_pipeline()
+
+        self.assertIsNone(first)
+        self.assertIs(second, fake_pipeline)
+        self.assertIs(third, fake_pipeline)
+        self.assertEqual(pipeline_ctor.call_count, 2)
+
+    def test_failed_load_is_not_retried_during_the_cooldown(self):
+        with (
+            patch.object(self.sentiment_analysis, "FINBERT_RETRY_COOLDOWN_SECONDS", 3600.0),
+            patch("transformers.pipeline", side_effect=RuntimeError("model download failed")) as pipeline_ctor,
+        ):
+            first = self.sentiment_analysis._load_finbert_pipeline()
+            second = self.sentiment_analysis._load_finbert_pipeline()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        pipeline_ctor.assert_called_once()
+
+    def test_cache_clear_forgets_a_recorded_failure(self):
+        fake_pipeline = Mock(name="finbert_pipeline")
+        with (
+            patch.object(self.sentiment_analysis, "FINBERT_RETRY_COOLDOWN_SECONDS", 3600.0),
+            patch("transformers.pipeline", side_effect=[RuntimeError("boom"), fake_pipeline]) as pipeline_ctor,
+        ):
+            self.assertIsNone(self.sentiment_analysis._load_finbert_pipeline())
+            self._clear_finbert_cache()
+            self.assertIs(self.sentiment_analysis._load_finbert_pipeline(), fake_pipeline)
+
+        self.assertEqual(pipeline_ctor.call_count, 2)
+
+
+class WarmUpFinbertTests(unittest.TestCase):
+    def test_reports_true_when_the_pipeline_loads(self):
+        sentiment_analysis = _load_sentiment_analysis_module()
+        with patch.object(sentiment_analysis, "_load_finbert_pipeline", return_value=Mock()) as loader:
+            self.assertTrue(sentiment_analysis.warm_up_finbert())
+        loader.assert_called_once_with()
+
+    def test_reports_false_when_the_pipeline_is_unavailable(self):
+        sentiment_analysis = _load_sentiment_analysis_module()
+        with patch.object(sentiment_analysis, "_load_finbert_pipeline", return_value=None):
+            self.assertFalse(sentiment_analysis.warm_up_finbert())
 
 
 if __name__ == "__main__":

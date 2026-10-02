@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
-from functools import lru_cache
 from statistics import mean
+from typing import Any
 
 from modules.data_fetcher import get_news, get_stock_info
 from modules.logger import get_logger
@@ -14,7 +14,6 @@ try:
     import streamlit as st
 
     cache_data = st.cache_data
-    cache_resource = st.cache_resource
 except Exception:  # pragma: no cover
 
     def cache_data(ttl: int | None = None):  # type: ignore[misc]
@@ -57,19 +56,84 @@ except Exception:  # pragma: no cover
 
         return decorator
 
-    def cache_resource(func):
-        return lru_cache(maxsize=1)(func)
+
+FINBERT_MODEL_NAME = "ProsusAI/finbert"
+# After a failed load, don't retry for this many seconds. Callers in that
+# window get ``None`` immediately (neutral sentiment) rather than each paying
+# for another slow import/model-download attempt; once it elapses the next
+# caller tries again, so a transient failure doesn't disable FinBERT for the
+# whole process.
+FINBERT_RETRY_COOLDOWN_SECONDS = 60.0
+
+_finbert_lock = threading.Lock()
+_finbert_pipeline: Any = None
+_finbert_last_failure_at: float | None = None
 
 
-@cache_resource
 def _load_finbert_pipeline():
-    try:
-        from transformers import pipeline
+    """Return the shared FinBERT pipeline, or ``None`` if it can't be loaded.
 
-        return pipeline("sentiment-analysis", model="ProsusAI/finbert")
-    except Exception as exc:
-        logger.warning("Unable to load FinBERT model, falling back to neutral headlines: %s", exc)
-        return None
+    The first call imports ``transformers`` and builds the model; later calls
+    reuse that instance. Loading is serialized behind a lock because
+    ``transformers`` resolves ``pipeline`` through a lazy module whose first
+    import is not thread-safe: concurrent cold-start callers (e.g. the scan
+    shard's worker threads, where Streamlit's own locking cache isn't
+    available) could otherwise fail with ``cannot import name 'pipeline' from
+    'transformers'``. A failed load is not cached for the life of the process
+    (that left an entire run on neutral sentiment); it is retried once
+    ``FINBERT_RETRY_COOLDOWN_SECONDS`` has elapsed.
+    """
+    global _finbert_pipeline, _finbert_last_failure_at
+
+    pipeline_instance = _finbert_pipeline
+    if pipeline_instance is not None:
+        return pipeline_instance
+
+    with _finbert_lock:
+        if _finbert_pipeline is not None:
+            return _finbert_pipeline
+        if (
+            _finbert_last_failure_at is not None
+            and (time.monotonic() - _finbert_last_failure_at) < FINBERT_RETRY_COOLDOWN_SECONDS
+        ):
+            return None
+        try:
+            from transformers import pipeline
+
+            _finbert_pipeline = pipeline("sentiment-analysis", model=FINBERT_MODEL_NAME)
+        except Exception as exc:
+            _finbert_last_failure_at = time.monotonic()
+            logger.warning(
+                "Unable to load FinBERT model, falling back to neutral headlines (retrying in %.0fs): %s",
+                FINBERT_RETRY_COOLDOWN_SECONDS,
+                exc,
+            )
+            return None
+        _finbert_last_failure_at = None
+        return _finbert_pipeline
+
+
+def _reset_finbert_pipeline() -> None:
+    """Forget the cached pipeline and any recorded load failure."""
+    global _finbert_pipeline, _finbert_last_failure_at
+    with _finbert_lock:
+        _finbert_pipeline = None
+        _finbert_last_failure_at = None
+
+
+# Same invalidation hook the ``cache_resource``/``lru_cache`` wrapper used to
+# expose, kept so callers (and tests) can reset the loader's state.
+_load_finbert_pipeline.cache_clear = _reset_finbert_pipeline  # type: ignore[attr-defined]
+
+
+def warm_up_finbert() -> bool:
+    """Load FinBERT eagerly; return ``True`` when it is ready for inference.
+
+    Batch jobs call this once from the main thread before fanning tickers out
+    to worker threads, so the (slow) import + model load happens a single time
+    up front instead of racing inside the pool.
+    """
+    return _load_finbert_pipeline() is not None
 
 
 @cache_data(ttl=3600)

@@ -28,6 +28,7 @@ from modules.lightgbm_batch import (
 from modules.logger import get_logger
 from modules.longterm_analysis import analyze_longterm_technical_score
 from modules.macro_regime import get_macro_regime
+from modules.price_format import price_decimals, round_price
 from modules.sentiment_analysis import analyze_sentiment
 from modules.technical_analysis import analyze_technical, relative_strength_vs_spy
 
@@ -106,24 +107,23 @@ _CONFIDENCE_EVIDENCE_WEIGHT = 0.5  # 50/50 blend between ensemble agreement and 
 # only dampens reach rather than ever fully erasing direction.
 _SHRINKAGE_MIN_RETAINED_MOVE = 0.50
 
-# Fixed fundamentals-model weight budgets for the medium/long-term price
-# projection ensembles in _get_price_projections_core. These used to be
-# 0.20/0.10 (medium) and 0.20/0.10 (long), with the remaining share reserved
-# for an "Analyst Target" slot fed by info.get("targetMeanPrice"). That field
-# is permanently hardcoded to None by the Polygon+SEC EDGAR data adapter (see
-# modules/polygon_client.py: no analyst-consensus source is wired up), so the
-# slot could never contribute -- and _weighted_ensemble() only normalizes over
-# components that DO have a value, so its "reserved" share was silently
-# redistributed back onto Trend/Fundamental/DCF in proportion to their
-# own weights, disproportionately inflating the remaining largest raw weight.
-# The dead Analyst slot has been removed and its
-# budget reassigned explicitly here instead, consistent with fundamentals
-# mattering more over longer holding periods (see _FUNDAMENTAL_SENTIMENT_WEIGHTS
-# below). The corresponding Trend "budget" in _projection_model_weights
-# has been reduced by the same amount so each horizon's weights still sum to 1.0.
-MEDIUM_TERM_FUNDAMENTAL_WEIGHT = 0.30
+# Fixed DCF+Comps weights for the medium/long-term price projection ensembles
+# in _get_price_projections_core; Trend (plus LightGBM at 180d) share the rest
+# of each horizon's budget, split by walk-forward backtest evidence in
+# _projection_model_weights.
+#
+# These ensembles used to carry a second fixed slot, "Fundamental Fair Value"
+# (30% medium / 35% long), computed as EPS x P/E. The SEC EDGAR adapter derives
+# trailingPE as price / EPS (and supplies no forward EPS/PE; see
+# modules/sec_edgar_client.py), so that product was always just the current
+# price: a hidden "no change" anchor that pulled every medium/long-term target
+# back toward today's price while being reported as a fundamentals model. It
+# has been removed and its budget reassigned explicitly to the Trend/LightGBM
+# pool in _projection_model_weights (the DCF+Comps weights are unchanged). The
+# explicit reassignment matters: _weighted_ensemble() only normalizes over the
+# components that have a value, so simply dropping a slot would silently
+# inflate whichever remaining weights happened to be largest.
 MEDIUM_TERM_DCF_WEIGHT = 0.20
-LONG_TERM_FUNDAMENTAL_WEIGHT = 0.35
 LONG_TERM_DCF_WEIGHT = 0.25
 
 # Fundamental+sentiment point pool in the composite 0-100 score is fixed at 50
@@ -292,7 +292,8 @@ def _apply_market_cap_confidence_padding(
     padding = current_price * padding_ratio
     widened_low = max(0.0, low - padding)
     widened_high = high + padding
-    return round(widened_low, 2), round(max(widened_low, widened_high), 2)
+    decimals = price_decimals(current_price)
+    return round(widened_low, decimals), round(max(widened_low, widened_high), decimals)
 
 
 def _weighted_ensemble(components: list[tuple[str, float | None, float]]) -> tuple[float | None, str, list[float]]:
@@ -348,7 +349,8 @@ def _confidence_bounds(
     if cap_value is not None:
         low = min(low, cap_value)
         high = min(high, cap_value)
-    return round(low, 2), round(max(low, high), 2)
+    decimals = price_decimals(current_price)
+    return round(low, decimals), round(max(low, high), decimals)
 
 
 def _required_history_days(horizon_days: int) -> int:
@@ -452,7 +454,7 @@ def _cap_target(value: float, current_price: float, cap_value: float | None) -> 
     target = max(float(value), current_price)
     if cap_value is not None:
         target = min(target, cap_value)
-    return round(target, 2)
+    return round(target, price_decimals(current_price))
 
 
 def _lightgbm_adaptive_share_cap(lightgbm_windows: int | None) -> float:
@@ -543,10 +545,9 @@ def _projection_model_weights(
         return _blend_lightgbm_weight(scaled, LIGHTGBM_WEIGHT_30D if include_lightgbm else 0.0)
 
     if int(horizon_days) == 180:
-        # budget + MEDIUM_TERM_FUNDAMENTAL_WEIGHT + MEDIUM_TERM_DCF_WEIGHT must
-        # sum to 1.0 (see the ensemble components built in
-        # _get_price_projections_core).
-        budget = 1.0 - MEDIUM_TERM_FUNDAMENTAL_WEIGHT - MEDIUM_TERM_DCF_WEIGHT
+        # budget + MEDIUM_TERM_DCF_WEIGHT must sum to 1.0 (see the ensemble
+        # components built in _get_price_projections_core).
+        budget = 1.0 - MEDIUM_TERM_DCF_WEIGHT
         if include_lightgbm and backtest:
             adaptive_weights = _inverse_rmse_weights(backtest, include_lightgbm=True)
             if adaptive_weights and "lightgbm" in adaptive_weights:
@@ -567,9 +568,9 @@ def _projection_model_weights(
     # non-overlapping backtest window per ticker at this horizon, so the 20/30 vs.
     # trend and 22/30 vs. naive win rates are promising but not yet actionable.
     # Revisit once more historical data accrues naturally and yields additional 720d windows.
-    # budget + LONG_TERM_FUNDAMENTAL_WEIGHT + LONG_TERM_DCF_WEIGHT must sum to
-    # 1.0 (see the ensemble components built in _get_price_projections_core).
-    long_budget = 1.0 - LONG_TERM_FUNDAMENTAL_WEIGHT - LONG_TERM_DCF_WEIGHT
+    # budget + LONG_TERM_DCF_WEIGHT must sum to 1.0 (see the ensemble
+    # components built in _get_price_projections_core).
+    long_budget = 1.0 - LONG_TERM_DCF_WEIGHT
     if backtest:
         base_weights = _inverse_rmse_weights(backtest)
         if base_weights:
@@ -738,14 +739,30 @@ def _garch_confidence_from_returns(
     *,
     forecast: Any | None = None,
 ) -> tuple[float | None, float | None]:
+    """95% price band implied by the GARCH(1,1) volatility forecast over
+    ``horizon_days``.
+
+    ``forecast.variance`` holds the conditional variance of each *single day*
+    ahead, so the variance of the cumulative log return over the horizon is
+    the sum of the first ``horizon_days`` steps (GARCH innovations are
+    uncorrelated). Using one day's variance instead gives a one-day band
+    (~+/-4% at 2% daily volatility) that is far too tight for a 30-720 day
+    target.
+    """
     if not ARCH_AVAILABLE or len(log_returns) < 60 or current_price <= 0:
         return None, None
     try:
         fcast = forecast
         if fcast is None:
             fcast = _fit_garch_forecast(log_returns, max_horizon=horizon_days)
-        var = float(fcast.variance.values[-1, min(horizon_days - 1, fcast.variance.shape[1] - 1)])
-        sigma = np.sqrt(max(var, 1e-9)) / 100.0
+        variance_path = np.asarray(fcast.variance.values[-1], dtype=float)
+        steps = max(1, min(int(horizon_days), variance_path.size))
+        cumulative_var = float(variance_path[:steps].sum())
+        if steps < horizon_days:
+            # The forecast is shorter than the requested horizon; extend it
+            # with the last forecast day's variance.
+            cumulative_var += float(variance_path[-1]) * (horizon_days - steps)
+        sigma = np.sqrt(max(cumulative_var, 1e-9)) / 100.0
         z = 1.96
         low = current_price * np.exp(-z * sigma)
         high = current_price * np.exp(z * sigma)
@@ -933,23 +950,6 @@ def _get_price_projections_core(
     fundamentals = analyze_fundamentals(info, current_price=current_price, risk_free_rate=risk_free_rate)
     metrics = fundamentals.get("metrics", {})
 
-    fair_value = None
-    forward_eps = info.get("forwardEps")
-    trailing_eps = info.get("trailingEps")
-    forward_pe = info.get("forwardPE")
-    trailing_pe = info.get("trailingPE")
-    if forward_eps and forward_eps > 0 and forward_pe and forward_pe > 0:
-        fair_value = float(forward_eps) * float(forward_pe)
-        models_used.append("Fundamental Fair Value")
-    elif trailing_eps and trailing_eps > 0 and trailing_pe and trailing_pe > 0:
-        fair_value = float(trailing_eps) * float(trailing_pe)
-        models_used.append("Fundamental Fair Value")
-    elif (forward_eps and forward_eps > 0) or (trailing_eps and trailing_eps > 0):
-        fair_value = float(forward_eps or trailing_eps) * 20.0
-        models_used.append("Fundamental Fair Value")
-    else:
-        models_skipped.append("Fundamental Fair Value: no EPS data")
-
     # valuation_estimate blends the Graham-DCF heuristic with a sector-P/E
     # comparables cross-check (see modules/fundamental_analysis.py); this is
     # what feeds the "DCF" ensemble slot below, so a single-model artifact in
@@ -977,10 +977,10 @@ def _get_price_projections_core(
     # redistributed *proportionally* back onto whichever other components
     # were present -- disproportionately inflating the largest of the
     # remaining raw weights rather than benefiting fundamentals. The weight
-    # has been removed here and its budget reassigned explicitly to
-    # Fundamental Fair Value / DCF+Comps below instead. If an
-    # analyst-consensus data source is ever reintroduced, re-add this slot
-    # deliberately rather than relying on info.get("targetMeanPrice").
+    # has been removed here and its budget reassigned explicitly instead (see
+    # the MEDIUM_TERM_DCF_WEIGHT note). If an analyst-consensus data source is
+    # ever reintroduced, re-add this slot deliberately rather than relying on
+    # info.get("targetMeanPrice").
 
     short_projection, short_basis, short_values = _weighted_ensemble(
         [
@@ -993,14 +993,12 @@ def _get_price_projections_core(
         [
             ("Trend", trend_180, medium_model_weights.get("trend", 0.0)),
             ("LightGBM", lightgbm_projections.get(180), medium_model_weights.get("lightgbm", 0.0)),
-            ("Fundamental", fair_value, MEDIUM_TERM_FUNDAMENTAL_WEIGHT),
             ("DCF+Comps", dcf_estimate, MEDIUM_TERM_DCF_WEIGHT),
         ]
     )
     long_projection, long_basis, long_values = _weighted_ensemble(
         [
             ("Trend", trend_720, long_model_weights.get("trend", 0.0)),
-            ("Fundamental", fair_value, LONG_TERM_FUNDAMENTAL_WEIGHT),
             ("DCF+Comps", dcf_estimate, LONG_TERM_DCF_WEIGHT),
         ]
     )
@@ -1055,7 +1053,6 @@ def _get_price_projections_core(
             trend_720,
             lightgbm_projections.get(30),
             lightgbm_projections.get(180),
-            fair_value,
             dcf_estimate,
         ]
         if x is not None
@@ -1113,7 +1110,8 @@ def _get_price_projections_core(
     long_low, long_high = _apply_market_cap_confidence_padding(long_low, long_high, current_price, market_cap_tier)
 
     near_resistance = current_price >= (technical_resistance * 0.97) if technical_resistance else False
-    if is_speculative_otc and "Fundamental Fair Value: no EPS data" in models_skipped:
+    has_fundamentals = "DCF+Comps Estimate" in models_used
+    if is_speculative_otc and not has_fundamentals:
         recommendation_to_sell_at = (
             "Limited data available for OTC stock. Projection based on technical trend only. "
             "High risk — size position accordingly."
@@ -1137,11 +1135,11 @@ def _get_price_projections_core(
             f"Take partial profits near ${short_projection:.2f}, then review momentum toward ${medium_projection:.2f}."
         )
 
-    if is_speculative_otc and "Fundamental Fair Value" not in models_used:
+    # "Full" means both a fundamentals-based estimate (DCF+Comps, built from
+    # EPS) and a price-trend model were available.
+    if is_speculative_otc and not has_fundamentals:
         data_quality = "Technical Only"
-    elif "Fundamental Fair Value" in models_used and (
-        "Log Linear Trend" in models_used or "Log Polynomial Trend" in models_used
-    ):
+    elif has_fundamentals and ("Log Linear Trend" in models_used or "Log Polynomial Trend" in models_used):
         data_quality = "Full"
     else:
         data_quality = "Limited"
@@ -1154,7 +1152,7 @@ def _get_price_projections_core(
     )
 
     return {
-        "current_price": round(current_price, 2),
+        "current_price": round_price(current_price),
         "short_term_target": short_projection,
         "short_term_low": short_low,
         "short_term_high": short_high,

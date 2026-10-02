@@ -168,5 +168,134 @@ class AnalyzeTickerForHorizonConfidenceTests(unittest.TestCase):
         )
 
 
+def _row_for(projections_overrides: dict, *, horizon: str = "short_term", **analysis_overrides):
+    analysis = _make_analysis(**analysis_overrides)
+    analysis["projections"].update(projections_overrides)
+    return profit_opportunities.profit_row_from_analysis("TEST", horizon, analysis)
+
+
+class RiskAdjustedUpsideBandEdgeTests(unittest.TestCase):
+    """Regression tests for the "8.02 / 8.00 then 0.83" Risk-Adjusted Upside
+    artifact: a forecast-band edge that was legitimately 0.0 was mistaken for
+    "missing" and replaced by a fabricated +/-5% band around the target, which
+    is far narrower than the move it must contain and inflated the ratio."""
+
+    def test_zero_lower_edge_is_a_real_edge_not_a_missing_one(self):
+        # Price $0.004 -> target $0.012 (+200%, the cap) with a lower edge of
+        # exactly $0.00 and an upper edge of $0.020. The honest band is
+        # (0.020 - 0.0) / 0.004 = 500% wide, so the ratio is 200 / 500 = 0.4.
+        # Treating 0.0 as "missing" gave a ~215% band and a ratio of ~0.93.
+        row = _row_for(
+            {
+                "current_price": 0.004,
+                "short_term_target": 0.012,
+                "short_term_low": 0.0,
+                "short_term_high": 0.020,
+                "short_term_upside": 200.0,
+            },
+            current_price=0.004,
+        )
+
+        self.assertEqual(row["Target Low"], 0.0)
+        self.assertAlmostEqual(row["Forecast Range %"], 500.0, places=2)
+        self.assertAlmostEqual(row["Risk-Adjusted Upside"], 0.4, places=4)
+
+    def test_missing_edges_fall_back_to_band_that_brackets_price_and_target(self):
+        # A fabricated +/-5%-of-target band around a +200% target never
+        # contained the current price (a 30%-wide band for a 200% move), which
+        # yielded a ratio of ~6.7. The fallback band must bracket both.
+        analysis = _make_analysis(current_price=100.0)
+        analysis["projections"].update(
+            {"current_price": 100.0, "short_term_target": 300.0, "short_term_upside": 200.0}
+        )
+        analysis["projections"].pop("short_term_low")
+        analysis["projections"].pop("short_term_high")
+
+        row = profit_opportunities.profit_row_from_analysis("TEST", "short_term", analysis)
+
+        self.assertEqual(row["Target Low"], 100.0)
+        self.assertEqual(row["Target High"], 315.0)
+        self.assertAlmostEqual(row["Risk-Adjusted Upside"], 200.0 / 215.0, places=4)
+        self.assertLessEqual(row["Risk-Adjusted Upside"], 1.0)
+
+    def test_non_finite_edges_are_treated_as_missing(self):
+        row = _row_for(
+            {
+                "current_price": 100.0,
+                "short_term_target": 130.0,
+                "short_term_low": float("nan"),
+                "short_term_high": float("inf"),
+                "short_term_upside": 30.0,
+            },
+            current_price=100.0,
+        )
+
+        self.assertEqual(row["Target Low"], 100.0)
+        self.assertEqual(row["Target High"], 136.5)
+        self.assertLessEqual(row["Risk-Adjusted Upside"], 1.0)
+
+    def test_real_band_containing_price_and_target_never_exceeds_one(self):
+        row = _row_for(
+            {
+                "current_price": 10.0,
+                "short_term_target": 12.0,
+                "short_term_low": 9.0,
+                "short_term_high": 14.0,
+                "short_term_upside": 20.0,
+            },
+            current_price=10.0,
+        )
+
+        # band = (14 - 9) / 10 = 50% wide; upside 20% -> 0.4.
+        self.assertAlmostEqual(row["Forecast Range %"], 50.0, places=2)
+        self.assertAlmostEqual(row["Risk-Adjusted Upside"], 0.4, places=4)
+
+    def test_sub_cent_prices_keep_enough_decimals_in_the_row(self):
+        row = _row_for(
+            {
+                "current_price": 0.003217,
+                "short_term_target": 0.006434,
+                "short_term_low": 0.002901,
+                "short_term_high": 0.007212,
+                "short_term_upside": 100.0,
+            },
+            current_price=0.003217,
+        )
+
+        self.assertEqual(row["Current Price"], 0.003217)
+        self.assertEqual(row["Target Price"], 0.006434)
+        self.assertEqual(row["Target Low"], 0.002901)
+        self.assertEqual(row["Target High"], 0.007212)
+
+    def test_normal_prices_keep_four_decimals_in_the_row(self):
+        row = _row_for({"short_term_target": 200.123456}, current_price=190.0)
+
+        self.assertEqual(row["Target Price"], 200.1235)
+
+
+class RiskAdjustedRatingTests(unittest.TestCase):
+    def test_buckets_follow_documented_thresholds(self):
+        rating = profit_opportunities.risk_adjusted_rating
+
+        self.assertEqual(rating(1.0), "Strong (0.60+)")
+        self.assertEqual(rating(0.60), "Strong (0.60+)")
+        self.assertEqual(rating(0.5999), "Moderate (0.30 to <0.60)")
+        self.assertEqual(rating(0.30), "Moderate (0.30 to <0.60)")
+        self.assertEqual(rating(0.2999), "Weak (<0.30)")
+        self.assertEqual(rating(0.0), "Weak (<0.30)")
+        self.assertEqual(rating(-0.2), "Weak (<0.30)")
+
+    def test_missing_or_non_finite_value_has_no_rating(self):
+        self.assertEqual(profit_opportunities.risk_adjusted_rating(None), "")
+        self.assertEqual(profit_opportunities.risk_adjusted_rating(float("nan")), "")
+
+    def test_row_exposes_forecast_range_and_self_describing_rating(self):
+        # current=190, band=(205-195)/190 = 5.26% wide, upside 5.26% -> ratio 1.0.
+        row = _row_for({})
+
+        self.assertAlmostEqual(row["Forecast Range %"], 5.26, places=2)
+        self.assertEqual(row["Risk-Adjusted Rating"], "Strong (0.60+)")
+
+
 if __name__ == "__main__":
     unittest.main()

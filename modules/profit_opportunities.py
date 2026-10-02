@@ -16,6 +16,7 @@ per-ticker analysis helpers defined here.
 
 from __future__ import annotations
 
+import math
 import threading
 from datetime import date, timedelta
 from typing import Any, Callable
@@ -31,6 +32,7 @@ from modules.data_fetcher import (
     get_stock_data,
 )
 from modules.logger import get_logger
+from modules.price_format import price_decimals
 from modules.scoring_engine import analyze_stock, fast_screen_score
 from modules.validators import sanitize_ticker_list
 
@@ -132,6 +134,48 @@ DEFAULT_MIN_UPSIDE_PCT = 15.0
 DEFAULT_MIN_BAND_WIDTH_PCT = 1.0
 
 
+def _optional_float(value: Any) -> float | None:
+    """``float(value)``, or ``None`` when the value is missing, non-numeric,
+    NaN or infinite. Unlike ``float(value or default)`` this keeps a genuine
+    ``0.0`` -- a legitimate forecast-band edge for a very uncertain or
+    sub-dollar ticker -- instead of mistaking it for "missing"."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+# "Risk-Adjusted Upside" (upside % / forecast-range width %) reading bands.
+# The forecast range always contains both the current price and the target
+# (see modules.scoring_engine._confidence_bounds), so the ratio lives in
+# (0, 1]: 1.0 means the whole range is upside, 0.5 means the range is twice as
+# wide as the expected gain, 0.1 means ten times as wide. Rows at/above
+# RISK_ADJUSTED_STRONG_MIN are rated "Strong", at/above
+# RISK_ADJUSTED_MODERATE_MIN "Moderate", and the rest "Weak".
+RISK_ADJUSTED_STRONG_MIN = 0.60
+RISK_ADJUSTED_MODERATE_MIN = 0.30
+RISK_ADJUSTED_RATING_LABELS: dict[str, str] = {
+    "Strong": f"Strong ({RISK_ADJUSTED_STRONG_MIN:.2f}+)",
+    "Moderate": f"Moderate ({RISK_ADJUSTED_MODERATE_MIN:.2f} to <{RISK_ADJUSTED_STRONG_MIN:.2f})",
+    "Weak": f"Weak (<{RISK_ADJUSTED_MODERATE_MIN:.2f})",
+}
+
+
+def risk_adjusted_rating(risk_adjusted_upside: float | None) -> str:
+    """Self-describing bucket for a Risk-Adjusted Upside value, e.g.
+    ``"Strong (0.60+)"``, so a CSV reader can see what a high or low number
+    means without opening the email legend."""
+    value = _optional_float(risk_adjusted_upside)
+    if value is None:
+        return ""
+    if value >= RISK_ADJUSTED_STRONG_MIN:
+        return RISK_ADJUSTED_RATING_LABELS["Strong"]
+    if value >= RISK_ADJUSTED_MODERATE_MIN:
+        return RISK_ADJUSTED_RATING_LABELS["Moderate"]
+    return RISK_ADJUSTED_RATING_LABELS["Weak"]
+
+
 def collect_universe_tickers(
     universes: list[str],
     custom_tickers: list[str] | None = None,
@@ -203,8 +247,17 @@ def profit_row_from_analysis(
 
     target_price = float(projections.get(settings["target_key"]) or 0)
     upside = float(projections.get(settings["upside_key"]) or 0)
-    target_low = float(projections.get(settings["target_low_key"]) or target_price * 0.95)
-    target_high = float(projections.get(settings["target_high_key"]) or target_price * 1.05)
+    target_low = _optional_float(projections.get(settings["target_low_key"]))
+    target_high = _optional_float(projections.get(settings["target_high_key"]))
+    # Only a genuinely missing edge falls back to a +/-5% band around the
+    # target (a real 0.0 lower edge is kept as-is). The fabricated edge is
+    # widened to still bracket the current price, as every real band does, so
+    # a made-up band can never look tighter than the move it should contain
+    # and inflate Risk-Adjusted Upside.
+    if target_low is None:
+        target_low = min(target_price * 0.95, current_price)
+    if target_high is None:
+        target_high = max(target_price * 1.05, current_price)
     rsi = (analysis.get("technical") or {}).get("indicators", {}).get("rsi")
     breakdown = analysis.get("score_breakdown") or {}
     lightgbm_backtested_key = settings.get("lightgbm_backtested_key")
@@ -221,17 +274,22 @@ def profit_row_from_analysis(
     # so a near-zero band width can't blow the ratio toward infinity.
     band_width_pct = ((target_high - target_low) / current_price) * 100 if current_price else 0.0
     risk_adjusted_upside = upside / max(band_width_pct, DEFAULT_MIN_BAND_WIDTH_PCT)
+    # Four decimals for normal prices; sub-cent prices need six or the
+    # rounding itself would distort the target/band the row reports.
+    price_places = max(4, price_decimals(current_price))
 
     return {
         "Ticker": ticker,
         "Company": analysis.get("company") or ticker,
         "Score": int(analysis.get("score") or 0),
-        "Current Price": round(current_price, 4),
-        "Target Price": round(target_price, 4),
-        "Target Low": round(target_low, 4),
-        "Target High": round(target_high, 4),
+        "Current Price": round(current_price, price_places),
+        "Target Price": round(target_price, price_places),
+        "Target Low": round(target_low, price_places),
+        "Target High": round(target_high, price_places),
         "Projected Upside %": round(upside, 4),
         "Risk-Adjusted Upside": round(risk_adjusted_upside, 4),
+        "Forecast Range %": round(band_width_pct, 2),
+        "Risk-Adjusted Rating": risk_adjusted_rating(risk_adjusted_upside),
         "Confidence Score": int(projections.get(settings.get("confidence_key")) or 0),
         "Sector": str(sector) if sector else "Unknown",
         "Sector Trend": str(analysis.get("sector_trend") or "unknown").replace("_", " ").title(),
