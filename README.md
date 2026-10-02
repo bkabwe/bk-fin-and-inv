@@ -133,6 +133,9 @@ on macOS or don't use Homebrew's `redis` service.
 - Market OHLCV data: Polygon aggregates `/v2/aggs/...` with `adjusted=true`
 - Current price proxy: Polygon previous-day close `/v2/aggs/ticker/{ticker}/prev`
 - VIX / macro regime volatility context: FRED `VIXCLS` daily observations API
+- 10Y Treasury yield for the macro regime: FRED `DGS10` (free with the same
+  `FRED_API_KEY`; it replaces Polygon's `I:TNX` index ticker, which needs a
+  paid Indices plan and returned HTTP 403 on the Stocks-only plan)
 - Additional macro feature series: FRED `DGS10` (10Y Treasury), `CPIAUCSL` (CPI),
   and `FEDFUNDS` (Fed Funds Rate), including 5-day/30-day deltas and percent changes
 - Reference/profile fields (name/sector/market-cap): Polygon ticker overview
@@ -175,9 +178,16 @@ sentiment, and macro context, with all final scores clamped to that range.
   how price-projection ensemble weights already shrink LightGBM's influence at
   longer horizons. Callers that don't pass a horizon keep the original flat
   30/20 split. Sentiment headline scoring uses FinBERT (`ProsusAI/finbert`)
-  via the `transformers` + `torch` dependencies.
+  via the `transformers` + `torch` dependencies. The pipeline is loaded lazily
+  behind a lock with a short retry cooldown (a failed load is retried, never
+  cached forever), and each scan shard pre-loads it once with
+  `warm_up_finbert()` before its worker threads start, so concurrent first
+  calls cannot race the `transformers` import and silently fall back to
+  neutral sentiment.
 - **Overall macro regime** adds a modest overlay (`risk_on` / `risk_off`) of
-  roughly +3 / -5 points.
+  roughly +3 / -5 points. Inputs are VIX (FRED `VIXCLS`), the 10Y yield (FRED
+  `DGS10`) and sector-ETF trends (Polygon); each input degrades to neutral on
+  its own if unavailable instead of discarding the whole regime.
 - **Sector momentum** now adds a small stock-specific overlay of **+3** when the
   stock's sector is currently in the macro model's bullish ETF basket and **-3**
   when that sector is in the bearish basket.
@@ -386,6 +396,15 @@ screener/profit-opportunity top 75 CSVs, and emails the report). The grading
 workflows run `scripts/grading_report.py` to evaluate the exact prior recorded
 scan batch using both point-in-time resolution and max-price-since-scan
 excursion checks.
+
+Both emails render as a Grafana-style dark dashboard (`modules/email_reports.py`:
+stat panels, gauge cells, badges, row titles). The layout is fluid up to
+1200px wide and uses wrapping tiles and horizontally scrollable tables, so
+the same HTML fills a laptop browser and fits a phone; a `@media` block adds
+a tighter phone layout in clients that honor `<style>` (Gmail with a Google
+account does, non-Google accounts in Gmail do not). Keep the HTML under
+Gmail's ~102KB clipping limit (`tests/test_scan_report_html.py` enforces it).
+The scan report must keep exactly four CSV attachments.
 
 Shard count is manifest-driven, set by `--scan-shard-count` at promote time
 (`scripts/lightgbm_batch_pipeline.py`'s `DEFAULT_SCAN_SHARD_COUNT`, currently
@@ -760,6 +779,37 @@ thin-history rows from the qualifying pool before ranking. The scheduled
 report is now split into **three** top-75 rankings over the same qualifying
 pool: by projected upside, by overall score, and by risk-adjusted upside —
 not just the original "by upside"/"by score" pair.
+
+#### Reading Risk-Adjusted Upside
+
+`Risk-Adjusted Upside = Projected Upside % ÷ Forecast Range %`, where
+`Forecast Range % = (Target High − Target Low) ÷ Current Price × 100` (a range
+narrower than 1% counts as 1%). The forecast range always contains both
+today's price and the target, so a valid value lies between **0 and 1**:
+`1.00` means the whole range is upside, `0.50` means the range is twice as
+wide as the expected gain, `0.10` means ten times as wide. The CSVs add a
+`Forecast Range %` column and a `Risk-Adjusted Rating` column (**Strong**
+0.60+, **Moderate** 0.30 to <0.60, **Weak** <0.30), and the emailed report
+explains all of this under "How to read this report". It is a ratio of model
+outputs, not a probability of profit, and it saturates near 1 for the largest
+(+200% capped) upsides, so read it together with Score and Projected Upside %.
+
+Prices are rounded with `modules/price_format.price_decimals` (2 decimals from
+$1, 4 from $0.01, 6 below) so sub-dollar tickers are not quantized to whole
+cents. Cent rounding used to collapse a penny stock's band edge to `0.00`
+(then mistaken for "missing" and replaced by a narrow ±5% band, which could
+produce values far above 1) and to push targets below the current price. Only a
+genuinely missing band edge now falls back to the ±5% band.
+
+#### Why short-term Resistance is always 20%
+
+The short-term target blends Trend, LightGBM and **Resistance** (the nearest
+technical resistance above price, or the upper Bollinger Band if higher).
+Resistance keeps a fixed 20% weight (`Resistance(20%)` in the `Basis` column);
+Trend and LightGBM split the other 80% by walk-forward accuracy. It is a prior,
+not a backtested model, and because it can only sit at or above the current
+price it pulls short-term targets upward, so treat short-term upside as
+optimistic.
 
 ### Upside-forecast validation (beyond the composite Score)
 
