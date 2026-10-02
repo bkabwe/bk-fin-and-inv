@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from modules import macro_regime, scoring_engine, sec_edgar_client
-from modules.backtester import get_walk_forward_window_config
+from modules.backtester import _compute_walk_forward_starts, get_walk_forward_window_config
 from modules.fundamental_analysis import analyze_fundamentals, classify_market_cap_tier
 from scripts import scan_email_report as ser
 
@@ -347,12 +347,20 @@ class GlossaryFiguresStayInSyncTests(unittest.TestCase):
     def test_model_weight_split_and_lightgbm_cap_match_the_ensemble_code(self):
         # LightGBM dominates the inverse-RMSE split, so its share is whatever the cap allows.
         backtest = {"n_windows": 6, "trend_rmse": 10.0, "lightgbm_rmse": 0.1}
-        for horizon, horizon_days, budget in (("short_term", 30, 0.80), ("medium_term", 180, 0.50)):
+        for horizon, horizon_days, budget, cap_text in (
+            ("short_term", 30, 0.80, "70% (six or more)"),
+            ("medium_term", 180, 0.50, "66% (five, the most the 180-day backtest can fit)"),
+        ):
             glossary = _glossary_html(_build(horizon))
+            window = get_walk_forward_window_config(horizon_days)
+            # Only counts the backtester can actually produce: the 180d one tops out at 5 windows, so never 70%.
+            max_windows = len(_compute_walk_forward_starts(window.max_history_rows, window))
+            max_cap = scoring_engine._lightgbm_adaptive_share_cap(max_windows)
             with self.subTest(horizon=horizon):
                 self.assertIn(f"share {round(budget * 100)}% of the weight", glossary)
-                self.assertIn("capped at 50% (one backtest window), rising to 70% (six or more)", glossary)
-                for windows, cap in ((1, 0.50), (6, 0.70)):
+                self.assertIn(f"capped at 50% (one backtest window), rising to {cap_text}", glossary)
+                self.assertTrue(cap_text.startswith(f"{round(max_cap * 100)}%"))
+                for windows, cap in ((1, 0.50), (max_windows, max_cap)):
                     weights = scoring_engine._projection_model_weights(
                         horizon_days, {**backtest, "lightgbm_windows": windows}, include_lightgbm=True
                     )
@@ -390,9 +398,9 @@ class GlossaryFiguresStayInSyncTests(unittest.TestCase):
     def test_confidence_figures_match_the_scoring_code(self):
         glossary = _glossary_html(_build("medium_term"))
         spread = round(scoring_engine._CONFIDENCE_AGREEMENT_CV_SCALE * 100)
-        self.assertIn(f"spread reaches {spread}% of the blended forecast", glossary)
+        self.assertIn(f"standard deviation reaches {spread}% of the blended forecast", glossary)
         self.assertEqual(scoring_engine._ensemble_agreement_score([100.0, 100.0], 100.0), 1.0)
-        # Components whose spread is exactly 20% of the forecast are fully distrusted.
+        # Components whose standard deviation is exactly 20% of the forecast are fully distrusted.
         self.assertAlmostEqual(scoring_engine._ensemble_agreement_score([80.0, 120.0], 100.0), 1.0 - 0.20 / 0.20)
         self.assertIn(f"LightGBM backtest windows out of {scoring_engine.LIGHTGBM_ADAPTIVE_CAP_FULL_EVIDENCE_WINDOWS}", glossary)
         # Half of the raw move survives even at zero confidence.

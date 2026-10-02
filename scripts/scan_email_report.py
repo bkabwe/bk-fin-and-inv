@@ -635,6 +635,8 @@ def _glossary_sections(horizon: str) -> list[StyledSection]:
     projection_days = 30 if short_term else 180
     window = get_walk_forward_window_config(projection_days)
     model_budget = 80 if short_term else 50
+    # The cap grows 4 points per backtest window; the 30d backtest fits up to 6 windows, the 180d one only 5.
+    lightgbm_cap_top = "70% (six or more)" if short_term else f"66% (five, the most the {projection_days}-day backtest can fit)"
 
     score_and_market = [
         {
@@ -769,7 +771,7 @@ def _glossary_sections(horizon: str) -> list[StyledSection]:
             "term": "Model weights",
             "definition": (
                 f"Trend and LightGBM share {model_budget}% of the weight in proportion to 1 ÷ RMSE; LightGBM's share of that is "
-                "capped at 50% (one backtest window), rising to 70% (six or more)."
+                f"capped at 50% (one backtest window), rising to {lightgbm_cap_top}."
             ),
         },
         {
@@ -808,8 +810,8 @@ def _glossary_sections(horizon: str) -> list[StyledSection]:
         {
             "term": "Confidence Score",
             "definition": (
-                "CSV only. 0–100 trust in one target: half model agreement (100 if the forecasts coincide, 0 if their spread "
-                "reaches 20% of the blended forecast), half evidence depth (price history vs the backtest window, and "
+                "CSV only. 0–100 trust in one target: half model agreement (100 if the forecasts coincide, 0 if their standard "
+                "deviation reaches 20% of the blended forecast), half evidence depth (price history vs the backtest window, and "
                 "LightGBM backtest windows out of 6)." + ("" if short_term else " Not the Full / Limited label above.")
             ),
         },
