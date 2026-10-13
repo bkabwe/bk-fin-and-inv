@@ -157,10 +157,19 @@ def _load_all() -> list[dict]:
     return [_row_to_record(row) for row in rows]
 
 
-def _load_by_status(status: str) -> list[dict]:
+def _iso_day(value: str | date) -> str:
+    """``YYYY-MM-DD`` for a date or an ISO date/datetime string."""
+    return value.isoformat()[:10] if isinstance(value, date) else str(value)[:10]
+
+
+def _load_by_status(status: str, since: str | date | None = None) -> list[dict]:
+    """Rows with the given status, optionally only those scanned on/after ``since``."""
+    # "" sorts before every ISO date, so no ``since`` means no lower bound.
+    since_day = "" if since is None else _iso_day(since)
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM predictions WHERE status = ? ORDER BY rowid", (status,)
+            "SELECT * FROM predictions WHERE status = ? AND scan_date >= ? ORDER BY rowid",
+            (status, since_day),
         ).fetchall()
     return [_row_to_record(row) for row in rows]
 
@@ -359,7 +368,9 @@ def compute_max_price_since_scan(
     if stop < start:
         return None
 
-    days_back = max(30, (stop - start).days + 10)
+    # The period counts back from today (not from ``stop``), so it has to reach
+    # ``start`` even when ``stop`` is well before today.
+    days_back = max(30, (date.today() - start).days + 10)
     df = get_stock_data(str(ticker or "").strip().upper(), period=f"{days_back}d", interval="1d")
     if df.empty:
         return None
@@ -625,7 +636,7 @@ def _score_ic_stats(subset: list[dict], min_samples: int) -> dict:
     }
 
 
-def compute_score_validation_stats(min_samples: int = 5) -> dict:
+def compute_score_validation_stats(min_samples: int = 5, since: str | date | None = None) -> dict:
     """Correlate recorded composite scores (analyze_stock's 0-100 score) against
     realized forward returns, once predictions are resolved.
 
@@ -642,10 +653,13 @@ def compute_score_validation_stats(min_samples: int = 5) -> dict:
     Returns {"overall": {...}, "by_horizon": {horizon: {...}}}. Any bucket
     with fewer than `min_samples` resolved predictions returns None values
     rather than a misleadingly precise statistic from a tiny sample.
+
+    ``since`` (an ISO date or ``date``) only counts predictions scanned on or
+    after that day, e.g. to leave out scans from an earlier scoring model.
     """
     # Only resolved rows are loaded -- pending predictions never contribute
     # to these stats, so there's no need to load/filter them in Python.
-    resolved_rows = _load_by_status("resolved")
+    resolved_rows = _load_by_status("resolved", since)
     resolved = [
         r for r in resolved_rows if r.get("score") is not None and r.get("actual_return_pct") is not None
     ]
@@ -694,7 +708,7 @@ def _upside_calibration_stats(subset: list[dict], min_samples: int) -> dict:
     }
 
 
-def compute_upside_validation_stats(min_samples: int = 5) -> dict:
+def compute_upside_validation_stats(min_samples: int = 5, since: str | date | None = None) -> dict:
     """Correlate recorded projected_upside_pct forecasts against realized
     forward returns, once predictions are resolved.
 
@@ -714,10 +728,11 @@ def compute_upside_validation_stats(min_samples: int = 5) -> dict:
 
     Returns {"overall": {...}, "by_horizon": {horizon: {...}}}. Any bucket
     with fewer than `min_samples` resolved predictions returns None values
-    rather than a misleadingly precise statistic from a tiny sample.
+    rather than a misleadingly precise statistic from a tiny sample. ``since``
+    limits the sample as in compute_score_validation_stats.
     """
     # Only resolved rows are loaded -- see compute_score_validation_stats above.
-    resolved_rows = _load_by_status("resolved")
+    resolved_rows = _load_by_status("resolved", since)
     resolved = [
         r for r in resolved_rows if r.get("projected_upside_pct") is not None and r.get("actual_return_pct") is not None
     ]

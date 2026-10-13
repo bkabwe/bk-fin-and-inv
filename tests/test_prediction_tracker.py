@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -262,6 +263,37 @@ class PredictionTrackerCoreTests(unittest.TestCase):
         overall = stats["overall"]
         self.assertGreater(overall["mean_bias_pct"], 0)
         self.assertEqual(overall["overoptimism_rate"], 0.0)
+
+    # -- validation stats: ``since`` cutoff ---------------------------------
+
+    def _record_resolved(self, scans):
+        """One resolved short-term prediction per (scan_date, actual_return_pct)."""
+        for idx in range(len(scans)):
+            self._record(ticker=f"T{idx}", score=50 + idx, projected_upside_pct=10.0 + idx)
+        for rec, (scan_date, actual_return_pct) in zip(prediction_tracker.get_all_predictions(), scans, strict=True):
+            rec["scan_date"] = scan_date
+            rec["status"] = "resolved"
+            rec["actual_return_pct"] = actual_return_pct
+            prediction_tracker._update_record(rec)
+
+    def test_validation_stats_since_only_count_scans_on_or_after_the_cutoff(self):
+        self._record_resolved([("2026-09-28", 1.0), ("2026-10-01", 2.0), ("2026-10-02", 3.0), ("2026-10-05", 4.0)])
+        for compute in (
+            prediction_tracker.compute_score_validation_stats,
+            prediction_tracker.compute_upside_validation_stats,
+        ):
+            with self.subTest(stats=compute.__name__):
+                self.assertEqual(compute(min_samples=1)["overall"]["count"], 4)  # no cutoff: every era
+                self.assertEqual(compute(min_samples=1, since="2026-10-02")["overall"]["count"], 2)  # inclusive
+                self.assertEqual(compute(min_samples=1, since="2026-10-02T09:30:00")["overall"]["count"], 2)
+                self.assertEqual(compute(min_samples=1, since=date(2026, 10, 2))["by_horizon"]["short_term"]["count"], 2)
+                self.assertEqual(compute(min_samples=1, since="2026-10-06")["overall"]["count"], 0)
+
+    def test_validation_stats_since_does_not_change_the_pending_row_lookup(self):
+        self._record(ticker="PEND")
+        self.assertEqual(len(prediction_tracker._load_by_status("pending")), 1)
+        self.assertEqual(len(prediction_tracker._load_by_status("pending", since=date.today())), 1)
+        self.assertEqual(prediction_tracker._load_by_status("pending", since="2999-01-01"), [])
 
     # -- sub-score recording -----------------------------------------------
 

@@ -4,6 +4,7 @@ import runpy
 import sys
 import types
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,6 +31,23 @@ class PredictionTrackerExcursionTests(unittest.TestCase):
             value = prediction_tracker.compute_max_price_since_scan("AAPL", "2026-08-21", "2026-08-22")
 
         self.assertEqual(value, 112.5)
+
+    def test_compute_max_price_since_scan_fetches_history_back_to_the_scan_date(self):
+        # get_stock_data's period counts back from today, so a window that ended
+        # long ago (a medium-term batch graded weeks after its target date) still
+        # needs a period that reaches the scan date.
+        today = date.today()
+        scan_day, window_end = today - timedelta(days=130), today - timedelta(days=40)
+        frame = pd.DataFrame(
+            {"High": [101.0, 130.0, 150.0]},
+            index=pd.to_datetime([scan_day, window_end, today]),
+        )
+
+        with patch("modules.data_fetcher.get_stock_data", return_value=frame) as fetch:
+            value = prediction_tracker.compute_max_price_since_scan("AAPL", scan_day, window_end)
+
+        self.assertEqual(fetch.call_args.kwargs["period"], "140d")
+        self.assertEqual(value, 130.0)  # the later 150.0 high is outside the window
 
 
 class ScanEmailReportTests(unittest.TestCase):

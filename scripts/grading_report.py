@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -12,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from modules.email_reports import (
     StyledSection,
+    csv_attachment,
     render_html_table,
     render_metric_tiles,
     render_panel,
@@ -35,10 +38,47 @@ HORIZON_LABELS = {
     "medium_term": "Medium-Term (1–6 months)",
 }
 
+# First scheduled scan on the current setup: the SQLite prediction store (#62)
+# and the scoring-model changes (#63). Earlier scans came from the legacy JSON
+# store, the previous model (the 2026-10-01 medium-term batch still had the
+# circular "Fundamental" ensemble slot) or one-off manual runs around the
+# changeover, so they are neither graded nor counted in the validation panels.
+# Move this forward whenever a scoring change makes older predictions
+# incomparable.
+CURRENT_MODEL_START_DATE = date(2026, 10, 5)
+
+# Days between runs of each horizon's grading workflow (the crons in
+# .github/workflows/grading-report-*.yml: every Monday, and the 1st of every
+# other month, which is 59-62 days apart). A run grades the newest scan whose
+# horizon completed within the last cadence, so each scheduled scan is graded
+# once even though its date is rarely exactly HORIZON_DAYS before a grading
+# date -- for the medium term it never is (90 days isn't a multiple of ~61).
+GRADING_CADENCE_DAYS = {"short_term": 7, "medium_term": 62}
+
+# Rows graded per report: the first 75 recorded rows (the scan's top-75 list).
+GRADED_BATCH_LIMIT = 75
+# Rows shown in the email's table. The CSV attachment carries every graded row,
+# which keeps the HTML under Gmail's ~102KB clipping limit.
+PREVIEW_LIMIT = 10
+
 
 def _target_scan_date(horizon: str, today: date | None = None) -> date:
     current_day = today or datetime.now(UTC).date()
     return current_day - timedelta(days=int(HORIZON_DAYS[horizon]))
+
+
+def _scan_window(horizon: str, today: date) -> tuple[date, date] | None:
+    """Inclusive range of scan dates a run on ``today`` may grade, or None if
+    the range is empty.
+
+    Its newest end is the horizon cut-off (a newer scan hasn't reached its
+    horizon yet); its oldest end is one grading cadence earlier, so a batch is
+    only picked up by the run that first covers it, and never predates the
+    current model.
+    """
+    last = _target_scan_date(horizon, today)
+    first = max(last - timedelta(days=GRADING_CADENCE_DAYS[horizon] - 1), CURRENT_MODEL_START_DATE)
+    return (first, last) if first <= last else None
 
 
 def _format_currency(value: Any) -> str:
@@ -52,15 +92,50 @@ def _format_pct(value: Any) -> str:
     return f"{float(value):,.2f}%"
 
 
-def load_prediction_batch(horizon: str, scan_date: date) -> list[dict[str, Any]]:
-    records = get_all_predictions()
-    return [
-        record
-        for record in records
-        if str(record.get("source") or "") == "profit_opportunities"
-        and str(record.get("horizon") or "") == horizon
-        and str(record.get("scan_date") or "")[:10] == scan_date.isoformat()
-    ]
+def find_grading_batch(horizon: str, today: date) -> tuple[date, list[dict[str, Any]]] | None:
+    """The newest recorded profit-opportunities batch a run on ``today`` should
+    grade, as ``(scan_date, records)``, or None when there isn't one."""
+    window = _scan_window(horizon, today)
+    if window is None:
+        return None
+    first, last = window[0].isoformat(), window[1].isoformat()
+    batches: dict[str, list[dict[str, Any]]] = {}
+    for record in get_all_predictions():
+        scan_day = str(record.get("scan_date") or "")[:10]
+        if (
+            str(record.get("source") or "") == "profit_opportunities"
+            and str(record.get("horizon") or "") == horizon
+            and first <= scan_day <= last
+        ):
+            batches.setdefault(scan_day, []).append(record)
+    if not batches:
+        return None
+    newest = max(batches)
+    return date.fromisoformat(newest), batches[newest]
+
+
+def _nothing_to_grade_message(horizon: str, today: date) -> str:
+    window = _scan_window(horizon, today)
+    if window is None:
+        return (
+            f"Nothing to grade yet: a {horizon} run on {today.isoformat()} covers scans up to "
+            f"{_target_scan_date(horizon, today).isoformat()}, before the current model's first scan "
+            f"({CURRENT_MODEL_START_DATE.isoformat()})."
+        )
+    return (
+        f"Nothing to grade: no profit_opportunities predictions were recorded for horizon={horizon} "
+        f"with scan dates {window[0].isoformat()} to {window[1].isoformat()}."
+    )
+
+
+def _excursion_end(target_date: Any, grading_date: date) -> date:
+    """Last day of a row's max-price window: its target date, or the grading date
+    if that comes first (or the target date is missing). Medium-term batches are
+    graded weeks after their target date; the max must not count that extra time."""
+    try:
+        return min(grading_date, date.fromisoformat(str(target_date)[:10]))
+    except ValueError:
+        return grading_date
 
 
 def build_grading_rows(records: list[dict[str, Any]], grading_date: date) -> list[dict[str, Any]]:
@@ -70,7 +145,11 @@ def build_grading_rows(records: list[dict[str, Any]], grading_date: date) -> lis
         target_price = float(record.get("target_price") or 0)
         target_low = float(record.get("target_low") or (target_price * 0.95 if target_price > 0 else 0))
         actual_return_pct = record.get("actual_return_pct")
-        max_price = compute_max_price_since_scan(record.get("ticker", ""), record.get("scan_date", ""), grading_date)
+        max_price = compute_max_price_since_scan(
+            record.get("ticker", ""),
+            record.get("scan_date", ""),
+            _excursion_end(record.get("target_date"), grading_date),
+        )
         max_return_pct = round(((float(max_price) - current_price) / current_price) * 100, 4) if max_price is not None and current_price > 0 else None
         projected_upside_pct = record.get("projected_upside_pct")
         point_error_pct = (
@@ -101,6 +180,17 @@ def build_grading_rows(records: list[dict[str, Any]], grading_date: date) -> lis
     return rows
 
 
+def build_graded_csv(rows: list[dict[str, Any]]) -> str:
+    """Every graded row as CSV, with the table's raw (unformatted) values."""
+    if not rows:
+        return ""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(rows[0]), lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue()
+
+
 def compute_batch_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     point_rows = [row for row in rows if row.get("Actual Return %") is not None]
     max_rows = [row for row in rows if row.get("Max Return %") is not None]
@@ -127,6 +217,13 @@ def compute_batch_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _horizon_stats(validation: dict[str, Any] | None, horizon: str) -> dict[str, Any]:
+    """The report's own horizon from a ``compute_*_validation_stats`` result.
+    (Its ``overall`` bucket blends every horizon, which would contradict the
+    "this horizon" panel titles.)"""
+    return ((validation or {}).get("by_horizon") or {}).get(horizon) or {}
+
+
 def build_grading_report(
     horizon: str,
     scan_date: date,
@@ -135,9 +232,11 @@ def build_grading_report(
     summary: dict[str, Any],
     score_validation: dict[str, Any] | None = None,
     upside_validation: dict[str, Any] | None = None,
+    *,
+    validation_since: date | None = None,
 ) -> str:
     preview_rows = []
-    for row in rows:
+    for row in rows[:PREVIEW_LIMIT]:
         preview_rows.append(
             {
                 **row,
@@ -150,6 +249,21 @@ def build_grading_report(
                 "Max Return %": _format_pct(row.get("Max Return %")),
             }
         )
+
+    if len(rows) > PREVIEW_LIMIT:
+        list_note = (
+            f"Showing the first {PREVIEW_LIMIT} of {len(rows)} graded predictions; "
+            "the full list is attached as CSV."
+        )
+    elif rows:
+        list_note = "The full list is also attached as CSV."
+    else:
+        list_note = ""
+    if validation_since is None:
+        validation_window, validation_scope = "all-time", "to date"
+    else:
+        validation_window = f"since {validation_since.isoformat()}"
+        validation_scope = f"scanned since {validation_since.isoformat()} (the current scoring model)"
 
     best = summary.get("best")
     worst = summary.get("worst")
@@ -199,16 +313,17 @@ def build_grading_report(
             ),
             description=(
                 f"Grading the profit-opportunities scan recorded on {scan_date.isoformat()} against data available "
-                f"through {grading_date.isoformat()}. Point-in-time resolution and max-favorable-excursion are shown "
-                "side by side for the exact recorded scan batch."
-            ),
+                f"through {grading_date.isoformat()}. Point-in-time resolution and max-favorable-excursion (the "
+                "highest price from the scan date through the target date) are shown side by side for the exact "
+                f"recorded scan batch. {list_note}"
+            ).strip(),
         ),
     ]
 
-    score_stats = (score_validation or {}).get("overall") or {}
+    score_stats = _horizon_stats(score_validation, horizon)
     if score_stats.get("count"):
         ic = score_stats.get("information_coefficient")
-        sections.append(render_row_title("Score validation (all-time, this horizon)"))
+        sections.append(render_row_title(f"Score validation ({validation_window}, this horizon)"))
         sections.append(
             render_panel(
                 "Does a higher score precede a better outcome?",
@@ -227,15 +342,15 @@ def build_grading_report(
                 ),
                 description=(
                     f"Computed across all {int(score_stats['count'])} resolved {HORIZON_LABELS[horizon]} "
-                    "predictions to date, not just this batch."
+                    f"predictions {validation_scope}, not just this batch."
                 ),
             )
         )
 
-    upside_stats = (upside_validation or {}).get("overall") or {}
+    upside_stats = _horizon_stats(upside_validation, horizon)
     if upside_stats.get("count"):
         upside_ic = upside_stats.get("information_coefficient")
-        sections.append(render_row_title("Upside forecast validation (all-time, this horizon)"))
+        sections.append(render_row_title(f"Upside forecast validation ({validation_window}, this horizon)"))
         sections.append(
             render_panel(
                 "Is the projected upside systematically over-optimistic?",
@@ -259,7 +374,7 @@ def build_grading_report(
                 description=(
                     "Is the projected upside % itself systematically over-optimistic, not just directionally "
                     f"correlated with outcomes? Computed across all {int(upside_stats['count'])} resolved "
-                    f"{HORIZON_LABELS[horizon]} predictions to date, not just this batch."
+                    f"{HORIZON_LABELS[horizon]} predictions {validation_scope}, not just this batch."
                 ),
             )
         )
@@ -277,23 +392,34 @@ def build_grading_report(
     )
 
 
-def generate_grading_report(horizon: str) -> int:
-    grading_date = datetime.now(UTC).date()
-    scan_date = _target_scan_date(horizon, grading_date)
+def generate_grading_report(horizon: str, today: date | None = None) -> int:
+    grading_date = today or datetime.now(UTC).date()
     resolution_summary = resolve_pending_predictions()
     print(f"Resolved pending predictions: {resolution_summary}")
-    batch_records = load_prediction_batch(horizon, scan_date)
-    if not batch_records:
-        raise RuntimeError(
-            f"No recorded profit_opportunities predictions found for horizon={horizon} scan_date={scan_date.isoformat()}"
-        )
-    rows = build_grading_rows(batch_records[:75], grading_date)
+    batch = find_grading_batch(horizon, grading_date)
+    if batch is None:
+        # Not an error: scans are weekly / bi-monthly, so most runs around a
+        # missed scan or the current-model cut-off simply have no batch yet.
+        print(_nothing_to_grade_message(horizon, grading_date))
+        return 0
+    scan_date, batch_records = batch
+    rows = build_grading_rows(batch_records[:GRADED_BATCH_LIMIT], grading_date)
     summary = compute_batch_summary(rows)
-    score_validation = compute_score_validation_stats()
-    upside_validation = compute_upside_validation_stats()
-    html_content = build_grading_report(horizon, scan_date, grading_date, rows, summary, score_validation, upside_validation)
+    score_validation = compute_score_validation_stats(since=CURRENT_MODEL_START_DATE)
+    upside_validation = compute_upside_validation_stats(since=CURRENT_MODEL_START_DATE)
+    html_content = build_grading_report(
+        horizon,
+        scan_date,
+        grading_date,
+        rows,
+        summary,
+        score_validation,
+        upside_validation,
+        validation_since=CURRENT_MODEL_START_DATE,
+    )
     subject = f"BK Self {HORIZON_LABELS[horizon]} grading report — {scan_date.isoformat()}"
-    sent_count = send_brevo_email(subject=subject, html_content=html_content)
+    graded_csv = csv_attachment(f"graded_predictions_{horizon}_{scan_date.isoformat()}.csv", build_graded_csv(rows))
+    sent_count = send_brevo_email(subject=subject, html_content=html_content, attachments=[graded_csv])
     print(f"Sent grading report to {sent_count} recipient(s)")
     return 0
 
