@@ -49,10 +49,10 @@ CURRENT_MODEL_START_DATE = date(2026, 10, 5)
 
 # Days between runs of each horizon's grading workflow (the crons in
 # .github/workflows/grading-report-*.yml: every Monday, and the 1st of every
-# other month, which is 59-62 days apart). A run grades the newest scan whose
-# horizon completed within the last cadence, so each scheduled scan is graded
-# once even though its date is rarely exactly HORIZON_DAYS before a grading
-# date -- for the medium term it never is (90 days isn't a multiple of ~61).
+# other month, i.e. 59-62 days apart). A run grades the newest scan in the
+# window of that many days ending HORIZON_DAYS ago, so every scheduled scan is
+# graded by exactly one run. An exact "HORIZON_DAYS ago" match can't work for
+# the medium term: no scan is ever exactly 90 days old on a grading date.
 GRADING_CADENCE_DAYS = {"short_term": 7, "medium_term": 62}
 
 # Rows graded per report: the first 75 recorded rows (the scan's top-75 list).

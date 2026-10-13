@@ -406,9 +406,37 @@ without truncating or recording), and `reduce` (merges every shard's partial
 results, truncates to the final top 75, records the profit-opportunity picks
 into `data/predictions.db` for later grading exactly once, attaches
 screener/profit-opportunity top 75 CSVs, and emails the report). The grading
-workflows run `scripts/grading_report.py` to evaluate the exact prior recorded
-scan batch using both point-in-time resolution and max-price-since-scan
-excursion checks.
+workflows run `scripts/grading_report.py` to evaluate a prior recorded scan
+batch using both point-in-time resolution and max-price-since-scan
+excursion checks (the max-price window ends at each row's target date, so a
+batch graded weeks late is not credited for extra time).
+
+Which batch a grading run picks (`find_grading_batch`):
+
+- The newest recorded `profit_opportunities` batch for that horizon whose scan
+  date is in a window ending `HORIZON_DAYS` (21 short-term, 90 medium-term)
+  before the run and reaching back `GRADING_CADENCE_DAYS` (7 / 62) from there.
+  The window rather than an exact date is what makes the medium-term run work:
+  the scan and grading crons both fire on the 1st of every other month, 59-62
+  days apart, so no scan is ever exactly 90 days old on a grading date. Every
+  scheduled scan ends up graded by exactly one run
+  (`SchedulingTests` in `tests/test_grading_report.py`). Keep
+  `GRADING_CADENCE_DAYS` in step with the workflow crons.
+- Scans before `CURRENT_MODEL_START_DATE` (the first scheduled scan on the
+  SQLite store and current scoring model) are never graded and are left out of
+  the validation panels, so older models' outcomes don't blend in. Move it
+  forward when a scoring change makes older predictions incomparable.
+- When no batch qualifies (for example the weeks before the first current-model
+  scan reaches its horizon, or a skipped scan) the run still resolves pending
+  predictions, logs why there is nothing to grade and exits 0 without an
+  email, so the failure alert isn't raised. Real errors (price data, Brevo)
+  still fail the run.
+
+The email previews the first 10 graded rows (`PREVIEW_LIMIT`); every graded row
+(the scan's top 75, `GRADED_BATCH_LIMIT`) is attached as
+`graded_predictions_<horizon>_<scan date>.csv` with the raw, unformatted
+values. The validation panels use the report's own horizon and are titled
+`since <CURRENT_MODEL_START_DATE>`.
 
 Both emails render as a Grafana-style dark dashboard (`modules/email_reports.py`:
 stat panels, gauge cells, badges, row titles). The layout is fluid up to
@@ -416,7 +444,8 @@ stat panels, gauge cells, badges, row titles). The layout is fluid up to
 the same HTML fills a laptop browser and fits a phone; a `@media` block adds
 a tighter phone layout in clients that honor `<style>` (Gmail with a Google
 account does, non-Google accounts in Gmail do not). Keep the HTML under
-Gmail's ~102KB clipping limit (`tests/test_scan_report_html.py` enforces it).
+Gmail's ~102KB clipping limit (`tests/test_scan_report_html.py` enforces it for
+the scan reports and `tests/test_grading_report.py` for the grading report).
 The scan report must keep exactly four CSV attachments.
 
 Each scan report closes with a **Glossary** (`_glossary_sections` in
@@ -874,7 +903,9 @@ coefficient (Pearson correlation between projected and realized return),
 mean/median bias (a large negative gap flags systematic over-optimism in
 large upside projections), and an over-optimism rate. `scripts/
 grading_report.py` now surfaces this alongside the existing score
-validation stats.
+validation stats. Both validation functions take an optional `since` date that
+only counts predictions scanned on or after it (the grading report passes
+`CURRENT_MODEL_START_DATE`); without it they aggregate every resolved row.
 
 ### Liquidity/tradability filter for scan universes
 
